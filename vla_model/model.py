@@ -126,15 +126,15 @@ class ExcavatorVLA(nn.Module):
         self.pos_embed = nn.Parameter(torch.randn(1, seq_len, hidden_dim) * 0.02)
         self.sinusoidal_pe = PositionalEncoding(hidden_dim, dropout=0.0)
 
-        # DropPath per layer
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, n_layers)]
-
+        # Transformer Encoder
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim, nhead=n_heads, dim_feedforward=ff_dim,
             dropout=dropout, activation='gelu', batch_first=False, norm_first=True,
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        self.drop_path = nn.ModuleList([DropPath(dpr[i]) for i in range(n_layers)])
+
+        # DropPath applied after transformer output
+        self.stoch_depth = DropPath(drop_path_rate)
 
         self.action_head = nn.Sequential(
             nn.Linear(hidden_dim, 256), nn.GELU(), nn.Dropout(dropout),
@@ -177,11 +177,10 @@ class ExcavatorVLA(nn.Module):
             features = self.sinusoidal_pe(features.permute(1, 0, 2)).permute(1, 0, 2)
 
         features = features.permute(1, 0, 2)  # [T, B, D]
-        encoded = self.transformer(features)
+        encoded = self.transformer(features)   # [T, B, D]
 
-        # Apply DropPath to encoder outputs
-        for i in range(len(encoded)):
-            encoded[i] = self.drop_path[i](encoded[i])
+        # Apply DropPath to the full sequence (stochastic depth on all features)
+        encoded = self.stoch_depth(encoded)
 
         encoded = encoded.permute(1, 0, 2)    # [B, T, D]
         action = self.action_head(encoded[:, -1, :]).view(B, self.action_chunk, 4)
