@@ -10,7 +10,7 @@ class Config:
     data_dir: str = "data/excavator-motion"
     seq_len: int = 8              # frames per sequence
     action_chunk: int = 5         # predict next K frames (action chunking)
-    img_size: int = 224           # resize to (img_size, img_size)
+    img_size: int = 384           # 224→384, 5090 has plenty of VRAM
     train_split: float = 0.9      # train/val split ratio
     sample_ratio: float = 0.2     # 0.2=20% for fast iteration, 1.0=full data
 
