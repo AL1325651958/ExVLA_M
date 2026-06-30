@@ -10,20 +10,20 @@ class Config:
     data_dir: str = "data/excavator-motion"
     seq_len: int = 8              # frames per sequence
     action_chunk: int = 1         # predict next N frames (1 = single step)
-    img_size: int = 160           # resize to (img_size, img_size)
+    img_size: int = 224           # resize to (img_size, img_size)
     train_split: float = 0.9      # train/val split ratio
 
     # Model
-    hidden_dim: int = 256
-    n_heads: int = 4
-    n_layers: int = 2
-    ff_dim: int = 1024
+    hidden_dim: int = 512          # full model for 5090 GPU
+    n_heads: int = 8
+    n_layers: int = 4
+    ff_dim: int = 2048
     dropout: float = 0.1
     pretrained: bool = True       # use pretrained ResNet-18
 
     # Training
-    batch_size: int = 8
-    epochs: int = 100
+    batch_size: int = 32          # 5090 32GB VRAM
+    epochs: int = 80
     lr: float = 3e-4
     weight_decay: float = 1e-4
     warmup_ratio: float = 0.05
