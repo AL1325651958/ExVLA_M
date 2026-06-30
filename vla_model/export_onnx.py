@@ -47,22 +47,26 @@ def export_onnx(checkpoint_path: str, output_path: str, seq_len: int = 8,
     # Create dummy inputs
     dummy_rgb = torch.randn(1, seq_len, 3, img_size, img_size).to(device)
     dummy_elevation = torch.randn(1, seq_len, 3, img_size, img_size).to(device)
+    dummy_qpos = torch.randn(1, seq_len, 4).to(device)
+    dummy_excv_id = torch.tensor([0], dtype=torch.long).to(device)
 
     # Warm up
     with torch.no_grad():
-        _ = model(dummy_rgb, dummy_elevation)
+        _ = model(dummy_rgb, dummy_elevation, dummy_qpos, dummy_excv_id)
 
     # Export
     print(f"Exporting to ONNX (opset={opset})...")
     torch.onnx.export(
         model,
-        (dummy_rgb, dummy_elevation),
+        (dummy_rgb, dummy_elevation, dummy_qpos, dummy_excv_id),
         output_path,
-        input_names=["rgb", "elevation"],
+        input_names=["rgb", "elevation", "qpos", "excavator_id"],
         output_names=["action"],
         dynamic_axes={
             "rgb": {0: "batch", 1: "seq_len"},
             "elevation": {0: "batch", 1: "seq_len"},
+            "qpos": {0: "batch", 1: "seq_len"},
+            "excavator_id": {0: "batch"},
             "action": {0: "batch"},
         },
         opset_version=opset,
@@ -82,11 +86,13 @@ def export_onnx(checkpoint_path: str, output_path: str, seq_len: int = 8,
     # Compare outputs
     ort_session = onnxruntime.InferenceSession(output_path, providers=["CPUExecutionProvider"])
     with torch.no_grad():
-        torch_out = model(dummy_rgb, dummy_elevation).cpu().numpy()
+        torch_out = model(dummy_rgb, dummy_elevation, dummy_qpos, dummy_excv_id).cpu().numpy()
 
     ort_inputs = {
         "rgb": dummy_rgb.cpu().numpy(),
         "elevation": dummy_elevation.cpu().numpy(),
+        "qpos": dummy_qpos.cpu().numpy(),
+        "excavator_id": dummy_excv_id.cpu().numpy(),
     }
     ort_out = ort_session.run(None, ort_inputs)[0]
 

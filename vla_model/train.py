@@ -35,13 +35,23 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch):
     for step, batch in enumerate(pbar):
         rgb = batch["rgb"].to(config.device)
         elevation = batch["elevation"].to(config.device)
+        qpos = batch["qpos"].to(config.device)
+        excavator_id = batch["excavator_id"].to(config.device)
         action_gt = batch["action"].to(config.device)  # [B, K, 4]
 
         optimizer.zero_grad()
 
         with autocast():
-            action_pred = model(rgb, elevation)  # [B, K, 4]
-            loss = criterion(action_pred, action_gt)
+            action_pred = model(rgb, elevation, qpos, excavator_id)  # [B, K, 4]
+            mse_loss = criterion(action_pred, action_gt)
+
+            # Temporal smoothness loss for action chunks (penalize jitter)
+            if action_pred.size(1) > 1:
+                smooth_loss = 0.01 * ((action_pred[:, 1:] - action_pred[:, :-1]) ** 2).mean()
+            else:
+                smooth_loss = 0.0
+
+            loss = mse_loss + smooth_loss
 
         scaler.scale(loss).backward()
 
@@ -81,9 +91,11 @@ def validate(model, dataloader, criterion, config):
     for batch in tqdm(dataloader, desc="Validating"):
         rgb = batch["rgb"].to(config.device)
         elevation = batch["elevation"].to(config.device)
+        qpos = batch["qpos"].to(config.device)
+        excavator_id = batch["excavator_id"].to(config.device)
         action_gt = batch["action"].to(config.device)
 
-        action_pred = model(rgb, elevation)
+        action_pred = model(rgb, elevation, qpos, excavator_id)
         loss = criterion(action_pred, action_gt)
 
         total_loss += loss.item()

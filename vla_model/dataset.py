@@ -97,6 +97,17 @@ class ExcavatorDataset(Dataset):
 
         print(f"[{split}] Loaded {len(self._episodes)} episodes, {len(self.samples)} samples")
 
+    def _parse_excavator_id(self, fpath: str) -> int:
+        """Parse excavator model ID from file path. Returns 0=75, 1=306, 2=490, 3=unknown."""
+        path_lower = fpath.lower()
+        if '/75/' in path_lower or '\\75\\' in path_lower:
+            return 0
+        elif '/306/' in path_lower or '\\306\\' in path_lower:
+            return 1
+        elif '/490/' in path_lower or '\\490\\' in path_lower:
+            return 2
+        return 3
+
     def _load_and_preprocess(self, fpath: str) -> dict:
         """Load raw uint8 data from one HDF5 episode (no preprocessing).
         Preprocessing happens on-the-fly in __getitem__.
@@ -120,12 +131,14 @@ class ExcavatorDataset(Dataset):
             print(f"  SKIP missing key: {fpath}: {e}")
             return None
 
+        excv_id = self._parse_excavator_id(fpath)
         return {
             "_h5": f,                          # keep file handle alive
             "mains_raw": mains_raw,            # h5py Dataset, lazy access
             "elevations_raw": elevations_raw,  # h5py Dataset, lazy access
             "qpos": qpos,
             "action": action,
+            "excavator_id": excv_id,           # int: 0=75, 1=306, 2=490
         }
 
     def _preprocess_image(self, img_bgr: np.ndarray) -> np.ndarray:
@@ -158,10 +171,12 @@ class ExcavatorDataset(Dataset):
 
         qpos_seq = ep["qpos"][start:end]         # [T, 4]
         action_target = ep["action"][start + T - 1 : start + T + K - 1]  # [K, 4]
+        excv_id = ep["excavator_id"]
 
         return {
             "rgb": torch.from_numpy(rgb_seq),
             "elevation": torch.from_numpy(elev_seq),
             "qpos": torch.from_numpy(qpos_seq.copy()),
             "action": torch.from_numpy(action_target.copy()),
+            "excavator_id": torch.tensor(excv_id, dtype=torch.long),
         }

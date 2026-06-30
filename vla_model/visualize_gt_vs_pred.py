@@ -163,16 +163,32 @@ def main():
             targets = np.zeros_like(qpos)
             targets[:-1] = qpos[1:]
             targets[-1] = qpos[-1]
+
+    # Parse excavator ID from path
+    path_lower = args.data_path.lower()
+    if '/75/' in path_lower or '\\75\\' in path_lower:
+        excv_id = 0
+    elif '/306/' in path_lower or '\\306\\' in path_lower:
+        excv_id = 1
+    elif '/490/' in path_lower or '\\490\\' in path_lower:
+        excv_id = 2
+    else:
+        excv_id = 3
+            targets[:-1] = qpos[1:]
+            targets[-1] = qpos[-1]
     N = len(targets)
 
     # Preprocess images
     print("Preprocessing images...")
     T_img = args.seq_len
+    qpos_pp = qpos.astype(np.float32)
     rgb_pp = np.zeros((N, 3, args.img_size, args.img_size), dtype=np.float32)
     elev_pp = np.zeros((N, 3, args.img_size, args.img_size), dtype=np.float32)
     for i in range(N):
         rgb_pp[i] = preprocess_image(mains[i], args.img_size)
         elev_pp[i] = preprocess_image(elevations[i], args.img_size)
+
+    excv_tensor = torch.tensor([excv_id], dtype=torch.long).to(device)
 
     # Run sliding-window inference
     print("Running inference...")
@@ -183,8 +199,9 @@ def main():
         end = start + T_img
         rgb_seq = torch.from_numpy(rgb_pp[start:end]).unsqueeze(0).to(device)
         elev_seq = torch.from_numpy(elev_pp[start:end]).unsqueeze(0).to(device)
+        qpos_seq = torch.from_numpy(qpos_pp[start:end]).unsqueeze(0).to(device)
         with torch.no_grad():
-            pred = model(rgb_seq, elev_seq)
+            pred = model(rgb_seq, elev_seq, qpos_seq, excv_tensor)
         predictions[start + T_img - 1] = pred[0, 0].cpu().numpy()
 
     # Error
