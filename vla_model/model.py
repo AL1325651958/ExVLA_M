@@ -1,5 +1,8 @@
 """ExcavatorVLA: Vision-Language-Action model with Transformer for joint prediction."""
 
+import warnings
+warnings.filterwarnings("ignore", message="enable_nested_tensor is True")
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
