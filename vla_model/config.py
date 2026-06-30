@@ -19,14 +19,18 @@ class Config:
     n_heads: int = 8
     n_layers: int = 4
     ff_dim: int = 2048
-    dropout: float = 0.1
+    dropout: float = 0.15          # 0.1 → 0.15 for regularization
+    drop_path_rate: float = 0.1    # stochastic depth
     pretrained: bool = True       # use pretrained ResNet-18
 
     # Training
     batch_size: int = 32          # 5090 32GB VRAM
     epochs: int = 80
     lr: float = 3e-4
-    weight_decay: float = 1e-4
+    weight_decay: float = 5e-4      # 1e-4 → 5e-4 for stronger L2
+    use_ema: bool = True            # exponential moving average
+    ema_decay: float = 0.999        # EMA decay rate
+    smooth_loss_weight: float = 0.05  # temporal smoothness (0.01→0.05 for anti-jitter)
     warmup_ratio: float = 0.05
     grad_clip: float = 1.0
     device: str = "cuda"

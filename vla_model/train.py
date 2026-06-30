@@ -45,9 +45,9 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch):
             action_pred = model(rgb, elevation, qpos, excavator_id)  # [B, K, 4]
             mse_loss = criterion(action_pred, action_gt)
 
-            # Temporal smoothness loss for action chunks (penalize jitter)
+            # Temporal smoothness loss for action chunks (anti-jitter)
             if action_pred.size(1) > 1:
-                smooth_loss = 0.01 * ((action_pred[:, 1:] - action_pred[:, :-1]) ** 2).mean()
+                smooth_loss = config.smooth_loss_weight * ((action_pred[:, 1:] - action_pred[:, :-1]) ** 2).mean()
             else:
                 smooth_loss = 0.0
 
@@ -61,6 +61,12 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch):
 
         scaler.step(optimizer)
         scaler.update()
+
+        # EMA update
+        if ema_model is not None:
+            with torch.no_grad():
+                for ema_p, p in zip(ema_model.parameters(), model.parameters()):
+                    ema_p.data.mul_(config.ema_decay).add_(p.data, alpha=1 - config.ema_decay)
 
         total_loss += loss.item()
         mae = (action_pred.detach() - action_gt).abs().mean(dim=(0, 1)).cpu().numpy()
@@ -204,6 +210,7 @@ def main():
         n_layers=config.n_layers,
         ff_dim=config.ff_dim,
         dropout=config.dropout,
+        drop_path_rate=config.drop_path_rate,
         pretrained=config.pretrained,
     ).to(config.device)
 
@@ -220,6 +227,15 @@ def main():
 
     scaler = GradScaler()
     criterion = nn.MSELoss()
+
+    # EMA (Exponential Moving Average) for better generalization
+    ema_model = None
+    if config.use_ema:
+        from copy import deepcopy
+        ema_model = deepcopy(model)
+        ema_model.eval()
+        for p in ema_model.parameters():
+            p.requires_grad = False
 
     # Resume if specified
     start_epoch = 0
