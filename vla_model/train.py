@@ -62,12 +62,6 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch):
         scaler.step(optimizer)
         scaler.update()
 
-        # EMA update
-        if ema_model is not None:
-            with torch.no_grad():
-                for ema_p, p in zip(ema_model.parameters(), model.parameters()):
-                    ema_p.data.mul_(config.ema_decay).add_(p.data, alpha=1 - config.ema_decay)
-
         total_loss += loss.item()
         mae = (action_pred.detach() - action_gt).abs().mean(dim=(0, 1)).cpu().numpy()
         total_mae += mae
@@ -261,6 +255,12 @@ def main():
         history["train_mae"].append(train_metrics["mae_mean"])
 
         scheduler.step()
+
+        # EMA update (smoothed weights for better generalization)
+        if ema_model is not None:
+            with torch.no_grad():
+                for ema_p, p in zip(ema_model.parameters(), model.parameters()):
+                    ema_p.data.mul_(config.ema_decay).add_(p.data, alpha=1 - config.ema_decay)
 
         # Validate
         val_metrics = {"loss": float("nan"), "mae": [0, 0, 0, 0], "mae_mean": float("nan")}
