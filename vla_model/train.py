@@ -121,6 +121,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--seq_len", type=int, default=None)
+    parser.add_argument("--sample_ratio", type=float, default=None, help="Fraction of data to use (0.2=20%% for fast training)")
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
     parser.add_argument("--overfit", action="store_true", help="Overfit single episode")
     args = parser.parse_args()
@@ -138,6 +139,8 @@ def main():
         config.lr = args.lr
     if args.seq_len:
         config.seq_len = args.seq_len
+    if args.sample_ratio is not None:
+        config.sample_ratio = args.sample_ratio
 
     # Device
     config.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -152,6 +155,7 @@ def main():
         img_size=config.img_size,
         split="train",
         train_split=config.train_split if not args.overfit else 1.0,
+        sample_ratio=config.sample_ratio,
     )
     val_dataset = ExcavatorDataset(
         data_dir=config.data_dir,
@@ -160,6 +164,7 @@ def main():
         img_size=config.img_size,
         split="val",
         train_split=config.train_split if not args.overfit else 1.0,
+        sample_ratio=config.sample_ratio,
     )
 
     train_loader = DataLoader(

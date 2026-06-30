@@ -12,6 +12,7 @@ class Config:
     action_chunk: int = 1         # predict next N frames (1 = single step)
     img_size: int = 224           # resize to (img_size, img_size)
     train_split: float = 0.9      # train/val split ratio
+    sample_ratio: float = 0.2     # 0.2=20% for fast iteration, 1.0=full data
 
     # Model
     hidden_dim: int = 512          # full model for 5090 GPU

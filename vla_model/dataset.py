@@ -31,6 +31,7 @@ class ExcavatorDataset(Dataset):
         img_size: int = 224,
         split: str = "train",
         train_split: float = 0.9,
+        sample_ratio: float = 1.0,  # 1.0=all, 0.2=20% for fast training
     ):
         self.data_dir = Path(data_dir)
         self.seq_len = seq_len
@@ -38,6 +39,7 @@ class ExcavatorDataset(Dataset):
         self.img_size = img_size
         self.split = split
         self.train_split = train_split
+        self.sample_ratio = sample_ratio
 
         # Find all H5/HDF5 files
         self.file_list = sorted(
@@ -86,6 +88,12 @@ class ExcavatorDataset(Dataset):
             total_window = seq_len + action_chunk
             for start in range(0, n_frames - total_window + 1):
                 self.samples.append((fidx, start))
+
+        # Sub-sample if ratio < 1.0 (for fast training)
+        if sample_ratio < 1.0:
+            step = max(1, int(1.0 / sample_ratio))
+            self.samples = self.samples[::step]  # take every N-th
+            print(f"[{split}] Subsampled to {len(self.samples)} samples ({sample_ratio*100:.0f}%)")
 
         print(f"[{split}] Loaded {len(self._episodes)} episodes, {len(self.samples)} samples")
 
