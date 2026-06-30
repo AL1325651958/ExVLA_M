@@ -1,0 +1,27 @@
+# Data files (too large)
+data/
+
+# Output / checkpoints / videos
+output/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Models
+*.pt
+*.pth
+*.onnx
+
+# Jupyter
+.ipynb_checkpoints/
