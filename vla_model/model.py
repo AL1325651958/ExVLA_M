@@ -99,16 +99,22 @@ class ExcavatorVLA(nn.Module):
     def __init__(
         self, seq_len=8, hidden_dim=512, n_heads=8, n_layers=4, ff_dim=2048,
         dropout=0.1, drop_path_rate=0.05, pretrained=True, num_excavators=4,
+        legacy_head: bool = False,
     ):
+        """
+        legacy_head=True: compatible with old ckpts (head input = hidden_dim only).
+        legacy_head=False: new style (head input = vision + excv_id concat).
+        """
         super().__init__()
         self.seq_len = seq_len
         self.hidden_dim = hidden_dim
+        self.legacy_head = legacy_head
 
         self.vision_encoder = TwoStreamEncoder(hidden_dim, pretrained=pretrained)
         self.excv_embed = nn.Embedding(num_excavators, hidden_dim)
-        # Privileged info: used ONLY during training (self.training=True)
+        # Keep Dropout in qpos_proj for backward compat with old checkpoints
         self.qpos_proj = nn.Sequential(
-            nn.Linear(4, hidden_dim // 4), nn.GELU(),
+            nn.Linear(4, hidden_dim // 4), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(hidden_dim // 4, hidden_dim),
         )
         self.pos_embed = nn.Parameter(torch.randn(1, seq_len, hidden_dim) * 0.02)
@@ -121,9 +127,13 @@ class ExcavatorVLA(nn.Module):
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         self.stoch_depth = DropPath(drop_path_rate)
 
-        # Head: vision + excavator ID → delta (NO qpos at inference)
+        # Head input size depends on mode
+        if legacy_head:
+            head_in = hidden_dim                   # old: vision only
+        else:
+            head_in = hidden_dim + hidden_dim      # new: vision + excv_id
         self.delta_head = nn.Sequential(
-            nn.Linear(hidden_dim + hidden_dim, 256), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(head_in, 256), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(256, 128), nn.GELU(), nn.Dropout(dropout * 0.5),
             nn.Linear(128, 4),
         )
@@ -143,11 +153,8 @@ class ExcavatorVLA(nn.Module):
 
     def forward(self, rgb, elevation, qpos=None, excavator_id=None):
         """
-        qpos is privileged information: only used during training (self.training=True).
-        At inference time (model.eval()), prediction is purely vision-based.
-
-        Returns:
-            delta [B, 4] — predicted change from last qpos
+        Returns delta [B, 4]. legacy_head(old ckpt): qpos always injected.
+        New mode: qpos is privileged (training only).
         """
         B, T = rgb.shape[:2]
         H, W = rgb.shape[3], rgb.shape[4]
@@ -157,12 +164,16 @@ class ExcavatorVLA(nn.Module):
         elev_flat = elevation.reshape(B * T, 3, H, W)
         features = self.vision_encoder(rgb_flat, elev_flat).view(B, T, -1)
 
-        # 2. qpos: privileged info — only during training
-        if qpos is not None and self.training:
-            features = features + self.qpos_proj(qpos)
+        # 2. qpos: legacy=always, new=training only
+        if self.legacy_head:
+            if qpos is not None:
+                features = features + self.qpos_proj(qpos)
+        else:
+            if qpos is not None and self.training:
+                features = features + self.qpos_proj(qpos)
 
-        # 3. Excavator ID embedding
-        if excavator_id is not None:
+        # 3. Excavator ID
+        if excavator_id is not None and self.legacy_head:
             features = features + self.excv_embed(excavator_id).unsqueeze(1)
 
         # 4. Position encoding
@@ -176,10 +187,13 @@ class ExcavatorVLA(nn.Module):
         encoded = self.stoch_depth(self.transformer(features))
         encoded = encoded.permute(1, 0, 2)
 
-        # 6. Head: vision + excavator ID → delta (no qpos)
-        vision_feat = encoded[:, -1, :]           # [B, hidden_dim]
-        excv_feat = self.excv_embed(excavator_id) # [B, hidden_dim]
-        delta = self.delta_head(torch.cat([vision_feat, excv_feat], dim=-1))
+        # 6. Head
+        vision_feat = encoded[:, -1, :]  # [B, hidden_dim]
+        if self.legacy_head:
+            delta = self.delta_head(vision_feat)
+        else:
+            excv_feat = self.excv_embed(excavator_id)
+            delta = self.delta_head(torch.cat([vision_feat, excv_feat], dim=-1))
 
         return delta
 

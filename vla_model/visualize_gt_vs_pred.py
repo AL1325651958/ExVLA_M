@@ -153,6 +153,8 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--pred_steps", type=int, default=None,
                         help="Number of prediction steps to draw (default: use model's action_chunk)")
+    parser.add_argument("--rollout", action="store_true",
+                        help="Closed-loop: first frame uses GT qpos, then chains own predictions")
     args = parser.parse_args()
 
     device = args.device if torch.cuda.is_available() else "cpu"
@@ -166,17 +168,23 @@ def main():
         config = ckpt["config"]
 
     # Detect model version from state_dict keys
-    state_keys = set(ckpt["model_state_dict"].keys())
+    state_dict = ckpt["model_state_dict"]
+    state_keys = set(state_dict.keys())
     is_delta_model = any("delta_head" in k for k in state_keys)
     is_v2_model = any("action_head" in k for k in state_keys)
-    if is_delta_model:
+    # legacy_head: old ckpt where delta_head.0.weight is [256, 512] (vision only)
+    legacy_head = is_delta_model and state_dict["delta_head.0.weight"].shape[1] == config.hidden_dim
+
+    if legacy_head:
         action_chunk = 1
-        print("Model type: delta prediction (v3)")
+        print("Model type: delta prediction (legacy — qpos always active)")
+    elif is_delta_model:
+        action_chunk = 1
+        print("Model type: delta prediction (new — qpos training-only)")
     elif is_v2_model:
         action_chunk = config.action_chunk if hasattr(config, "action_chunk") else 1
         print(f"Model type: action chunking (v2), action_chunk={action_chunk}")
     else:
-        # Fallback: treat as delta if model doesn't accept action_chunk
         action_chunk = 1
         print("Model type: unknown, treating as delta")
 
@@ -185,8 +193,9 @@ def main():
         hidden_dim=config.hidden_dim, n_heads=config.n_heads,
         n_layers=config.n_layers, ff_dim=config.ff_dim,
         dropout=0.0, pretrained=False,
+        legacy_head=legacy_head,
     ).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    model.load_state_dict(state_dict)
     model.eval()
 
     # For delta model, pred_steps is always 1
@@ -241,7 +250,14 @@ def main():
 
     # Run sliding-window inference
     print("Running inference...")
+    if args.rollout:
+        print("  Mode: CLOSED-LOOP (rollout) — first frame GT, then chain predictions")
+    else:
+        print("  Mode: open-loop — each frame uses GT qpos")
     predictions = np.full((N, pred_steps, 4), np.nan, dtype=np.float32)
+
+    # For rollout: track the last predicted absolute qpos as the "current state"
+    rollout_qpos = None  # will be set after first window
 
     for start in range(0, N - T_img):
         end = start + T_img
@@ -264,11 +280,19 @@ def main():
         tgt_idx = start + T_img - 1
 
         if is_delta_model:
-            # Model predicts delta (change from last qpos)
-            # Convert to absolute: last_qpos + delta
             delta = pred[0].cpu().numpy()  # [4]
-            last_qpos = qpos_pp[tgt_idx]     # [4]
-            absolute_pred = last_qpos + delta
+
+            if args.rollout:
+                # Closed-loop: chain own predictions
+                if rollout_qpos is None:
+                    # First window: use GT qpos to bootstrap
+                    rollout_qpos = qpos_pp[tgt_idx].copy()
+                absolute_pred = rollout_qpos + delta
+                rollout_qpos = absolute_pred.copy()  # feed forward to next window
+            else:
+                # Open-loop: always use GT qpos
+                absolute_pred = qpos_pp[tgt_idx] + delta
+
             predictions[tgt_idx, 0] = absolute_pred
         else:
             for k in range(pred_steps):
@@ -277,7 +301,10 @@ def main():
                     predictions[tk, k] = pred[0, k].cpu().numpy()
 
     # Per-step MAE
-    print(f"Per-step MAE ({pred_steps} steps):")
+    mode_label = "CLOSED-LOOP (rollout)" if args.rollout else "OPEN-LOOP"
+    print(f"\n{'='*60}")
+    print(f"MAE — {mode_label}")
+    print(f"{'='*60}")
     mae_per_step = []
     for k in range(pred_steps):
         mask = ~np.isnan(predictions[:, k, 0])
@@ -287,11 +314,9 @@ def main():
             mae_per_step.append(mae_k)
             print(f"  Step {k+1}: Boom={mae_k[0]:.4f} Arm={mae_k[1]:.4f} "
                   f"Bucket={mae_k[2]:.4f} Swing={mae_k[3]:.4f}  (n={mask.sum()})")
-
-    # Overall MAE (step 0 only)
     mae_per = mae_per_step[0] if mae_per_step else np.zeros(4)
-    print(f"Overall (step1 only): Boom={mae_per[0]:.4f} Arm={mae_per[1]:.4f} "
-          f"Bucket={mae_per[2]:.4f} Swing={mae_per[3]:.4f} rad")
+    mean_mae = np.mean([m.mean() for m in mae_per_step]) if mae_per_step else 0
+    print(f"  → Mean: {mean_mae:.4f} rad = {mean_mae*57.3:.2f}°")
 
     # ============ Render video ============
     print("Rendering video frames...")
@@ -321,7 +346,10 @@ def main():
 
         # Title
         title_img = np.full((title_h, total_w, 3), 255, dtype=np.uint8)
-        cv2.putText(title_img, f"Frame: {i} / {N}  |  Model: {'delta' if is_delta_model else 'chunk'}  |  GT vs Prediction",
+        mode_tag = "ROLLOUT" if args.rollout else "open-loop"
+        if legacy_head:
+            mode_tag += " [legacy-qpos]"
+        cv2.putText(title_img, f"Frame: {i} / {N}  |  {mode_tag}  |  GT vs Prediction",
                     (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (50, 50, 50), 1, cv2.LINE_AA)
 
         # Step1 MAE text (comparable to V1 single-step)
