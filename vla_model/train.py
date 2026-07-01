@@ -24,7 +24,7 @@ from vla_model.model import ExcavatorVLA, count_parameters
 from vla_model.dataset import ExcavatorDataset
 
 
-def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch):
+def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, config, epoch):
     """Train one epoch."""
     model.train()
     total_loss = 0.0
@@ -54,6 +54,9 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch):
 
         scaler.step(optimizer)
         scaler.update()
+
+        # Step LR scheduler per batch (warmup is per-step, not per-epoch)
+        scheduler.step()
 
         total_loss += loss.item()
         mae = (delta_pred.detach() - delta_gt).abs().mean(dim=0).cpu().numpy()
@@ -246,11 +249,9 @@ def main():
         t0 = time.time()
 
         # Train
-        train_metrics = train_epoch(model, train_loader, optimizer, scaler, criterion, config, epoch)
+        train_metrics = train_epoch(model, train_loader, optimizer, scaler, scheduler, criterion, config, epoch)
         history["train_loss"].append(train_metrics["loss"])
         history["train_mae"].append(train_metrics["mae_mean"])
-
-        scheduler.step()
 
         # EMA update (smoothed weights for better generalization)
         if ema_model is not None:
