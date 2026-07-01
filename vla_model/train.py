@@ -128,6 +128,7 @@ def main():
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--seq_len", type=int, default=None)
     parser.add_argument("--sample_ratio", type=float, default=None, help="Fraction of data to use (0.2=20%% for fast training)")
+    parser.add_argument("--img_size", type=int, default=None, help="Override image size")
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
     parser.add_argument("--overfit", action="store_true", help="Overfit single episode")
     args = parser.parse_args()
@@ -147,6 +148,8 @@ def main():
         config.seq_len = args.seq_len
     if args.sample_ratio is not None:
         config.sample_ratio = args.sample_ratio
+    if args.img_size is not None:
+        config.img_size = args.img_size
 
     # Device
     config.device = "cuda" if torch.cuda.is_available() else "cpu"
