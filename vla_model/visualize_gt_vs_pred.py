@@ -258,6 +258,10 @@ def main():
         print("  Mode: open-loop — each frame uses GT qpos")
     predictions = np.full((N, pred_steps, 4), np.nan, dtype=np.float32)
 
+    # Fill first T-1 frames with GT values so the prediction curve starts at frame 0
+    for k in range(pred_steps):
+        predictions[:T_img - 1, k] = targets[:T_img - 1]
+
     # For rollout: track the last predicted absolute qpos as the "current state"
     rollout_qpos = None  # will be set after first window
 
