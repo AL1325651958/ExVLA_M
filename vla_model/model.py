@@ -112,9 +112,9 @@ class ExcavatorVLA(nn.Module):
 
         self.vision_encoder = TwoStreamEncoder(hidden_dim, pretrained=pretrained)
         self.excv_embed = nn.Embedding(num_excavators, hidden_dim)
-        # Keep Dropout in qpos_proj for backward compat with old checkpoints
+        # No Dropout here — it's just a small embedder
         self.qpos_proj = nn.Sequential(
-            nn.Linear(4, hidden_dim // 4), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(4, hidden_dim // 4), nn.GELU(),
             nn.Linear(hidden_dim // 4, hidden_dim),
         )
         self.pos_embed = nn.Parameter(torch.randn(1, seq_len, hidden_dim) * 0.02)
