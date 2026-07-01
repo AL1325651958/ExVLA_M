@@ -195,7 +195,6 @@ def main():
     # Model
     model = ExcavatorVLA(
         seq_len=config.seq_len,
-        action_chunk=config.action_chunk,
         hidden_dim=config.hidden_dim,
         n_heads=config.n_heads,
         n_layers=config.n_layers,
