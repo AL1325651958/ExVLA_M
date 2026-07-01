@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import cv2
 import imageio
+from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -240,9 +241,10 @@ def main():
         print(f"  Large ({mem_needed:.0f}MB), on-the-fly mode")
         rgb_pp = None; elev_pp = None
     else:
+        print(f"  Preprocessing {N} frames...")
         rgb_pp = np.zeros((N, 3, args.img_size, args.img_size), dtype=np.float32)
         elev_pp = np.zeros((N, 3, args.img_size, args.img_size), dtype=np.float32)
-        for i in range(N):
+        for i in tqdm(range(N), desc="  Preprocessing"):
             rgb_pp[i] = preprocess_image(mains[i], args.img_size)
             elev_pp[i] = preprocess_image(elevations[i], args.img_size)
 
@@ -259,7 +261,7 @@ def main():
     # For rollout: track the last predicted absolute qpos as the "current state"
     rollout_qpos = None  # will be set after first window
 
-    for start in range(0, N - T_img):
+    for start in tqdm(range(0, N - T_img), desc="  Inference"):
         end = start + T_img
         if rgb_pp is not None:
             rgb_seq = torch.from_numpy(rgb_pp[start:end]).unsqueeze(0).to(device)
