@@ -8,7 +8,7 @@ class Config:
     data_dir: str = "data/excavator-motion"
     seq_len: int = 8
     action_chunk: int = 1          # single step (delta prediction)
-    img_size: int = 384            # 384 for 5090
+    img_size: int = 224            # can override with --img_size
     train_split: float = 0.9
     sample_ratio: float = 0.2
 
