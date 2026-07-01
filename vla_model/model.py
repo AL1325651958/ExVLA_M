@@ -106,8 +106,9 @@ class ExcavatorVLA(nn.Module):
 
         self.vision_encoder = TwoStreamEncoder(hidden_dim, pretrained=pretrained)
         self.excv_embed = nn.Embedding(num_excavators, hidden_dim)
+        # Privileged info: used ONLY during training (self.training=True)
         self.qpos_proj = nn.Sequential(
-            nn.Linear(4, hidden_dim // 4), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(4, hidden_dim // 4), nn.GELU(),
             nn.Linear(hidden_dim // 4, hidden_dim),
         )
         self.pos_embed = nn.Parameter(torch.randn(1, seq_len, hidden_dim) * 0.02)
@@ -120,9 +121,9 @@ class ExcavatorVLA(nn.Module):
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         self.stoch_depth = DropPath(drop_path_rate)
 
-        # Head: predicts Δqpos (4 values), not absolute
+        # Head: vision + excavator ID → delta (NO qpos at inference)
         self.delta_head = nn.Sequential(
-            nn.Linear(hidden_dim, 256), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden_dim + hidden_dim, 256), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(256, 128), nn.GELU(), nn.Dropout(dropout * 0.5),
             nn.Linear(128, 4),
         )
@@ -142,37 +143,43 @@ class ExcavatorVLA(nn.Module):
 
     def forward(self, rgb, elevation, qpos=None, excavator_id=None):
         """
+        qpos is privileged information: only used during training (self.training=True).
+        At inference time (model.eval()), prediction is purely vision-based.
+
         Returns:
             delta [B, 4] — predicted change from last qpos
-            Final prediction = last_qpos + delta
         """
         B, T = rgb.shape[:2]
         H, W = rgb.shape[3], rgb.shape[4]
 
-        # Vision
+        # 1. Vision encoder (per-frame)
         rgb_flat = rgb.reshape(B * T, 3, H, W)
         elev_flat = elevation.reshape(B * T, 3, H, W)
         features = self.vision_encoder(rgb_flat, elev_flat).view(B, T, -1)
 
-        # Proprioception + excavator
-        if qpos is not None:
+        # 2. qpos: privileged info — only during training
+        if qpos is not None and self.training:
             features = features + self.qpos_proj(qpos)
+
+        # 3. Excavator ID embedding
         if excavator_id is not None:
             features = features + self.excv_embed(excavator_id).unsqueeze(1)
 
-        # Position encoding
+        # 4. Position encoding
         if T <= self.seq_len:
             features = features + self.pos_embed[:, :T, :]
         else:
             features = self.sinusoidal_pe(features.permute(1, 0, 2)).permute(1, 0, 2)
 
-        # Transformer
+        # 5. Transformer
         features = features.permute(1, 0, 2)
         encoded = self.stoch_depth(self.transformer(features))
         encoded = encoded.permute(1, 0, 2)
 
-        # Predict delta (change from last qpos)
-        delta = self.delta_head(encoded[:, -1, :])  # [B, 4]
+        # 6. Head: vision + excavator ID → delta (no qpos)
+        vision_feat = encoded[:, -1, :]           # [B, hidden_dim]
+        excv_feat = self.excv_embed(excavator_id) # [B, hidden_dim]
+        delta = self.delta_head(torch.cat([vision_feat, excv_feat], dim=-1))
 
         return delta
 
