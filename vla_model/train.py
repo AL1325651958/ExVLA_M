@@ -24,11 +24,31 @@ from vla_model.model import ExcavatorVLA, count_parameters
 from vla_model.dataset import ExcavatorDataset
 
 
+def _compute_r2(ss_res, sum_y, sum_y2, n):
+    """Compute per-joint R² from accumulated statistics.
+
+    ss_res[j]: sum of squared residuals
+    sum_y[j]:  sum of true values
+    sum_y2[j]: sum of squared true values
+    n:         total number of samples
+    Returns: per-joint R² [4], mean R²
+    """
+    ss_tot = sum_y2 - (sum_y ** 2) / n
+    ss_tot = np.maximum(ss_tot, 1e-10)  # avoid div-by-zero for constant joints
+    r2 = 1 - ss_res / ss_tot
+    return r2, float(r2.mean())
+
+
 def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, config, epoch):
     """Train one epoch."""
     model.train()
     total_loss = 0.0
-    total_mae = np.zeros(4)  # per-joint MAE
+    total_mae = np.zeros(4)
+    # R² accumulators
+    ss_res = np.zeros(4)
+    sum_y  = np.zeros(4)
+    sum_y2 = np.zeros(4)
+    n_total = 0
     n_batches = 0
 
     pbar = tqdm(dataloader, desc=f"Train Epoch {epoch+1}")
@@ -47,20 +67,23 @@ def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, conf
             loss = criterion(action_pred, action_label)
 
         scaler.scale(loss).backward()
-
-        # Gradient clipping
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
-
         scaler.step(optimizer)
         scaler.update()
-
-        # Step LR scheduler per batch (warmup is per-step, not per-epoch)
         scheduler.step()
 
         total_loss += loss.item()
         mae = (action_pred.detach() - action_label).abs().mean(dim=0).cpu().numpy()
         total_mae += mae
+
+        # Accumulate R² stats (detach, CPU)
+        pred_cpu = action_pred.detach().cpu().numpy()
+        label_cpu = action_label.cpu().numpy()
+        ss_res += ((pred_cpu - label_cpu) ** 2).sum(axis=0)
+        sum_y  += label_cpu.sum(axis=0)
+        sum_y2 += (label_cpu ** 2).sum(axis=0)
+        n_total += len(label_cpu)
         n_batches += 1
 
         if step % config.log_interval == 0:
@@ -69,19 +92,26 @@ def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, conf
                 "mae": f"{mae.mean():.4f}",
             })
 
+    r2_per, r2_mean = _compute_r2(ss_res, sum_y, sum_y2, n_total)
     return {
         "loss": total_loss / n_batches,
         "mae": (total_mae / n_batches).tolist(),
         "mae_mean": float(total_mae.mean() / n_batches),
+        "r2": r2_per.tolist(),
+        "r2_mean": r2_mean,
     }
 
 
 @torch.no_grad()
 def validate(model, dataloader, criterion, config):
-    """Validation."""
+    """Validation with R²."""
     model.eval()
     total_loss = 0.0
     total_mae = np.zeros(4)
+    ss_res = np.zeros(4)
+    sum_y  = np.zeros(4)
+    sum_y2 = np.zeros(4)
+    n_total = 0
     n_batches = 0
 
     for batch in tqdm(dataloader, desc="Validating"):
@@ -98,12 +128,22 @@ def validate(model, dataloader, criterion, config):
         total_loss += loss.item()
         mae = (action_pred - action_label).abs().mean(dim=0).cpu().numpy()
         total_mae += mae
+
+        pred_cpu = action_pred.cpu().numpy()
+        label_cpu = action_label.cpu().numpy()
+        ss_res += ((pred_cpu - label_cpu) ** 2).sum(axis=0)
+        sum_y  += label_cpu.sum(axis=0)
+        sum_y2 += (label_cpu ** 2).sum(axis=0)
+        n_total += len(label_cpu)
         n_batches += 1
 
+    r2_per, r2_mean = _compute_r2(ss_res, sum_y, sum_y2, n_total)
     return {
         "loss": total_loss / n_batches,
         "mae": (total_mae / n_batches).tolist(),
         "mae_mean": float(total_mae.mean() / n_batches),
+        "r2": r2_per.tolist(),
+        "r2_mean": r2_mean,
     }
 
 
@@ -243,7 +283,8 @@ def main():
         print(f"Resumed from {args.resume} at epoch {start_epoch}")
 
     # Training loop
-    history = {"train_loss": [], "val_loss": [], "train_mae": [], "val_mae": []}
+    history = {"train_loss": [], "val_loss": [], "train_mae": [], "val_mae": [],
+               "train_r2": [], "val_r2": []}
 
     for epoch in range(start_epoch, config.epochs):
         t0 = time.time()
@@ -252,19 +293,22 @@ def main():
         train_metrics = train_epoch(model, train_loader, optimizer, scaler, scheduler, criterion, config, epoch)
         history["train_loss"].append(train_metrics["loss"])
         history["train_mae"].append(train_metrics["mae_mean"])
+        history["train_r2"].append(train_metrics["r2_mean"])
 
-        # EMA update (smoothed weights for better generalization)
+        # EMA update
         if ema_model is not None:
             with torch.no_grad():
                 for ema_p, p in zip(ema_model.parameters(), model.parameters()):
                     ema_p.data.mul_(config.ema_decay).add_(p.data, alpha=1 - config.ema_decay)
 
         # Validate
-        val_metrics = {"loss": float("nan"), "mae": [0, 0, 0, 0], "mae_mean": float("nan")}
+        val_metrics = {"loss": float("nan"), "mae": [0, 0, 0, 0], "mae_mean": float("nan"),
+                       "r2": [0, 0, 0, 0], "r2_mean": float("nan")}
         if val_loader is not None and len(val_loader) > 0:
             val_metrics = validate(model, val_loader, criterion, config)
             history["val_loss"].append(val_metrics["loss"])
             history["val_mae"].append(val_metrics["mae_mean"])
+            history["val_r2"].append(val_metrics["r2_mean"])
 
         elapsed = time.time() - t0
         lr_now = scheduler.get_last_lr()[0]
@@ -276,10 +320,14 @@ def main():
             f"Val Loss: {val_metrics['loss']:.6f} | "
             f"Train MAE: {train_metrics['mae_mean']:.4f} | "
             f"Val MAE: {val_metrics['mae_mean']:.4f} | "
+            f"Train R²: {train_metrics['r2_mean']:.4f} | "
+            f"Val R²: {val_metrics['r2_mean']:.4f} | "
             f"Time: {elapsed:.1f}s"
         )
         print(f"  Per-joint MAE - Train: {[f'{x:.4f}' for x in train_metrics['mae']]} | "
               f"Val: {[f'{x:.4f}' for x in val_metrics['mae']]}")
+        print(f"  Per-joint R²  - Train: {[f'{x:.4f}' for x in train_metrics['r2']]} | "
+              f"Val: {[f'{x:.4f}' for x in val_metrics['r2']]}")
 
         # Save best
         is_best = val_metrics.get("loss", float("inf")) < best_loss
