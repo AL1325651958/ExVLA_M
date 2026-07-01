@@ -1,7 +1,7 @@
-"""ExcavatorVLA: VLA model — two-stream vision + proprioception + excavator ID + delta output.
+"""ExcavatorVLA: two-stream vision + Transformer -> absolute joint angle prediction.
 
-Predicts Δqpos (change from current position), not absolute qpos.
-Final prediction = last_qpos + Δ.
+Pure vision at inference. qpos is privileged info (training only).
+Output: next absolute qpos [B, 4] -- no delta, no anchor needed.
 """
 
 import warnings
@@ -82,37 +82,31 @@ class DropPath(nn.Module):
 
 
 class ExcavatorVLA(nn.Module):
-    """VLA model: two-stream vision + proprioception + excavator ID → delta prediction.
+    """VLA: pure vision -> absolute next joint position.
 
-    Predicts Δqpos from last qpos — residual learning is easier and smoother.
-    final = last_qpos + Δ
+    qpos is privileged information: injected into Transformer during training
+    only. At inference (model.eval()), prediction is purely vision-based.
 
     Input:
         rgb           [B, T, 3, H, W]
         elevation     [B, T, 3, H, W]
-        qpos          [B, T, 4]     current joint state
-        excavator_id  [B]           0=75, 1=306, 2=490
+        qpos          [B, T, 4]     (training only, ignored at inference)
+        excavator_id  [B]
     Output:
-        delta         [B, 4]        predicted Δqpos
+        next_qpos     [B, 4]        absolute joint angles (radians)
     """
 
     def __init__(
         self, seq_len=8, hidden_dim=512, n_heads=8, n_layers=4, ff_dim=2048,
         dropout=0.1, drop_path_rate=0.05, pretrained=True, num_excavators=4,
-        legacy_head: bool = False,
     ):
-        """
-        legacy_head=True: compatible with old ckpts (head input = hidden_dim only).
-        legacy_head=False: new style (head input = vision + excv_id concat).
-        """
         super().__init__()
         self.seq_len = seq_len
         self.hidden_dim = hidden_dim
-        self.legacy_head = legacy_head
 
         self.vision_encoder = TwoStreamEncoder(hidden_dim, pretrained=pretrained)
         self.excv_embed = nn.Embedding(num_excavators, hidden_dim)
-        # No Dropout here — it's just a small embedder
+        # Privileged: qpos injected into Transformer during training only
         self.qpos_proj = nn.Sequential(
             nn.Linear(4, hidden_dim // 4), nn.GELU(),
             nn.Linear(hidden_dim // 4, hidden_dim),
@@ -127,12 +121,9 @@ class ExcavatorVLA(nn.Module):
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         self.stoch_depth = DropPath(drop_path_rate)
 
-        # Head input size depends on mode
-        if legacy_head:
-            head_in = hidden_dim                   # old: vision only
-        else:
-            head_in = hidden_dim + hidden_dim      # new: vision + excv_id
-        self.delta_head = nn.Sequential(
+        # Head: vision_feat + excavator_id -> absolute qpos
+        head_in = hidden_dim + hidden_dim
+        self.action_head = nn.Sequential(
             nn.Linear(head_in, 256), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(256, 128), nn.GELU(), nn.Dropout(dropout * 0.5),
             nn.Linear(128, 4),
@@ -144,7 +135,7 @@ class ExcavatorVLA(nn.Module):
         for p in self.transformer.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p, gain=0.5)
-        for module in self.delta_head:
+        for module in self.action_head:
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight, gain=0.5)
                 if module.bias is not None:
@@ -153,8 +144,8 @@ class ExcavatorVLA(nn.Module):
 
     def forward(self, rgb, elevation, qpos=None, excavator_id=None):
         """
-        Returns delta [B, 4]. legacy_head(old ckpt): qpos always injected.
-        New mode: qpos is privileged (training only).
+        Returns:
+            next_qpos [B, 4] -- absolute joint angles (radians)
         """
         B, T = rgb.shape[:2]
         H, W = rgb.shape[3], rgb.shape[4]
@@ -164,38 +155,27 @@ class ExcavatorVLA(nn.Module):
         elev_flat = elevation.reshape(B * T, 3, H, W)
         features = self.vision_encoder(rgb_flat, elev_flat).view(B, T, -1)
 
-        # 2. qpos: legacy=always, new=training only
-        if self.legacy_head:
-            if qpos is not None:
-                features = features + self.qpos_proj(qpos)
-        else:
-            if qpos is not None and self.training:
-                features = features + self.qpos_proj(qpos)
+        # 2. qpos: privileged info, training only
+        if qpos is not None and self.training:
+            features = features + self.qpos_proj(qpos)
 
-        # 3. Excavator ID
-        if excavator_id is not None and self.legacy_head:
-            features = features + self.excv_embed(excavator_id).unsqueeze(1)
-
-        # 4. Position encoding
+        # 3. Position encoding
         if T <= self.seq_len:
             features = features + self.pos_embed[:, :T, :]
         else:
             features = self.sinusoidal_pe(features.permute(1, 0, 2)).permute(1, 0, 2)
 
-        # 5. Transformer
+        # 4. Transformer
         features = features.permute(1, 0, 2)
         encoded = self.stoch_depth(self.transformer(features))
         encoded = encoded.permute(1, 0, 2)
 
-        # 6. Head
-        vision_feat = encoded[:, -1, :]  # [B, hidden_dim]
-        if self.legacy_head:
-            delta = self.delta_head(vision_feat)
-        else:
-            excv_feat = self.excv_embed(excavator_id)
-            delta = self.delta_head(torch.cat([vision_feat, excv_feat], dim=-1))
+        # 5. Head: vision + excavator ID -> absolute qpos
+        vision_feat = encoded[:, -1, :]
+        excv_feat = self.excv_embed(excavator_id)
+        next_qpos = self.action_head(torch.cat([vision_feat, excv_feat], dim=-1))
 
-        return delta
+        return next_qpos
 
 
 def count_parameters(model: nn.Module) -> dict:

@@ -183,16 +183,14 @@ class ExcavatorDataset(Dataset):
             elev_seq[t] = self._preprocess_image(ep["elevations_raw"][i], augment)
 
         qpos_seq = ep["qpos"][start:end]         # [T, 4]
-        # Target: delta = next_qpos - last_qpos (residual learning)
-        last_qpos = qpos_seq[-1]                  # [4]
-        next_qpos = ep["action"][start + T - 1]   # [4]
-        action_delta = next_qpos - last_qpos      # [4] — predicted change
+        # Target: absolute next qpos (not delta)
+        next_qpos = ep["action"][start + T - 1]   # [4] -- absolute joint angles
         excv_id = ep["excavator_id"]
 
         return {
             "rgb": torch.from_numpy(rgb_seq),
             "elevation": torch.from_numpy(elev_seq),
             "qpos": torch.from_numpy(qpos_seq.copy()),
-            "action": torch.from_numpy(action_delta.reshape(1, 4).copy()),
+            "action": torch.from_numpy(next_qpos.reshape(1, 4).copy()),
             "excavator_id": torch.tensor(excv_id, dtype=torch.long),
         }

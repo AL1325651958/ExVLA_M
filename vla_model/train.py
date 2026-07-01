@@ -42,9 +42,9 @@ def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, conf
         optimizer.zero_grad()
 
         with autocast():
-            delta_pred = model(rgb, elevation, qpos, excavator_id)  # [B, 4]
-            delta_gt = action_gt.squeeze(1)  # [B, 4]
-            loss = criterion(delta_pred, delta_gt)
+            action_pred = model(rgb, elevation, qpos, excavator_id)  # [B, 4] absolute
+            action_label = action_gt.squeeze(1)  # [B, 4]
+            loss = criterion(action_pred, action_label)
 
         scaler.scale(loss).backward()
 
@@ -59,7 +59,7 @@ def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, conf
         scheduler.step()
 
         total_loss += loss.item()
-        mae = (delta_pred.detach() - delta_gt).abs().mean(dim=0).cpu().numpy()
+        mae = (action_pred.detach() - action_label).abs().mean(dim=0).cpu().numpy()
         total_mae += mae
         n_batches += 1
 
@@ -91,12 +91,12 @@ def validate(model, dataloader, criterion, config):
         excavator_id = batch["excavator_id"].to(config.device)
         action_gt = batch["action"].to(config.device)
 
-        delta_pred = model(rgb, elevation, qpos, excavator_id)
-        delta_gt = action_gt.squeeze(1)
-        loss = criterion(delta_pred, delta_gt)
+        action_pred = model(rgb, elevation, qpos, excavator_id)
+        action_label = action_gt.squeeze(1)
+        loss = criterion(action_pred, action_label)
 
         total_loss += loss.item()
-        mae = (delta_pred - delta_gt).abs().mean(dim=0).cpu().numpy()
+        mae = (action_pred - action_label).abs().mean(dim=0).cpu().numpy()
         total_mae += mae
         n_batches += 1
 

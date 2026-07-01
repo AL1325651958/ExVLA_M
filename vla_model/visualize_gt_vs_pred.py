@@ -168,42 +168,46 @@ def main():
     if "config" in ckpt and hasattr(ckpt["config"], "hidden_dim"):
         config = ckpt["config"]
 
-    # Detect model version from state_dict keys
+    # Load model (absolute output — no delta conversion needed)
+    print(f"Loading checkpoint: {args.checkpoint}")
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    config = Config()
+    if "config" in ckpt and hasattr(ckpt["config"], "hidden_dim"):
+        config = ckpt["config"]
+
+    # Auto-detect: old ckpts have "delta_head", new ones have "action_head"
     state_dict = ckpt["model_state_dict"]
     state_keys = set(state_dict.keys())
-    is_delta_model = any("delta_head" in k for k in state_keys)
-    is_v2_model = any("action_head" in k for k in state_keys)
-    # legacy_head: old ckpt where delta_head.0.weight is [256, 512] (vision only)
-    legacy_head = is_delta_model and state_dict["delta_head.0.weight"].shape[1] == config.hidden_dim
+    has_delta_head = any("delta_head" in k for k in state_keys)
+    has_action_head = any("action_head" in k for k in state_keys)
 
-    if legacy_head:
-        action_chunk = 1
-        print("Model type: delta prediction (legacy — qpos always active)")
-    elif is_delta_model:
-        action_chunk = 1
-        print("Model type: delta prediction (new — qpos training-only)")
-    elif is_v2_model:
-        action_chunk = config.action_chunk if hasattr(config, "action_chunk") else 1
-        print(f"Model type: action chunking (v2), action_chunk={action_chunk}")
+    if has_action_head:
+        print("Model type: absolute qpos prediction")
+        is_absolute = True
+    elif has_delta_head:
+        print("Model type: delta prediction (legacy) — will convert to absolute")
+        is_absolute = False
     else:
-        action_chunk = 1
-        print("Model type: unknown, treating as delta")
+        print("Model type: unknown")
+        is_absolute = False
 
     model = ExcavatorVLA(
         seq_len=args.seq_len,
         hidden_dim=config.hidden_dim, n_heads=config.n_heads,
         n_layers=config.n_layers, ff_dim=config.ff_dim,
         dropout=0.0, pretrained=False,
-        legacy_head=legacy_head,
     ).to(device)
+
+    # Handle old delta checkpoints: map delta_head weights to action_head
+    if has_delta_head and not has_action_head:
+        sd_new = {}
+        for k, v in state_dict.items():
+            sd_new[k.replace("delta_head", "action_head")] = v
+        state_dict = sd_new
     model.load_state_dict(state_dict)
     model.eval()
 
-    # For delta model, pred_steps is always 1
-    if is_delta_model:
-        pred_steps = 1
-    else:
-        pred_steps = min(args.pred_steps or action_chunk, action_chunk)
+    pred_steps = 1
     print(f"Prediction steps to visualize: {pred_steps}")
 
     # Load data
@@ -255,15 +259,15 @@ def main():
     if args.rollout:
         print("  Mode: CLOSED-LOOP (rollout) — first frame GT, then chain predictions")
     else:
-        print("  Mode: open-loop — each frame uses GT qpos")
-    predictions = np.full((N, pred_steps, 4), np.nan, dtype=np.float32)
+        print("  Mode: open-loop — each window independent")
 
-    # Fill first T-1 frames with GT values so the prediction curve starts at frame 0
+    predictions = np.full((N, pred_steps, 4), np.nan, dtype=np.float32)
+    # Fill first T-1 frames with GT
     for k in range(pred_steps):
         predictions[:T_img - 1, k] = targets[:T_img - 1]
 
-    # For rollout: track the last predicted absolute qpos as the "current state"
-    rollout_qpos = None  # will be set after first window
+    # For rollout: carry forward the model's own prediction
+    rollout_pred = None
 
     for start in tqdm(range(0, N - T_img), desc="  Inference"):
         end = start + T_img
@@ -279,32 +283,30 @@ def main():
                 _elev[t] = preprocess_image(elevations[i], args.img_size)
             rgb_seq = torch.from_numpy(_rgb).unsqueeze(0).to(device)
             elev_seq = torch.from_numpy(_elev).unsqueeze(0).to(device)
+
+        # Rollout: feed predicted qpos into the sliding window so model can use it
+        if args.rollout and rollout_pred is not None:
+            # Replace last frame qpos with our own prediction
+            qpos_pp[end - 1] = rollout_pred
+
         qpos_seq = torch.from_numpy(qpos_pp[start:end]).unsqueeze(0).to(device)
         with torch.no_grad():
-            pred = model(rgb_seq, elev_seq, qpos_seq, excv_tensor)  # [1, K, 4] or [1, 4]
+            pred = model(rgb_seq, elev_seq, qpos_seq, excv_tensor)
 
         tgt_idx = start + T_img - 1
 
-        if is_delta_model:
-            delta = pred[0].cpu().numpy()  # [4]
-
-            if args.rollout:
-                # Closed-loop: chain own predictions
-                if rollout_qpos is None:
-                    # First window: use GT qpos to bootstrap
-                    rollout_qpos = qpos_pp[tgt_idx].copy()
-                absolute_pred = rollout_qpos + delta
-                rollout_qpos = absolute_pred.copy()  # feed forward to next window
-            else:
-                # Open-loop: always use GT qpos
-                absolute_pred = qpos_pp[tgt_idx] + delta
-
-            predictions[tgt_idx, 0] = absolute_pred
+        if is_absolute:
+            # Model outputs absolute qpos directly
+            val = pred[0].cpu().numpy()  # [4]
         else:
-            for k in range(pred_steps):
-                tk = tgt_idx + k
-                if tk < N:
-                    predictions[tk, k] = pred[0, k].cpu().numpy()
+            # Legacy delta model: convert to absolute
+            delta = pred[0].cpu().numpy()
+            val = qpos_pp[tgt_idx] + delta
+
+        predictions[tgt_idx, 0] = val
+
+        if args.rollout:
+            rollout_pred = val.copy()  # chain to next window
 
     # Per-step MAE
     mode_label = "CLOSED-LOOP (rollout)" if args.rollout else "OPEN-LOOP"
@@ -353,8 +355,8 @@ def main():
         # Title
         title_img = np.full((title_h, total_w, 3), 255, dtype=np.uint8)
         mode_tag = "ROLLOUT" if args.rollout else "open-loop"
-        if legacy_head:
-            mode_tag += " [legacy-qpos]"
+        if not is_absolute:
+            mode_tag += " [delta-legacy]"
         cv2.putText(title_img, f"Frame: {i} / {N}  |  {mode_tag}  |  GT vs Prediction",
                     (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (50, 50, 50), 1, cv2.LINE_AA)
 
