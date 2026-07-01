@@ -37,21 +37,14 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch):
         elevation = batch["elevation"].to(config.device)
         qpos = batch["qpos"].to(config.device)
         excavator_id = batch["excavator_id"].to(config.device)
-        action_gt = batch["action"].to(config.device)  # [B, K, 4]
+        action_gt = batch["action"].to(config.device)  # [B, 1, 4]
 
         optimizer.zero_grad()
 
         with autocast():
-            action_pred = model(rgb, elevation, qpos, excavator_id)  # [B, K, 4]
-            mse_loss = criterion(action_pred, action_gt)
-
-            # Temporal smoothness loss for action chunks (anti-jitter)
-            if action_pred.size(1) > 1:
-                smooth_loss = config.smooth_loss_weight * ((action_pred[:, 1:] - action_pred[:, :-1]) ** 2).mean()
-            else:
-                smooth_loss = 0.0
-
-            loss = mse_loss + smooth_loss
+            delta_pred = model(rgb, elevation, qpos, excavator_id)  # [B, 4]
+            delta_gt = action_gt.squeeze(1)  # [B, 4]
+            loss = criterion(delta_pred, delta_gt)
 
         scaler.scale(loss).backward()
 
@@ -63,7 +56,7 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch):
         scaler.update()
 
         total_loss += loss.item()
-        mae = (action_pred.detach() - action_gt).abs().mean(dim=(0, 1)).cpu().numpy()
+        mae = (delta_pred.detach() - delta_gt).abs().mean(dim=0).cpu().numpy()
         total_mae += mae
         n_batches += 1
 
@@ -95,11 +88,12 @@ def validate(model, dataloader, criterion, config):
         excavator_id = batch["excavator_id"].to(config.device)
         action_gt = batch["action"].to(config.device)
 
-        action_pred = model(rgb, elevation, qpos, excavator_id)
-        loss = criterion(action_pred, action_gt)
+        delta_pred = model(rgb, elevation, qpos, excavator_id)
+        delta_gt = action_gt.squeeze(1)
+        loss = criterion(delta_pred, delta_gt)
 
         total_loss += loss.item()
-        mae = (action_pred - action_gt).abs().mean(dim=(0, 1)).cpu().numpy()
+        mae = (delta_pred - delta_gt).abs().mean(dim=0).cpu().numpy()
         total_mae += mae
         n_batches += 1
 

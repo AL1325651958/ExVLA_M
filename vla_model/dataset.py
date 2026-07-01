@@ -183,13 +183,16 @@ class ExcavatorDataset(Dataset):
             elev_seq[t] = self._preprocess_image(ep["elevations_raw"][i], augment)
 
         qpos_seq = ep["qpos"][start:end]         # [T, 4]
-        action_target = ep["action"][start + T - 1 : start + T + K - 1]  # [K, 4]
+        # Target: delta = next_qpos - last_qpos (residual learning)
+        last_qpos = qpos_seq[-1]                  # [4]
+        next_qpos = ep["action"][start + T - 1]   # [4]
+        action_delta = next_qpos - last_qpos      # [4] — predicted change
         excv_id = ep["excavator_id"]
 
         return {
             "rgb": torch.from_numpy(rgb_seq),
             "elevation": torch.from_numpy(elev_seq),
             "qpos": torch.from_numpy(qpos_seq.copy()),
-            "action": torch.from_numpy(action_target.copy()),
+            "action": torch.from_numpy(action_delta.reshape(1, 4).copy()),
             "excavator_id": torch.tensor(excv_id, dtype=torch.long),
         }

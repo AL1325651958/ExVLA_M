@@ -1,11 +1,7 @@
-"""ExcavatorVLA: Vision-Language-Action model with Transformer for joint prediction.
+"""ExcavatorVLA: VLA model — two-stream vision + proprioception + excavator ID + delta output.
 
-v2 improvements:
-  - Two-stream vision encoder (RGB + Elevation separate backbones)
-  - Excavator ID embedding (per-model learnable bias)
-  - Proprioception input (current qpos)
-  - Action chunking (predict K future frames)
-  - Stochastic Depth (DropPath) + increased dropout for regularization
+Predicts Δqpos (change from current position), not absolute qpos.
+Final prediction = last_qpos + Δ.
 """
 
 import warnings
@@ -25,7 +21,6 @@ class ImageEncoder(nn.Module):
         super().__init__()
         weights = ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
         self.backbone = resnet18(weights=weights)
-
         if in_channels != 3:
             old_conv = self.backbone.conv1
             self.backbone.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
@@ -35,22 +30,16 @@ class ImageEncoder(nn.Module):
                     for c in range(min(3, in_channels)):
                         new_weight[:, c] = old_conv.weight[:, c % 3]
                     self.backbone.conv1.weight.copy_(new_weight)
-
         in_features = self.backbone.fc.in_features
         self.backbone.fc = nn.Identity()
-        self._out_features = in_features
         self.proj = nn.Linear(in_features, hidden_dim) if in_features != hidden_dim else nn.Identity()
-
-    @property
-    def out_features(self) -> int:
-        return self._out_features
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.proj(self.backbone(x))
 
 
 class TwoStreamEncoder(nn.Module):
-    """Two-tower vision encoder: separate ResNet-18 for RGB and Elevation, then concat."""
+    """Two-tower: separate ResNet-18 for RGB and Elevation, then concat."""
 
     def __init__(self, hidden_dim: int = 512, pretrained: bool = True):
         super().__init__()
@@ -63,8 +52,6 @@ class TwoStreamEncoder(nn.Module):
 
 
 class PositionalEncoding(nn.Module):
-    """Sinusoidal position encoding."""
-
     def __init__(self, d_model: int, max_len: int = 5000, dropout: float = 0.1):
         super().__init__()
         self.dropout = nn.Dropout(p=dropout)
@@ -80,8 +67,6 @@ class PositionalEncoding(nn.Module):
 
 
 class DropPath(nn.Module):
-    """Stochastic Depth for regularization."""
-
     def __init__(self, drop_prob: float = 0.0):
         super().__init__()
         self.drop_prob = drop_prob
@@ -97,24 +82,26 @@ class DropPath(nn.Module):
 
 
 class ExcavatorVLA(nn.Module):
-    """VLA model v2: two-stream vision + proprioception + excavator ID + regularization."""
+    """VLA model: two-stream vision + proprioception + excavator ID → delta prediction.
+
+    Predicts Δqpos from last qpos — residual learning is easier and smoother.
+    final = last_qpos + Δ
+
+    Input:
+        rgb           [B, T, 3, H, W]
+        elevation     [B, T, 3, H, W]
+        qpos          [B, T, 4]     current joint state
+        excavator_id  [B]           0=75, 1=306, 2=490
+    Output:
+        delta         [B, 4]        predicted Δqpos
+    """
 
     def __init__(
-        self,
-        seq_len: int = 8,
-        action_chunk: int = 5,
-        hidden_dim: int = 512,
-        n_heads: int = 8,
-        n_layers: int = 4,
-        ff_dim: int = 2048,
-        dropout: float = 0.15,
-        drop_path_rate: float = 0.1,
-        pretrained: bool = True,
-        num_excavators: int = 4,
+        self, seq_len=8, hidden_dim=512, n_heads=8, n_layers=4, ff_dim=2048,
+        dropout=0.1, drop_path_rate=0.05, pretrained=True, num_excavators=4,
     ):
         super().__init__()
         self.seq_len = seq_len
-        self.action_chunk = action_chunk
         self.hidden_dim = hidden_dim
 
         self.vision_encoder = TwoStreamEncoder(hidden_dim, pretrained=pretrained)
@@ -126,20 +113,18 @@ class ExcavatorVLA(nn.Module):
         self.pos_embed = nn.Parameter(torch.randn(1, seq_len, hidden_dim) * 0.02)
         self.sinusoidal_pe = PositionalEncoding(hidden_dim, dropout=0.0)
 
-        # Transformer Encoder
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim, nhead=n_heads, dim_feedforward=ff_dim,
             dropout=dropout, activation='gelu', batch_first=False, norm_first=True,
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-
-        # DropPath applied after transformer output
         self.stoch_depth = DropPath(drop_path_rate)
 
-        self.action_head = nn.Sequential(
+        # Head: predicts Δqpos (4 values), not absolute
+        self.delta_head = nn.Sequential(
             nn.Linear(hidden_dim, 256), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(256, 128), nn.GELU(), nn.Dropout(dropout * 0.5),
-            nn.Linear(128, action_chunk * 4),
+            nn.Linear(128, 4),
         )
 
         self._init_weights()
@@ -148,44 +133,48 @@ class ExcavatorVLA(nn.Module):
         for p in self.transformer.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p, gain=0.5)
-        for module in self.action_head:
+        for module in self.delta_head:
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight, gain=0.5)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
         nn.init.normal_(self.excv_embed.weight, mean=0.0, std=0.02)
 
-    def forward(
-        self, rgb: torch.Tensor, elevation: torch.Tensor,
-        qpos: torch.Tensor = None, excavator_id: torch.Tensor = None,
-    ) -> torch.Tensor:
+    def forward(self, rgb, elevation, qpos=None, excavator_id=None):
+        """
+        Returns:
+            delta [B, 4] — predicted change from last qpos
+            Final prediction = last_qpos + delta
+        """
         B, T = rgb.shape[:2]
         H, W = rgb.shape[3], rgb.shape[4]
 
+        # Vision
         rgb_flat = rgb.reshape(B * T, 3, H, W)
         elev_flat = elevation.reshape(B * T, 3, H, W)
         features = self.vision_encoder(rgb_flat, elev_flat).view(B, T, -1)
 
+        # Proprioception + excavator
         if qpos is not None:
             features = features + self.qpos_proj(qpos)
         if excavator_id is not None:
             features = features + self.excv_embed(excavator_id).unsqueeze(1)
 
+        # Position encoding
         if T <= self.seq_len:
             features = features + self.pos_embed[:, :T, :]
         else:
             features = self.sinusoidal_pe(features.permute(1, 0, 2)).permute(1, 0, 2)
 
-        features = features.permute(1, 0, 2)  # [T, B, D]
-        encoded = self.transformer(features)   # [T, B, D]
+        # Transformer
+        features = features.permute(1, 0, 2)
+        encoded = self.stoch_depth(self.transformer(features))
+        encoded = encoded.permute(1, 0, 2)
 
-        # Apply DropPath to the full sequence (stochastic depth on all features)
-        encoded = self.stoch_depth(encoded)
+        # Predict delta (change from last qpos)
+        delta = self.delta_head(encoded[:, -1, :])  # [B, 4]
 
-        encoded = encoded.permute(1, 0, 2)    # [B, T, D]
-        action = self.action_head(encoded[:, -1, :]).view(B, self.action_chunk, 4)
-
-        return action
+        return delta
 
 
 def count_parameters(model: nn.Module) -> dict:
