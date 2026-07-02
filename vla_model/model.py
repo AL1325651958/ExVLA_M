@@ -198,6 +198,35 @@ class MambaEncoder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+#  Joint encoding helpers — encode radians → [sin, cos] for smooth circular rep
+# ---------------------------------------------------------------------------
+
+def encode_joints_sincos(qpos_rad: torch.Tensor) -> torch.Tensor:
+    """Encode joint angles from radians to [sin(θ), cos(θ)] per joint.
+
+    Args:
+        qpos_rad: [...]  last dim=4 (joint angles in radians)
+    Returns:
+        [...]  last dim=8 ([sin₀,cos₀, sin₁,cos₁, sin₂,cos₂, sin₃,cos₃])
+    """
+    sin = torch.sin(qpos_rad)
+    cos = torch.cos(qpos_rad)
+    return torch.cat([sin, cos], dim=-1)
+
+
+def decode_joints_sincos(sincos: torch.Tensor) -> torch.Tensor:
+    """Decode from [sin, cos] back to radians via atan2.
+
+    Args:
+        sincos: [...]  last dim=8 (sin/cos pairs)
+    Returns:
+        [...]  last dim=4 (radians)
+    """
+    sin, cos = sincos.chunk(2, dim=-1)
+    return torch.atan2(sin, cos)
+
+
+# ---------------------------------------------------------------------------
 #  Main model
 # ---------------------------------------------------------------------------
 
@@ -223,11 +252,13 @@ class ExcavatorVLA(nn.Module):
         qpos_mode: str = "modulation", qpos_drop_prob=0.3,
         encoder_type: str = "transformer",
         mamba_d_state: int = 16, mamba_d_conv: int = 4, mamba_expand: int = 2,
+        use_sincos: bool = False,
     ):
         """
         Args:
             encoder_type: "transformer" or "mamba"
             qpos_mode:    "modulation" (head residual) or "transformer" (inject into encoder)
+            use_sincos:   encode qpos as [sin(θ), cos(θ)] — eliminates 2π discontinuity
             mamba_d_state, mamba_d_conv, mamba_expand: Mamba hyper-params
         """
         super().__init__()
@@ -236,6 +267,10 @@ class ExcavatorVLA(nn.Module):
         self.qpos_mode = qpos_mode
         self.qpos_drop_prob = qpos_drop_prob
         self.encoder_type = encoder_type
+        self.use_sincos = use_sincos
+
+        # qpos dimension: 4 for raw radians, 8 for sin/cos pairs
+        qpos_dim = 8 if use_sincos else 4
 
         # ── Vision backbone ──
         self.vision_encoder = TwoStreamEncoder(hidden_dim, pretrained=pretrained)
@@ -271,10 +306,12 @@ class ExcavatorVLA(nn.Module):
 
         # ── qpos components ──
         if qpos_mode == "modulation":
-            self.qpos_mod = nn.Sequential(nn.Linear(4, 32), nn.GELU(), nn.Linear(32, 4))
+            self.qpos_mod = nn.Sequential(
+                nn.Linear(qpos_dim, 32), nn.GELU(), nn.Linear(32, 4),
+            )
         elif qpos_mode == "transformer":
             self.qpos_proj = nn.Sequential(
-                nn.Linear(4, hidden_dim // 4), nn.GELU(),
+                nn.Linear(qpos_dim, hidden_dim // 4), nn.GELU(),
                 nn.Linear(hidden_dim // 4, hidden_dim),
             )
         else:
@@ -315,7 +352,8 @@ class ExcavatorVLA(nn.Module):
 
         # ── 2. qpos injection (transformer/mamba mode) — training only ──
         if self.qpos_mode == "transformer" and qpos is not None and self.training:
-            qpos_feat = self.qpos_proj(qpos)
+            qpos_enc = encode_joints_sincos(qpos) if self.use_sincos else qpos
+            qpos_feat = self.qpos_proj(qpos_enc)
             if self.qpos_drop_prob > 0:
                 mask = (torch.rand(B, 1, 1, device=qpos.device) > self.qpos_drop_prob).float()
                 qpos_feat = qpos_feat * mask
@@ -344,7 +382,8 @@ class ExcavatorVLA(nn.Module):
 
         # ── 5. qpos modulation residual ──
         if self.qpos_mode == "modulation" and qpos is not None and self.training:
-            correction = self.qpos_mod(qpos[:, -1])
+            qpos_last = encode_joints_sincos(qpos[:, -1, :]) if self.use_sincos else qpos[:, -1, :]
+            correction = self.qpos_mod(qpos_last)
             if self.qpos_drop_prob > 0:
                 mask = (torch.rand(B, 1, device=qpos.device) > self.qpos_drop_prob).float()
                 correction = correction * mask
