@@ -96,91 +96,127 @@ class DropPath(nn.Module):
 # ---------------------------------------------------------------------------
 
 class MambaBlock(nn.Module):
-    """Lightweight Mamba-style block — causal conv + gated activation + residual.
+    """Selective state-space block (Mamba-style) with diagonal SSM recurrence.
 
-    Processes sequences in O(n) time (no quadratic attention).
-    Designed to be a drop-in replacement for TransformerEncoderLayer
-    operating on (B, T, D) tensors.
+    Implements the discretized SSM:
+        h_t = Ā_t ⊙ h_{t-1} + B̄_t ⊙ x_t    (state update)
+        y_t = C_t · h_t                       (output from state)
 
-    Args:
-        d_model: hidden dimension
-        d_state:  SSM state dimension
-        d_conv:   causal conv kernel size
-        expand:   inner expansion ratio
-        dropout:  residual dropout
+    where Ā = exp(Δ⊗A) and B̄ = Δ⊗B are ZOH-discretized forms of the
+    continuous-time parameters.  B, C, Δ are all input-dependent
+    ("selective"), and A is a learnable negative-diagonal matrix that
+    guarantees stable exponential decay.
+
+    References
+    ----------
+    Gu & Dao, "Mamba: Linear-Time Sequence Modeling with Selective
+    State Spaces", 2023.  https://arxiv.org/abs/2312.00752
     """
 
     def __init__(self, d_model: int = 512, d_state: int = 16, d_conv: int = 4,
                  expand: int = 2, dropout: float = 0.1):
         super().__init__()
         self.d_model = d_model
+        self.d_state = d_state
         inner = int(d_model * expand)
 
-        # Input projection
+        # ── Input projection → gate + signal ──
         self.in_proj = nn.Linear(d_model, inner * 2, bias=False)
 
-        # 1D causal conv over time
+        # ── Causal depthwise conv (temporal mixing) ──
         self.conv1d = nn.Conv1d(
             in_channels=inner, out_channels=inner,
             kernel_size=d_conv, padding=d_conv - 1, groups=inner,
         )
 
-        # State-space projection (simplified: learned linear recurrence)
-        self.x_proj = nn.Linear(inner, d_state, bias=False)
-        self.dt_proj = nn.Linear(inner, inner, bias=False)  # time-step modulation
+        # ── Selective SSM core ──
+        # A: diagonal state-transition matrix (log-space; exponentiated
+        #    and negated for guaranteed stability,  A = -exp(A_log))
+        self.A_log = nn.Parameter(
+            torch.log(torch.arange(1, d_state + 1, dtype=torch.float32))
+        )
+        # B(x):  input → state   (selective)
+        self.B_proj = nn.Linear(inner, d_state, bias=False)
+        # C(x):  state → output  (selective)
+        self.C_proj = nn.Linear(inner, d_state, bias=False)
+        # Δ(x):  discretisation step  (selective; bias sets base rate)
+        self.dt_proj = nn.Linear(inner, inner, bias=True)
+        # D:  residual skip  (y = SSM(x) + D ⊙ x)
+        self.D = nn.Parameter(torch.ones(inner))
 
-        # Output projection
+        # ── Output ──
         self.out_proj = nn.Linear(inner, d_model, bias=False)
-
-        # Normalization & regularization
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
+
+        # Initialise dt bias so softplus(·) ≈ 5e-2  (moderate base step)
+        nn.init.constant_(self.dt_proj.bias, -3.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: [B, T, D]
+            x: [B, T, d_model]
         Returns:
-            y: [B, T, D]
+            y: [B, T, d_model]
         """
-        B, T, D = x.shape
-        inner = self.in_proj.weight.shape[0] // 2   # respect expand ratio
+        B, T, D_in = x.shape
+        inner = self.in_proj.weight.shape[0] // 2
+        d_state = self.d_state
 
         residual = x
 
-        # 1. Linear projection + SiLU activation (like Mamba's "selective" gate)
-        proj = self.in_proj(x)                    # [B, T, inner * 2]
-        z, x_in = proj.chunk(2, dim=-1)           # each [B, T, inner]
+        # 1 ── Gate (z)  &  signal (x_sig) branches ──
+        proj = self.in_proj(x)                     # [B, T, inner·2]
+        z, x_sig = proj.chunk(2, dim=-1)           # [B, T, inner] each
 
-        # 2. Causal 1D conv over time (maintains temporal locality)
-        x_in_t = x_in.transpose(1, 2)             # [B, inner, T]
-        x_conv = self.conv1d(x_in_t)[:, :, :T]    # causal: trim future padding
-        x_conv = F.silu(x_conv)                   # activation after conv
-        x_conv = x_conv.transpose(1, 2)           # [B, T, inner]
+        # 2 ── Causal 1-D conv over time ──
+        x_conv = self.conv1d(x_sig.transpose(1, 2))[:, :, :T]
+        x_conv = F.silu(x_conv.transpose(1, 2))     # [B, T, inner]
 
-        # 3. Time-varying selection (simplified SSM scan)
-        #    sigmoid bounds dt ∈ (0,1) so (1-dt) stays positive —
-        #    the recurrence h_t = (1-α)·h_{t-1} + α·x_t is then a
-        #    stable convex combination (EMA).  softplus would allow
-        #    dt > 1, flipping the decay term negative and causing
-        #    exponential blow-up → NaN.
-        dt = torch.sigmoid(self.dt_proj(x_conv))   # [B, T, inner] ∈ (0,1)
-        state = self.x_proj(x_conv)                # [B, T, d_state]
+        # 3 ── Discretisation step  Δ(x) > 0 ──
+        dt = F.softplus(self.dt_proj(x_conv))       # [B, T, inner]
 
-        # Simplified selective scan: dt-weighted cumsum along time
-        # This approximates the continuous-time SSM discretization
-        x_ssm = torch.zeros_like(x_conv[:, 0])     # [B, inner]
-        x_out = []
-        for t_step in range(T):
-            x_ssm = (1 - dt[:, t_step]) * x_ssm + dt[:, t_step] * x_conv[:, t_step]
-            x_out.append(x_ssm.unsqueeze(1))
-        x_out = torch.cat(x_out, dim=1)            # [B, T, inner]
+        # 4 ── Selective projections  B(x), C(x) ──
+        B_sel = self.B_proj(x_conv)                # [B, T, d_state]
+        C_sel = self.C_proj(x_conv)                # [B, T, d_state]
 
-        # 4. Gating with SiLU(z) like Mamba
-        y = x_out * F.silu(z)                      # [B, T, inner]
+        # 5 ── Diagonal state transition  A = -exp(A_log) ──
+        #      A[d_state] is negative → exp(Δt·A) ∈ (0, 1)  stable decay
+        A = -torch.exp(self.A_log)                 # [d_state]
 
-        # 5. Output projection + residual
-        y = self.dropout(self.out_proj(y))
+        # 6 ── ZOH discretisation ──
+        #      Ā = exp(Δ ⊗ A)       [B, T, inner, d_state]
+        #      B̄ = Δ · B             [B, T, inner, d_state]
+        A_bar = torch.exp(
+            dt.unsqueeze(-1) * A                   # Δ[b,t,i] * A[s]
+        )                                          # → [B, T, inner, d_state]
+        B_bar = (
+            dt.unsqueeze(-1) * B_sel.unsqueeze(2)  # Δ[b,t,i] * B[b,t,s]
+        )                                          # → [B, T, inner, d_state]
+
+        # 7 ── Associative scan over time ──
+        #      h₀ = 0
+        #      h_t = Ā_t ⊙ h_{t-1} + B̄_t · x_sig_t
+        #      y_t = C_t · h_t
+        h = torch.zeros(B, inner, d_state, device=x.device, dtype=x.dtype)
+        out_parts = []
+        for t in range(T):
+            # state update  [B, inner, d_state]
+            h = (A_bar[:, t] * h
+                 + B_bar[:, t] * x_conv[:, t].unsqueeze(-1))
+            # output from state  [B, inner]
+            y_t = (C_sel[:, t].unsqueeze(1) * h).sum(dim=-1)
+            out_parts.append(y_t.unsqueeze(1))
+        x_ssm = torch.cat(out_parts, dim=1)        # [B, T, inner]
+
+        # 8 ── Skip connection  D ⊙ x ──
+        x_ssm = x_ssm + x_conv * self.D
+
+        # 9 ── Gating  SiLU(z) ──
+        y = x_ssm * F.silu(z)                      # [B, T, inner]
+
+        # 10 ── Output projection + residual ──
+        y = self.dropout(self.out_proj(y))         # [B, T, d_model]
         return self.norm(residual + y)
 
 
