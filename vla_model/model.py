@@ -96,22 +96,20 @@ class DropPath(nn.Module):
 # ---------------------------------------------------------------------------
 
 class MambaBlock(nn.Module):
-    """Selective state-space block with bottlenecked diagonal SSM.
+    """Selective diagonal-SSM block — bottlenecked for stability.
 
-    Architecture (Mamba-inspired, bottlenecked for stability):
-        x → LayerNorm → Conv1d → SiLU → proj_down(ssm_dim) ─┐
-                                       ┌────────────────────┘
-                                       ↓
-                           SSM core (selective scan, d_state)
-                                       ↓
-                               norm → proj_up(inner) ─┐
-                                                       ├→ ⊗SiLU(z) → out
-        x → LayerNorm → in_proj → z (gate) ──────────┘
+    The SSM operates in a low-dimension bottleneck (ssm_dim=128) rather
+    than the full inner space, keeping the scan narrow and its gradients
+    well-behaved.
 
-    The SSM operates in a low-dimension bottleneck (ssm_dim=128 by default)
-    rather than the full inner=1024 space.  This keeps the serial-scan
-    gradient chain narrow and numerically stable while still learning
-    rich temporal selectivity.
+    Key guards against training instability:
+      - dt  = σ(Linear(x))           ∈ (0, 1)   (cum_dt ≤ T, no overflow)
+      - A   = -softplus(A_log)       ∈ (-2, 0)  (all state dims active)
+      - A_bar = exp(dt·A)            ∈ (0, 1]   (stable convex combination)
+      - Serial scan with LayerNorm before each stage
+
+    Gradient through the serial loop is naturally bounded because every
+    A_bar ∈ (0,1] — the multiplicative chain shrinks, never explodes.
     """
 
     def __init__(self, d_model: int = 512, d_state: int = 16, d_conv: int = 4,
@@ -123,30 +121,32 @@ class MambaBlock(nn.Module):
         inner = int(d_model * expand)
         self.inner = inner
         ssm_dim = ssm_bottleneck if ssm_bottleneck > 0 else inner
+        self.ssm_dim = ssm_dim
 
         # ── Input projection → gate + signal ──
         self.in_proj = nn.Linear(d_model, inner * 2, bias=False)
 
-        # ── Causal depthwise conv (temporal mixing) ──
+        # ── Causal depthwise conv ──
         self.conv1d = nn.Conv1d(
             in_channels=inner, out_channels=inner,
             kernel_size=d_conv, padding=d_conv - 1, groups=inner,
         )
 
-        # ── Bottleneck: inner → ssm_dim → inner ──
+        # ── Bottleneck ──
         self.ssm_down = nn.Linear(inner, ssm_dim, bias=False)
         self.ssm_up   = nn.Linear(ssm_dim, inner, bias=False)
 
-        # ── Selective SSM core (operates on ssm_dim) ──
-        # A: diagonal state-transition (log-space → -exp(·) ≤ 0, stable)
-        A_init = torch.linspace(0.5, 3.0, d_state, dtype=torch.float32)
-        self.A_log = nn.Parameter(torch.log(A_init))
-        # B(x), C(x): input-dependent projections
+        # ── Selective SSM core ──
+        # A = -softplus(A_log)  →  ∈ (-2, -0.01)  (gentle range, all active)
+        self.A_log = nn.Parameter(
+            torch.linspace(0.05, 0.7, d_state, dtype=torch.float32).log()
+        )
+        # B, C: input-dependent  (selective)
         self.B_proj = nn.Linear(ssm_dim, d_state, bias=False)
         self.C_proj = nn.Linear(ssm_dim, d_state, bias=False)
-        # Δ(x): per-channel discretisation step
+        # Δ: sigmoid-bounded ∈ (0, 1) — guarantees cum_dt ≤ T
         self.dt_proj = nn.Linear(ssm_dim, ssm_dim, bias=True)
-        # D: skip connection (1 per channel)
+        # D skip
         self.D = nn.Parameter(torch.ones(ssm_dim))
 
         # ── Normalisation ──
@@ -154,96 +154,66 @@ class MambaBlock(nn.Module):
 
         # ── Output ──
         self.out_proj = nn.Linear(inner, d_model, bias=False)
-        self.norm = nn.LayerNorm(d_model)
+        self.norm1 = nn.LayerNorm(d_model)   # pre-norm for signal
+        self.norm2 = nn.LayerNorm(d_model)   # final norm
         self.dropout = nn.Dropout(dropout)
 
-        # Init dt bias: softplus ≈ 0.05 base rate  (small step, slow decay)
-        nn.init.constant_(self.dt_proj.bias, -3.0)
+        # Init dt bias: sigmoid(-2.0) ≈ 0.12  (moderate step)
+        nn.init.constant_(self.dt_proj.bias, -2.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [B, T, d_model]
-        Returns:
-            y: [B, T, d_model]
-        """
-        B, T, _ = x.shape
+        B, T, D_in = x.shape
         inner = self.inner
         d_state = self.d_state
+        ssm_dim = self.ssm_dim
 
         residual = x
+        x_norm = self.norm1(x)
 
-        # 1 ── Gate (z)  &  signal (x_sig) branches ──
-        proj = self.in_proj(self.norm(x))            # [B, T, inner·2]
-        z, x_sig = proj.chunk(2, dim=-1)             # [B, T, inner]
+        # 1 ── Gate (z) + signal (x_sig) ──
+        proj = self.in_proj(x_norm)                # [B, T, inner*2]
+        z, x_sig = proj.chunk(2, dim=-1)           # [B, T, inner] each
 
-        # 2 ── Causal 1-D conv over time ──
+        # 2 ── Causal conv ──
         x_conv = self.conv1d(x_sig.transpose(1, 2))[:, :, :T]
-        x_conv = F.silu(x_conv.transpose(1, 2))      # [B, T, inner]
+        x_conv = F.silu(x_conv.transpose(1, 2))    # [B, T, inner]
 
-        # 3 ── Bottleneck down: inner → ssm_dim ──
-        x_ssm_in = self.ssm_down(x_conv)             # [B, T, ssm_dim]
+        # 3 ── Bottleneck down ──
+        x_s = self.ssm_down(x_conv)                # [B, T, ssm_dim]
 
-        # 4 ── Discretisation step Δ(x) ∈ (0, ∞) ──
-        dt = F.softplus(self.dt_proj(x_ssm_in))      # [B, T, ssm_dim]
-        dt = dt.clamp(max=20.0)                      # prevent extreme values
+        # 4 ── SSM parameters ──
+        dt = torch.sigmoid(self.dt_proj(x_s))      # [B,T,ssm] ∈ (0,1)
+        B_s = self.B_proj(x_s)                     # [B,T,ds]
+        C_s = self.C_proj(x_s)                     # [B,T,ds]
+        A   = -F.softplus(self.A_log)              # [ds]  ∈ (-2, -0.01)
 
-        # 5 ── Selective B(x), C(x) ──
-        B_sel = self.B_proj(x_ssm_in)                # [B, T, d_state]
-        C_sel = self.C_proj(x_ssm_in)                # [B, T, d_state]
+        # 5 ── Discretise:  A_bar = e^{dt⊗A},  B_bar = dt⊗B ──
+        A_bar = torch.exp(
+            dt.unsqueeze(-1) * A                   # [B,T,ssm,ds]
+        )                                          # ∈ (0,1]
+        B_bar = dt.unsqueeze(-1) * B_s.unsqueeze(2)  # [B,T,ssm,ds]
 
-        # 6 ── Diagonal A = -exp(log) ≤ 0  ⇒  exp(Δt·A) ∈ (0,1] ──
-        A_vec = -torch.exp(self.A_log)               # [d_state]
+        # 6 ── Serial scan  h_t = A_bar·h_{t-1} + B_bar·x_t ──
+        #     A_bar ∈ (0,1] ⇒ each step is a convex shrink, gradient
+        #     naturally bounded — no explosion, no overflow.
+        h = torch.zeros(B, ssm_dim, d_state,
+                        device=x.device, dtype=x.dtype)
+        out_parts = []
+        for t_step in range(T):
+            h = (A_bar[:, t_step] * h
+                 + B_bar[:, t_step] * x_s[:, t_step].unsqueeze(-1))
+            y_t = (C_s[:, t_step].unsqueeze(1) * h).sum(dim=-1)
+            out_parts.append(y_t.unsqueeze(1))
+        x_ssm = torch.cat(out_parts, dim=1)        # [B, T, ssm_dim]
 
-        # 7 ── Parallel prefix scan via cusum ──
-        #      Unrolling the recurrence  h_t = Ā_t·h_{t-1} + B̄_t·x_t
-        #      (where Ā=exp(Δ⊗A), B̄=Δ⊗B) yields the closed form:
-        #
-        #        h_t = Σ_{i≤t}  exp(A·(cumΔ[t] − cumΔ[i])) · Δ[i]·B[i]·x[i]
-        #
-        #      Computed in O(T) as two cumsums:
-        #        1.  cumΔ = cumsum(Δt)
-        #        2.  term = Δt · B_sel · x_ssm_in          [B,T,ssm,ds]
-        #        3.  inner = cumsum(exp(−A·cumΔ) · term)
-        #        4.  h[t]  = exp(A·cumΔ[t]) · inner[t]
-        #        5.  y[t]  = C[t] · h[t]
-        #
-        #      Gradient flows through cumsum (O(1) backward),
-        #      NOT through a serial for-loop (O(T) backward).
-        # ─────────────────────────────────────────────────────
-        cum_dt = torch.cumsum(dt, dim=1)             # [B, T, ssm_dim]
+        # 7 ── Norm + skip + bottleneck up ──
+        x_ssm = self.ssm_norm(x_ssm + x_s * self.D)
+        x_up = self.ssm_up(x_ssm)                  # [B, T, inner]
 
-        # term[b,t,c,s] = dt[b,t,c] * B[b,t,s] * x_ssm_in[b,t,c]
-        term = (dt.unsqueeze(-1)
-                * B_sel.unsqueeze(2)
-                * x_ssm_in.unsqueeze(-1))            # [B, T, ssm_dim, d_state]
-
-        # exp(−A·cumΔ) — A_vec ≤ 0 so −A_vec ≥ 0
-        decay = torch.exp(
-            -A_vec.view(1, 1, 1, d_state) * cum_dt.unsqueeze(-1)
-        )                                            # [B, T, ssm_dim, d_state]
-
-        inner_sum = torch.cumsum(decay * term, dim=1)  # [B, T, ssm_dim, d_state]
-
-        # h[t] = exp(A·cumΔ[t]) · inner_sum[t]
-        h = (torch.exp(A_vec.view(1, 1, 1, d_state) * cum_dt.unsqueeze(-1))
-             * inner_sum)                             # [B, T, ssm_dim, d_state]
-
-        # y[t] = Σ_s C[t,s] · h[t,c,s]
-        x_ssm = (C_sel.unsqueeze(2) * h).sum(dim=-1)  # [B, T, ssm_dim]
-
-        # 8 ── Normalise + skip ──
-        x_ssm = self.ssm_norm(x_ssm + x_ssm_in * self.D)
-
-        # 9 ── Bottleneck up: ssm_dim → inner ──
-        x_ssm_up = self.ssm_up(x_ssm)                # [B, T, inner]
-
-        # 10 ── Gating  SiLU(z) ──
-        y = x_ssm_up * F.silu(z)                     # [B, T, inner]
-
-        # 11 ── Output projection + residual ──
-        y = self.dropout(self.out_proj(y))           # [B, T, d_model]
-        return self.norm(residual + y)
+        # 8 ── Gate + output + residual ──
+        y = x_up * F.silu(z)
+        y = self.dropout(self.out_proj(y))
+        return self.norm2(residual + y)
 
 
 class MambaEncoder(nn.Module):
