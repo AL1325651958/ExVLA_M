@@ -114,47 +114,89 @@ def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, conf
 
 
 @torch.no_grad()
-def validate(model, dataloader, criterion, config):
-    """Validation with R²."""
+def validate_rollout(model, val_dataset, criterion, config):
+    """Autoregressive (rollout) validation over full episodes.
+
+    First window uses GT qpos as anchor. Every subsequent frame chains the
+    model's own prediction — no GT qpos leakage.
+    """
     model.eval()
+    T = config.seq_len
+    sz = config.img_size
+
     total_loss = 0.0
     total_mae = np.zeros(4)
     ss_res = np.zeros(4)
     sum_y  = np.zeros(4)
     sum_y2 = np.zeros(4)
     n_total = 0
-    n_batches = 0
+    n_steps = 0
 
-    for batch in tqdm(dataloader, desc="Validating"):
-        rgb = batch["rgb"].to(config.device)
-        elevation = batch["elevation"].to(config.device)
-        qpos = batch["qpos"].to(config.device)
-        excavator_id = batch["excavator_id"].to(config.device)
-        action_gt = batch["action"].to(config.device)
+    n_episodes = len(val_dataset._episodes)
+    # Determine which episodes belong to val split
+    val_files = val_dataset.val_files
 
-        delta_pred = model(rgb, elevation, qpos, excavator_id)
-        action_label = action_gt.squeeze(1)
-        last_qpos = qpos[:, -1, :]
-        delta_label = action_label - last_qpos
-        loss = criterion(delta_pred, delta_label)
+    for ep_idx, ep in enumerate(tqdm(val_dataset._episodes, desc="Validating (rollout)")):
+        qpos_all = ep["qpos"]           # [N_frames, 4]
+        action_all = ep["action"]       # [N_frames, 4]
+        excv_id = torch.tensor([ep["excavator_id"]], dtype=torch.long, device=config.device)
+        N = len(qpos_all)
+        if N < T + 1:
+            continue
 
-        total_loss += loss.item()
-        abs_pred = (last_qpos + delta_pred).cpu().numpy()
-        abs_label = action_label.cpu().numpy()
-        mae = np.abs(abs_pred - abs_label).mean(axis=0)
-        total_mae += mae
+        # Chained prediction: start from GT, then feed our own output
+        pred_qpos = qpos_all[T - 1].copy()  # bootstrap anchor
 
-        ss_res += ((abs_pred - abs_label) ** 2).sum(axis=0)
-        sum_y  += abs_label.sum(axis=0)
-        sum_y2 += (abs_label ** 2).sum(axis=0)
-        n_total += len(abs_label)
-        n_batches += 1
+        for t in range(N - T):
+            # Build input window
+            rgb_seq = np.zeros((T, 3, sz, sz), dtype=np.float32)
+            elev_seq = np.zeros((T, 3, sz, sz), dtype=np.float32)
+            qpos_seq = np.zeros((T, 4), dtype=np.float32)
+
+            for i in range(T):
+                frame_idx = t + i
+                raw_rgb = ep["mains_raw"][frame_idx]
+                raw_elev = ep["elevations_raw"][frame_idx]
+                rgb_seq[i] = val_dataset._preprocess_image(raw_rgb, augment=False)
+                elev_seq[i] = val_dataset._preprocess_image(raw_elev, augment=False)
+                qpos_seq[i] = qpos_all[frame_idx]
+
+            # Replace last-frame qpos with our own prediction (the chaining step)
+            qpos_seq[-1] = pred_qpos  # THIS is where rollout happens
+
+            rs = torch.from_numpy(rgb_seq).unsqueeze(0).to(config.device)
+            es = torch.from_numpy(elev_seq).unsqueeze(0).to(config.device)
+            qs = torch.from_numpy(qpos_seq.copy()).unsqueeze(0).to(config.device)
+
+            delta_pred = model(rs, es, qs, excv_id).cpu().numpy()[0]  # [4]
+
+            # Convert delta to absolute: current_pred = pred_qpos + delta
+            abs_pred = pred_qpos + delta_pred
+            abs_label = action_all[t + T - 1]  # GT next position
+
+            delta_label = abs_label - pred_qpos
+            loss = criterion(torch.from_numpy(delta_pred), torch.from_numpy(delta_label))
+
+            total_loss += loss.item()
+            total_mae += np.abs(abs_pred - abs_label)
+            ss_res += (abs_pred - abs_label) ** 2
+            sum_y  += abs_label
+            sum_y2 += abs_label ** 2
+            n_total += 1
+            n_steps += 1
+
+            # Chain: this prediction becomes next window's "current qpos"
+            pred_qpos = abs_pred.copy()
+
+    if n_steps == 0:
+        return {"loss": float("nan"), "mae": [0, 0, 0, 0], "mae_mean": float("nan"),
+                "r2": [0, 0, 0, 0], "r2_mean": float("nan")}
 
     r2_per, r2_mean = _compute_r2(ss_res, sum_y, sum_y2, n_total)
     return {
-        "loss": total_loss / n_batches,
-        "mae": (total_mae / n_batches).tolist(),
-        "mae_mean": float(total_mae.mean() / n_batches),
+        "loss": total_loss / n_steps,
+        "mae": (total_mae / n_steps).tolist(),
+        "mae_mean": float(total_mae.mean() / n_steps),
         "r2": r2_per.tolist(),
         "r2_mean": r2_mean,
     }
@@ -317,11 +359,11 @@ def main():
                 for ema_p, p in zip(ema_model.parameters(), model.parameters()):
                     ema_p.data.mul_(config.ema_decay).add_(p.data, alpha=1 - config.ema_decay)
 
-        # Validate
+        # Validate — autoregressive rollout (NO GT qpos chaining)
         val_metrics = {"loss": float("nan"), "mae": [0, 0, 0, 0], "mae_mean": float("nan"),
                        "r2": [0, 0, 0, 0], "r2_mean": float("nan")}
-        if val_loader is not None and len(val_loader) > 0:
-            val_metrics = validate(model, val_loader, criterion, config)
+        if len(val_dataset) > 0:
+            val_metrics = validate_rollout(model, val_dataset, criterion, config)
             history["val_loss"].append(val_metrics["loss"])
             history["val_mae"].append(val_metrics["mae_mean"])
             history["val_r2"].append(val_metrics["r2_mean"])
@@ -333,17 +375,17 @@ def main():
             f"Epoch {epoch+1:3d}/{config.epochs} | "
             f"LR: {lr_now:.2e} | "
             f"Train Loss: {train_metrics['loss']:.6f} | "
-            f"Val Loss: {val_metrics['loss']:.6f} | "
+            f"Val Rollout Loss: {val_metrics['loss']:.6f} | "
             f"Train MAE: {train_metrics['mae_mean']:.4f} | "
-            f"Val MAE: {val_metrics['mae_mean']:.4f} | "
+            f"Val Rollout MAE: {val_metrics['mae_mean']:.4f} | "
             f"Train R²: {train_metrics['r2_mean']:.4f} | "
-            f"Val R²: {val_metrics['r2_mean']:.4f} | "
+            f"Val Rollout R²: {val_metrics['r2_mean']:.4f} | "
             f"Time: {elapsed:.1f}s"
         )
-        print(f"  Per-joint MAE - Train: {[f'{x:.4f}' for x in train_metrics['mae']]} | "
-              f"Val: {[f'{x:.4f}' for x in val_metrics['mae']]}")
-        print(f"  Per-joint R²  - Train: {[f'{x:.4f}' for x in train_metrics['r2']]} | "
-              f"Val: {[f'{x:.4f}' for x in val_metrics['r2']]}")
+        print(f"  Per-joint MAE  - Train: {[f'{x:.4f}' for x in train_metrics['mae']]} | "
+              f"Val(R): {[f'{x:.4f}' for x in val_metrics['mae']]}")
+        print(f"  Per-joint R²   - Train: {[f'{x:.4f}' for x in train_metrics['r2']]} | "
+              f"Val(R): {[f'{x:.4f}' for x in val_metrics['r2']]}")
 
         # Save best
         is_best = val_metrics.get("loss", float("inf")) < best_loss
