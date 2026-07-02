@@ -174,9 +174,12 @@ def main():
     parser.add_argument("--img_size", type=int, default=None, help="Override image size")
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
     parser.add_argument("--overfit", action="store_true", help="Overfit single episode")
+    parser.add_argument("--output_dir", type=str, default=None, help="Override checkpoint output directory")
     args = parser.parse_args()
 
     config = Config()
+    if args.output_dir is not None:
+        config.output_dir = args.output_dir
 
     # Override config with CLI args
     if args.data_dir:
