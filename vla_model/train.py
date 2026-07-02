@@ -245,6 +245,7 @@ def main():
         dropout=config.dropout,
         drop_path_rate=config.drop_path_rate,
         pretrained=config.pretrained,
+        qpos_drop_prob=config.qpos_drop_prob,
     ).to(config.device)
 
     params = count_parameters(model)

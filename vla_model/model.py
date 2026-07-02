@@ -1,7 +1,11 @@
-"""ExcavatorVLA: two-stream vision + Transformer -> absolute joint angle prediction.
+"""ExcavatorVLA: vision-first architecture with privileged qpos modulation.
 
-Pure vision at inference. qpos is privileged info (training only).
-Output: next absolute qpos [B, 4] -- no delta, no anchor needed.
+Vision (RGB+Elevation) is the primary predictor. qpos acts as a small
+residual correction at the head level — NOT injected into the Transformer.
+
+Training: qpos_correction is randomly masked (dropout) to force the vision
+  path to learn the full prediction, not depend on qpos.
+Inference: pure vision (qpos=None), zero qpos dependency.
 """
 
 import warnings
@@ -82,15 +86,21 @@ class DropPath(nn.Module):
 
 
 class ExcavatorVLA(nn.Module):
-    """VLA: pure vision -> absolute next joint position.
+    """Vision-first VLA: qpos is a head-level residual, not a Transformer input.
 
-    qpos is privileged information: injected into Transformer during training
-    only. At inference (model.eval()), prediction is purely vision-based.
+    Architecture:
+        RGB + Elev → ResNet → Transformer → vision_feat ─┐
+                                                          ├─ [B, 4] base_pred
+        excv_id ─────────────────────────────────────────┘
+                                                          ┌─ [B, 4] qpos_correction (training only, randomly dropped)
+        qpos[:, -1] → modulation MLP ─────────────────────┘
+                                                          ↓
+                                              final = base_pred + qpos_correction
 
     Input:
         rgb           [B, T, 3, H, W]
         elevation     [B, T, 3, H, W]
-        qpos          [B, T, 4]     (training only, ignored at inference)
+        qpos          [B, T, 4]     (training: head correction; inference: ignored)
         excavator_id  [B]
     Output:
         next_qpos     [B, 4]        absolute joint angles (radians)
@@ -99,21 +109,22 @@ class ExcavatorVLA(nn.Module):
     def __init__(
         self, seq_len=8, hidden_dim=512, n_heads=8, n_layers=4, ff_dim=2048,
         dropout=0.1, drop_path_rate=0.05, pretrained=True, num_excavators=4,
+        qpos_drop_prob=0.3,
     ):
         super().__init__()
         self.seq_len = seq_len
         self.hidden_dim = hidden_dim
+        self.qpos_drop_prob = qpos_drop_prob
 
+        # ── Vision backbone ──
         self.vision_encoder = TwoStreamEncoder(hidden_dim, pretrained=pretrained)
         self.excv_embed = nn.Embedding(num_excavators, hidden_dim)
-        # Privileged: qpos injected into Transformer during training only
-        self.qpos_proj = nn.Sequential(
-            nn.Linear(4, hidden_dim // 4), nn.GELU(),
-            nn.Linear(hidden_dim // 4, hidden_dim),
-        )
+
+        # ── Position encoding ──
         self.pos_embed = nn.Parameter(torch.randn(1, seq_len, hidden_dim) * 0.02)
         self.sinusoidal_pe = PositionalEncoding(hidden_dim, dropout=0.0)
 
+        # ── Transformer ──
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim, nhead=n_heads, dim_feedforward=ff_dim,
             dropout=dropout, activation='gelu', batch_first=False, norm_first=True,
@@ -121,12 +132,19 @@ class ExcavatorVLA(nn.Module):
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         self.stoch_depth = DropPath(drop_path_rate)
 
-        # Head: vision_feat + excavator_id -> absolute qpos
-        head_in = hidden_dim + hidden_dim
+        # ── Base prediction head (vision + excv_id → absolute qpos) ──
+        head_in = hidden_dim + hidden_dim  # vision_feat + excv_feat
         self.action_head = nn.Sequential(
             nn.Linear(head_in, 256), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(256, 128), nn.GELU(), nn.Dropout(dropout * 0.5),
             nn.Linear(128, 4),
+        )
+
+        # ── qpos modulation: small residual correction (training only) ──
+        # NOT injected into Transformer — only a lightweight bias at the head.
+        self.qpos_mod = nn.Sequential(
+            nn.Linear(4, 32), nn.GELU(),
+            nn.Linear(32, 4),   # → correction in joint space
         )
 
         self._init_weights()
@@ -141,6 +159,12 @@ class ExcavatorVLA(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
         nn.init.normal_(self.excv_embed.weight, mean=0.0, std=0.02)
+        # qpos_mod initialized small: residual should start near zero
+        for module in self.qpos_mod:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight, gain=0.1)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
     def forward(self, rgb, elevation, qpos=None, excavator_id=None):
         """
@@ -150,32 +174,40 @@ class ExcavatorVLA(nn.Module):
         B, T = rgb.shape[:2]
         H, W = rgb.shape[3], rgb.shape[4]
 
-        # 1. Vision encoder (per-frame)
+        # ── 1. Vision encoder (per-frame) ──
         rgb_flat = rgb.reshape(B * T, 3, H, W)
         elev_flat = elevation.reshape(B * T, 3, H, W)
         features = self.vision_encoder(rgb_flat, elev_flat).view(B, T, -1)
 
-        # 2. qpos: privileged info, training only
-        if qpos is not None and self.training:
-            features = features + self.qpos_proj(qpos)
-
-        # 3. Position encoding
+        # ── 2. Position encoding ──
         if T <= self.seq_len:
             features = features + self.pos_embed[:, :T, :]
         else:
             features = self.sinusoidal_pe(features.permute(1, 0, 2)).permute(1, 0, 2)
 
-        # 4. Transformer
-        features = features.permute(1, 0, 2)
+        # ── 3. Transformer (pure vision + position, no qpos shortcut) ──
+        features = features.permute(1, 0, 2)          # [T, B, D]
         encoded = self.stoch_depth(self.transformer(features))
-        encoded = encoded.permute(1, 0, 2)
+        encoded = encoded.permute(1, 0, 2)             # [B, T, D]
 
-        # 5. Head: vision + excavator ID -> absolute qpos
-        vision_feat = encoded[:, -1, :]
-        excv_feat = self.excv_embed(excavator_id)
-        next_qpos = self.action_head(torch.cat([vision_feat, excv_feat], dim=-1))
+        # ── 4. Base prediction: vision is the primary driver ──
+        vision_feat = encoded[:, -1, :]                # [B, hidden_dim]
+        excv_feat = self.excv_embed(excavator_id)      # [B, hidden_dim]
+        base_pred = self.action_head(torch.cat([vision_feat, excv_feat], dim=-1))
 
-        return next_qpos
+        # ── 5. qpos modulation: lightweight residual correction ──
+        if qpos is not None and self.training:
+            correction = self.qpos_mod(qpos[:, -1])     # [B, 4] — last-frame only
+
+            # Dropout mask: randomly kill qpos correction for some samples
+            if self.qpos_drop_prob > 0:
+                mask = (torch.rand(B, 1, device=qpos.device) > self.qpos_drop_prob).float()
+                correction = correction * mask
+
+            return base_pred + correction
+        else:
+            # Inference or no qpos: pure vision
+            return base_pred
 
 
 def count_parameters(model: nn.Module) -> dict:

@@ -20,7 +20,8 @@ class Config:
     dropout: float = 0.1           # moderate regularization
     drop_path_rate: float = 0.05   # light stochastic depth
     pretrained: bool = True
-    predict_delta: bool = True     # output Δqpos (change from last qpos)
+    predict_delta: bool = False    # absolute qpos prediction
+    qpos_drop_prob: float = 0.3   # probability of masking qpos during training
 
     # Training
     batch_size: int = 32
