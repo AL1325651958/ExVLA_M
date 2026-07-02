@@ -96,139 +96,119 @@ class DropPath(nn.Module):
 # ---------------------------------------------------------------------------
 
 class MambaBlock(nn.Module):
-    """Selective diagonal-SSM block — bottlenecked, parallel scan.
+    """Selective diagonal-SSM block — parallel prefix scan, no bottleneck.
 
-    Design choices for stable training:
+    The SSM operates at the full inner (expand×d_model) dimension,
+    with d_state scalar states per channel.  No bottleneck is needed
+    because sigmoid dt + softplus A guarantee numerical stability:
       - dt  = σ(Linear(x))          ∈ (0, 1)   → cum_dt ≤ T, exp safe
       - A   = -softplus(A_log)      ∈ (-1.2, -0.01)
       - A_bar = exp(dt⊗A)           ∈ (0, 1]
-      - Parallel prefix scan via cumsum — O(log T) gradient depth
-        instead of O(T) serial.  Closed-form:
-          h[t] = Σ_{i≤t} exp(A·(cumΔ[t]−cumΔ[i])) · Δ[i]·B[i]·x[i]
+
+    Parallel prefix scan via cumsum:
+      h[t] = Σ_{i≤t} exp(A·(cumΔ[t]−cumΔ[i])) · Δ[i]·B[i]·x[i]
+
+    Each of the inner channels has its own independent d_state-dim
+    memory, giving per-channel selectivity (unlike a bottleneck which
+    forces information through a narrow shared representation).
     """
 
     def __init__(self, d_model: int = 512, d_state: int = 16, d_conv: int = 4,
-                 expand: int = 2, dropout: float = 0.1,
-                 ssm_bottleneck: int = 128):
+                 expand: int = 2, dropout: float = 0.1):
         super().__init__()
         self.d_model = d_model
         self.d_state = d_state
-        inner = int(d_model * expand)
-        self.inner = inner
-        ssm_dim = ssm_bottleneck if ssm_bottleneck > 0 else inner
-        self.ssm_dim = ssm_dim
+        self.inner = int(d_model * expand)
 
-        # ── Input projection → gate + signal ──
-        self.in_proj = nn.Linear(d_model, inner * 2, bias=False)
+        # ── Gate + signal projection ──
+        self.in_proj = nn.Linear(d_model, self.inner * 2, bias=False)
 
         # ── Causal depthwise conv ──
         self.conv1d = nn.Conv1d(
-            in_channels=inner, out_channels=inner,
-            kernel_size=d_conv, padding=d_conv - 1, groups=inner,
+            in_channels=self.inner, out_channels=self.inner,
+            kernel_size=d_conv, padding=d_conv - 1, groups=self.inner,
         )
 
-        # ── Bottleneck ──
-        self.ssm_down = nn.Linear(inner, ssm_dim, bias=False)
-        self.ssm_up   = nn.Linear(ssm_dim, inner, bias=False)
-
-        # ── Selective SSM core ──
-        # A = -softplus(A_log):  linspace(0.1, 1.2, 16) → softplus → negate
-        #   yields A ∈ [-1.23, -0.10] — wide enough for real selectivity
+        # ── Selective SSM (runs at full inner dim) ──
         A_init = torch.linspace(0.1, 1.2, d_state, dtype=torch.float32)
         self.A_log = nn.Parameter(A_init.log())
-        # B(x), C(x): input-dependent projections
-        self.B_proj = nn.Linear(ssm_dim, d_state, bias=False)
-        self.C_proj = nn.Linear(ssm_dim, d_state, bias=False)
-        # Δ(x): sigmoid-bounded ∈ (0, 1) ⇒ cum_dt ≤ T = 8 ⇒ exp safe
-        self.dt_proj = nn.Linear(ssm_dim, ssm_dim, bias=True)
-        # D: residual skip
-        self.D = nn.Parameter(torch.ones(ssm_dim))
+        self.B_proj = nn.Linear(self.inner, d_state, bias=False)
+        self.C_proj = nn.Linear(self.inner, d_state, bias=False)
+        self.dt_proj = nn.Linear(self.inner, self.inner, bias=True)
+        self.D = nn.Parameter(torch.ones(self.inner))
 
         # ── Normalisation ──
-        self.ssm_norm = nn.LayerNorm(ssm_dim)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
+        self.norm_in  = nn.LayerNorm(d_model)
+        self.norm_ssm = nn.LayerNorm(self.inner)
+        self.norm_out = nn.LayerNorm(d_model)
 
         # ── Output ──
-        self.out_proj = nn.Linear(inner, d_model, bias=False)
+        self.out_proj = nn.Linear(self.inner, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
 
-        # Init dt bias: sigmoid(-2) ≈ 0.12
         nn.init.constant_(self.dt_proj.bias, -2.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, D_in = x.shape
+        B, T, _ = x.shape
         inner = self.inner
-        d_state = self.d_state
-        ssm_dim = self.ssm_dim
+        ds   = self.d_state
 
         residual = x
-        x_n = self.norm1(x)
 
-        # 1 ── Gate (z) + signal (x_sig) ──
-        proj = self.in_proj(x_n)                   # [B, T, inner·2]
-        z, x_sig = proj.chunk(2, dim=-1)            # [B, T, inner]
+        # 1 ── Gate (z) + signal branch ──
+        proj = self.in_proj(self.norm_in(x))         # [B, T, inner·2]
+        z, x_sig = proj.chunk(2, dim=-1)              # [B, T, inner]
 
         # 2 ── Causal conv ──
         x_conv = self.conv1d(x_sig.transpose(1, 2))[:, :, :T]
-        x_conv = F.silu(x_conv.transpose(1, 2))     # [B, T, inner]
+        x_conv = F.silu(x_conv.transpose(1, 2))       # [B, T, inner]
 
-        # 3 ── Bottleneck down ──
-        x_s = self.ssm_down(x_conv)                 # [B, T, ssm_dim]
+        # 3 ── SSM parameters ──
+        dt   = torch.sigmoid(self.dt_proj(x_conv))     # [B,T,inner] ∈ (0,1)
+        B_s  = self.B_proj(x_conv)                     # [B,T,ds]
+        C_s  = self.C_proj(x_conv)                     # [B,T,ds]
+        A    = -F.softplus(self.A_log)                 # [ds]   ∈ (-1.3,-0.1)
 
-        # 4 ── SSM params ──
-        dt = torch.sigmoid(self.dt_proj(x_s))       # [B,T,ssm] ∈ (0,1)
-        B_s = self.B_proj(x_s)                      # [B,T,ds]
-        C_s = self.C_proj(x_s)                      # [B,T,ds]
-        A   = -F.softplus(self.A_log)               # [ds]    ∈ (-1.3, -0.1)
+        # 4 ── Parallel prefix scan ──
+        cum_dt = torch.cumsum(dt, dim=1)               # [B, T, inner]
 
-        # 5 ── Parallel prefix scan ──
-        #     h[t] = exp(A·cum[t]) · Σ_{i≤t} exp(-A·cum[i]) · dt[i]·B[i]·x[i]
-        #     Numerically safe: |A|≤1.3, cum_dt≤8 → max exp(|A|·T) ≈ exp(11)≈6e4
-        #     Typical operating point: |A|~0.5, cum_dt~1 → exp(0.5)≈1.6
-        cum_dt = torch.cumsum(dt, dim=1)            # [B, T, ssm_dim]
-
-        # term = dt · B · x  (expanded over state dim)
+        # term[b,t,c,s] = dt[b,t,c] · B[b,t,s] · x_conv[b,t,c]
         term = (dt.unsqueeze(-1)
                 * B_s.unsqueeze(2)
-                * x_s.unsqueeze(-1))                # [B, T, ssm_dim, d_state]
+                * x_conv.unsqueeze(-1))                # [B,T,inner,ds]
 
-        # decay[i] = exp(-A·cum_dt[i])    (−A > 0 → exponential growth)
-        neg_A = -A                                     # [ds], positive
+        # decay[i] = exp(-A·cum[i])  (−A > 0)
+        neg_A = -A                                      # [ds]
         decay = torch.exp(
-            neg_A.view(1, 1, 1, d_state) * cum_dt.unsqueeze(-1)
-        )                                           # [B, T, ssm_dim, d_state]
+            neg_A.view(1, 1, 1, ds) * cum_dt.unsqueeze(-1)
+        )                                              # [B,T,inner,ds]
 
-        inner_sum = torch.cumsum(decay * term, dim=1)  # [B, T, ssm_dim, d_state]
+        cum_term = torch.cumsum(decay * term, dim=1)    # [B,T,inner,ds]
 
-        # h[t] = exp(A·cum_dt[t]) · inner_sum[t]
+        # h[t] = exp(A·cum[t]) · cum_term[t]
         gain = torch.exp(
-            A.view(1, 1, 1, d_state) * cum_dt.unsqueeze(-1)
-        )                                           # [B, T, ssm_dim, d_state] ∈ (0,1]
-        h = gain * inner_sum                         # [B, T, ssm_dim, d_state]
+            A.view(1, 1, 1, ds) * cum_dt.unsqueeze(-1)
+        )                                              # [B,T,inner,ds] ∈ (0,1]
+        h = gain * cum_term
 
-        # y[t] = Σ_s C[t,s] · h[t,c,s]
-        x_ssm = (C_s.unsqueeze(2) * h).sum(dim=-1)   # [B, T, ssm_dim]
+        # y[t,c] = Σ_s C[t,c,s] · h[t,c,s]
+        x_ssm = (C_s.unsqueeze(2) * h).sum(dim=-1)     # [B, T, inner]
 
-        # 6 ── Norm + skip + bottleneck up ──
-        x_ssm = self.ssm_norm(x_ssm + x_s * self.D)
-        x_up  = self.ssm_up(x_ssm)                   # [B, T, inner]
-
-        # 7 ── Gate + output + residual ──
-        y = x_up * F.silu(z)
-        y = self.dropout(self.out_proj(y))
-        return self.norm2(residual + y)
+        # 5 ── Norm + skip + gate + output ──
+        x_ssm = self.norm_ssm(x_ssm + x_conv * self.D)
+        y = x_ssm * F.silu(z)                           # [B, T, inner]
+        y = self.dropout(self.out_proj(y))              # [B, T, d_model]
+        return self.norm_out(residual + y)
 
 
 class MambaEncoder(nn.Module):
     """Stack of MambaBlocks — drop-in replacement for TransformerEncoder."""
 
     def __init__(self, d_model: int = 512, n_layers: int = 4, d_state: int = 16,
-                 d_conv: int = 4, expand: int = 2, dropout: float = 0.1,
-                 ssm_bottleneck: int = 128):
+                 d_conv: int = 4, expand: int = 2, dropout: float = 0.1):
         super().__init__()
         self.blocks = nn.ModuleList([
-            MambaBlock(d_model, d_state, d_conv, expand, dropout, ssm_bottleneck)
+            MambaBlock(d_model, d_state, d_conv, expand, dropout)
             for _ in range(n_layers)
         ])
 
@@ -294,7 +274,6 @@ class ExcavatorVLA(nn.Module):
         qpos_mode: str = "modulation", qpos_drop_prob=0.3,
         encoder_type: str = "transformer",
         mamba_d_state: int = 16, mamba_d_conv: int = 4, mamba_expand: int = 2,
-        mamba_ssm_bottleneck: int = 128,
         use_sincos: bool = False,
     ):
         """
@@ -302,7 +281,7 @@ class ExcavatorVLA(nn.Module):
             encoder_type: "transformer" or "mamba"
             qpos_mode:    "modulation" (head residual) or "transformer" (inject into encoder)
             use_sincos:   encode qpos as [sin(θ), cos(θ)] — eliminates 2π discontinuity
-            mamba_d_state, mamba_d_conv, mamba_expand, mamba_ssm_bottleneck: Mamba hyper-params
+            mamba_d_state, mamba_d_conv, mamba_expand: Mamba hyper-params
         """
         super().__init__()
         self.seq_len = seq_len
@@ -335,7 +314,6 @@ class ExcavatorVLA(nn.Module):
                 d_model=hidden_dim, n_layers=n_layers,
                 d_state=mamba_d_state, d_conv=mamba_d_conv,
                 expand=mamba_expand, dropout=dropout,
-                ssm_bottleneck=mamba_ssm_bottleneck,
             )
         else:
             raise ValueError(f"Unknown encoder_type: {encoder_type}")
