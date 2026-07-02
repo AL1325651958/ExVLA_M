@@ -184,41 +184,64 @@ class MambaBlock(nn.Module):
         # 3 ── Bottleneck down: inner → ssm_dim ──
         x_ssm_in = self.ssm_down(x_conv)             # [B, T, ssm_dim]
 
-        # 4 ── Discretisation step Δ(x) ──
+        # 4 ── Discretisation step Δ(x) ∈ (0, ∞) ──
         dt = F.softplus(self.dt_proj(x_ssm_in))      # [B, T, ssm_dim]
+        dt = dt.clamp(max=20.0)                      # prevent extreme values
 
         # 5 ── Selective B(x), C(x) ──
         B_sel = self.B_proj(x_ssm_in)                # [B, T, d_state]
         C_sel = self.C_proj(x_ssm_in)                # [B, T, d_state]
 
-        # 6 ── Diagonal A:  -exp(log) ≤ 0 → exp(Δt·A) ∈ (0,1] ──
-        A = -torch.exp(self.A_log)                   # [d_state]
+        # 6 ── Diagonal A = -exp(log) ≤ 0  ⇒  exp(Δt·A) ∈ (0,1] ──
+        A_vec = -torch.exp(self.A_log)               # [d_state]
 
-        # 7 ── ZOH discretisation ──
-        A_bar = torch.exp(dt.unsqueeze(-1) * A)      # [B,T,ssm,d_state]
-        B_bar = dt.unsqueeze(-1) * B_sel.unsqueeze(2) # [B,T,ssm,d_state]
+        # 7 ── Parallel prefix scan via cusum ──
+        #      Unrolling the recurrence  h_t = Ā_t·h_{t-1} + B̄_t·x_t
+        #      (where Ā=exp(Δ⊗A), B̄=Δ⊗B) yields the closed form:
+        #
+        #        h_t = Σ_{i≤t}  exp(A·(cumΔ[t] − cumΔ[i])) · Δ[i]·B[i]·x[i]
+        #
+        #      Computed in O(T) as two cumsums:
+        #        1.  cumΔ = cumsum(Δt)
+        #        2.  term = Δt · B_sel · x_ssm_in          [B,T,ssm,ds]
+        #        3.  inner = cumsum(exp(−A·cumΔ) · term)
+        #        4.  h[t]  = exp(A·cumΔ[t]) · inner[t]
+        #        5.  y[t]  = C[t] · h[t]
+        #
+        #      Gradient flows through cumsum (O(1) backward),
+        #      NOT through a serial for-loop (O(T) backward).
+        # ─────────────────────────────────────────────────────
+        cum_dt = torch.cumsum(dt, dim=1)             # [B, T, ssm_dim]
 
-        # 8 ── Serial associative scan  h_t = Ā_t·h_{t-1} + B̄_t·x_t ──
-        h = torch.zeros(B, A_bar.shape[2], d_state,
-                        device=x.device, dtype=x.dtype)  # [B,ssm_dim,d_state]
-        out_parts = []
-        for t_step in range(T):
-            h = (A_bar[:, t_step] * h
-                 + B_bar[:, t_step] * x_ssm_in[:, t_step].unsqueeze(-1))
-            y_t = (C_sel[:, t_step].unsqueeze(1) * h).sum(dim=-1)
-            out_parts.append(y_t.unsqueeze(1))
-        x_ssm = torch.cat(out_parts, dim=1)          # [B, T, ssm_dim]
+        # term[b,t,c,s] = dt[b,t,c] * B[b,t,s] * x_ssm_in[b,t,c]
+        term = (dt.unsqueeze(-1)
+                * B_sel.unsqueeze(2)
+                * x_ssm_in.unsqueeze(-1))            # [B, T, ssm_dim, d_state]
 
-        # 9 ── Normalise + skip ──
+        # exp(−A·cumΔ) — A_vec ≤ 0 so −A_vec ≥ 0
+        decay = torch.exp(
+            -A_vec.view(1, 1, 1, d_state) * cum_dt.unsqueeze(-1)
+        )                                            # [B, T, ssm_dim, d_state]
+
+        inner_sum = torch.cumsum(decay * term, dim=1)  # [B, T, ssm_dim, d_state]
+
+        # h[t] = exp(A·cumΔ[t]) · inner_sum[t]
+        h = (torch.exp(A_vec.view(1, 1, 1, d_state) * cum_dt.unsqueeze(-1))
+             * inner_sum)                             # [B, T, ssm_dim, d_state]
+
+        # y[t] = Σ_s C[t,s] · h[t,c,s]
+        x_ssm = (C_sel.unsqueeze(2) * h).sum(dim=-1)  # [B, T, ssm_dim]
+
+        # 8 ── Normalise + skip ──
         x_ssm = self.ssm_norm(x_ssm + x_ssm_in * self.D)
 
-        # 10 ── Bottleneck up: ssm_dim → inner ──
+        # 9 ── Bottleneck up: ssm_dim → inner ──
         x_ssm_up = self.ssm_up(x_ssm)                # [B, T, inner]
 
-        # 11 ── Gating  SiLU(z) ──
+        # 10 ── Gating  SiLU(z) ──
         y = x_ssm_up * F.silu(z)                     # [B, T, inner]
 
-        # 12 ── Output projection + residual ──
+        # 11 ── Output projection + residual ──
         y = self.dropout(self.out_proj(y))           # [B, T, d_model]
         return self.norm(residual + y)
 
