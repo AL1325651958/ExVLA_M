@@ -437,6 +437,7 @@ def main():
             mode_tag += " [delta]"
         elif not is_absolute:
             mode_tag += " [legacy]"
+        mode_tag += f" [{encoder_type}]"
         cv2.putText(title_img, f"Frame: {i} / {N}  |  {mode_tag}  |  GT vs Prediction",
                     (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (50, 50, 50), 1, cv2.LINE_AA)
 
@@ -468,7 +469,8 @@ def main():
     # Save video
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     name = Path(args.data_path).stem
-    out_path = f"{args.out_dir}/{name}_gt_vs_pred.mp4"
+    enc_suffix = "_mamba" if encoder_type == "mamba" else ""
+    out_path = f"{args.out_dir}/{name}{enc_suffix}_gt_vs_pred.mp4"
     imageio.mimsave(out_path, frames, fps=args.fps, macro_block_size=1)
     print(f"\nSaved: {out_path}")
 
