@@ -109,11 +109,18 @@ class ExcavatorVLA(nn.Module):
     def __init__(
         self, seq_len=8, hidden_dim=512, n_heads=8, n_layers=4, ff_dim=2048,
         dropout=0.1, drop_path_rate=0.05, pretrained=True, num_excavators=4,
-        qpos_drop_prob=0.3,
+        qpos_mode: str = "modulation", qpos_drop_prob=0.3,
     ):
+        """
+        qpos_mode:
+          - "modulation":  qpos → small MLP → head-level residual correction
+          - "transformer": qpos → proj → add to Transformer input (legacy style)
+        Both modes: training only, masked with dropout. Inference = pure vision.
+        """
         super().__init__()
         self.seq_len = seq_len
         self.hidden_dim = hidden_dim
+        self.qpos_mode = qpos_mode
         self.qpos_drop_prob = qpos_drop_prob
 
         # ── Vision backbone ──
@@ -140,12 +147,20 @@ class ExcavatorVLA(nn.Module):
             nn.Linear(128, 4),
         )
 
-        # ── qpos modulation: small residual correction (training only) ──
-        # NOT injected into Transformer — only a lightweight bias at the head.
-        self.qpos_mod = nn.Sequential(
-            nn.Linear(4, 32), nn.GELU(),
-            nn.Linear(32, 4),   # → correction in joint space
-        )
+        if qpos_mode == "modulation":
+            # Head-level residual: qpos[:, -1] → 32 → 4 correction
+            self.qpos_mod = nn.Sequential(
+                nn.Linear(4, 32), nn.GELU(),
+                nn.Linear(32, 4),
+            )
+        elif qpos_mode == "transformer":
+            # Inject qpos into Transformer input: qpos → 128 → hidden_dim
+            self.qpos_proj = nn.Sequential(
+                nn.Linear(4, hidden_dim // 4), nn.GELU(),
+                nn.Linear(hidden_dim // 4, hidden_dim),
+            )
+        else:
+            raise ValueError(f"Unknown qpos_mode: {qpos_mode}")
 
         self._init_weights()
 
@@ -159,8 +174,9 @@ class ExcavatorVLA(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
         nn.init.normal_(self.excv_embed.weight, mean=0.0, std=0.02)
-        # qpos_mod initialized small: residual should start near zero
-        for module in self.qpos_mod:
+        # qpos components: initialized small so residual starts near zero
+        qpos_modules = self.qpos_mod if self.qpos_mode == "modulation" else self.qpos_proj
+        for module in qpos_modules:
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight, gain=0.1)
                 if module.bias is not None:
@@ -179,34 +195,38 @@ class ExcavatorVLA(nn.Module):
         elev_flat = elevation.reshape(B * T, 3, H, W)
         features = self.vision_encoder(rgb_flat, elev_flat).view(B, T, -1)
 
-        # ── 2. Position encoding ──
+        # ── 2. qpos injection (transformer mode) — training only with dropout ──
+        if self.qpos_mode == "transformer" and qpos is not None and self.training:
+            qpos_feat = self.qpos_proj(qpos)   # [B, T, D]
+            if self.qpos_drop_prob > 0:
+                mask = (torch.rand(B, 1, 1, device=qpos.device) > self.qpos_drop_prob).float()
+                qpos_feat = qpos_feat * mask
+            features = features + qpos_feat
+
+        # ── 3. Position encoding ──
         if T <= self.seq_len:
             features = features + self.pos_embed[:, :T, :]
         else:
             features = self.sinusoidal_pe(features.permute(1, 0, 2)).permute(1, 0, 2)
 
-        # ── 3. Transformer (pure vision + position, no qpos shortcut) ──
+        # ── 4. Transformer ──
         features = features.permute(1, 0, 2)          # [T, B, D]
         encoded = self.stoch_depth(self.transformer(features))
         encoded = encoded.permute(1, 0, 2)             # [B, T, D]
 
-        # ── 4. Base prediction: vision is the primary driver ──
+        # ── 5. Base prediction: vision is the primary driver ──
         vision_feat = encoded[:, -1, :]                # [B, hidden_dim]
         excv_feat = self.excv_embed(excavator_id)      # [B, hidden_dim]
         base_pred = self.action_head(torch.cat([vision_feat, excv_feat], dim=-1))
 
-        # ── 5. qpos modulation: lightweight residual correction ──
-        if qpos is not None and self.training:
-            correction = self.qpos_mod(qpos[:, -1])     # [B, 4] — last-frame only
-
-            # Dropout mask: randomly kill qpos correction for some samples
+        # ── 6. qpos modulation (modulation mode) — training only with dropout ──
+        if self.qpos_mode == "modulation" and qpos is not None and self.training:
+            correction = self.qpos_mod(qpos[:, -1])     # [B, 4]
             if self.qpos_drop_prob > 0:
                 mask = (torch.rand(B, 1, device=qpos.device) > self.qpos_drop_prob).float()
                 correction = correction * mask
-
             return base_pred + correction
         else:
-            # Inference or no qpos: pure vision
             return base_pred
 
 
