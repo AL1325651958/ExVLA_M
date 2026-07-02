@@ -182,6 +182,7 @@ def main():
     state_keys = set(state_dict.keys())
     has_delta_head = any("delta_head" in k for k in state_keys)
     has_action_head = any("action_head" in k for k in state_keys)
+    has_action_heads = any("action_heads" in k for k in state_keys)
     has_qpos_proj = any("qpos_proj" in k for k in state_keys)
     has_qpos_mod = any("qpos_mod" in k for k in state_keys)
 
@@ -199,7 +200,14 @@ def main():
     else:
         encoder_type = "transformer"
 
-    if has_action_head:
+    # Detect excv-specific heads
+    has_excv_heads = has_action_heads
+
+    if has_excv_heads:
+        is_absolute = not args.delta
+        tag = "delta" if args.delta else "absolute"
+        print(f"Model type: {tag} qpos ({qpos_mode}) encoder ({encoder_type}) excv-heads")
+    elif has_action_head:
         is_absolute = not args.delta
         tag = "delta" if args.delta else "absolute"
         print(f"Model type: {tag} qpos ({qpos_mode}) encoder ({encoder_type})")
@@ -225,7 +233,26 @@ def main():
         for k, v in state_dict.items():
             sd_new[k.replace("delta_head", "action_head")] = v
         state_dict = sd_new
-    model.load_state_dict(state_dict)
+
+    # Handle old checkpoints: remap "transformer." → "encoder." for key compat
+    has_old_transformer_key = any(k.startswith("transformer.") for k in state_dict)
+    has_new_encoder_key = any(k.startswith("encoder.") for k in state_dict)
+    if has_old_transformer_key and not has_new_encoder_key:
+        sd_new = {}
+        for k, v in state_dict.items():
+            sd_new[k.replace("transformer.", "encoder.")] = v
+        state_dict = sd_new
+        print("  Remapped: transformer.* → encoder.* (legacy checkpoint)")
+
+    # Handle old single-head checkpoints: action_head → action_heads.0
+    if has_action_head and not has_action_heads:
+        sd_new = {}
+        for k, v in state_dict.items():
+            sd_new[k.replace("action_head.", "action_heads.0.").replace("action_head.0.", "action_heads.0.0.")] = v
+        state_dict = sd_new
+        print("  Remapped: action_head → action_heads.0 (single→per-excv heads)")
+
+    model.load_state_dict(state_dict, strict=False)
     model.eval()
 
     pred_steps = 1

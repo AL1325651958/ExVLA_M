@@ -318,13 +318,19 @@ class ExcavatorVLA(nn.Module):
         else:
             raise ValueError(f"Unknown encoder_type: {encoder_type}")
 
-        # ── Base prediction head ──
-        head_in = hidden_dim + hidden_dim  # vision_feat + excv_feat
-        self.action_head = nn.Sequential(
-            nn.Linear(head_in, 256), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(256, 128), nn.GELU(), nn.Dropout(dropout * 0.5),
-            nn.Linear(128, 4),
-        )
+        # ── Excavator-specific prediction heads ──
+        # Shared vision → per-excavator MLP: each machine has its own kinematics.
+        # vision_feat [D] → head[excv_id] → [4]
+        head_in = hidden_dim  # vision_feat only (excv_id selects the head)
+        self.action_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(head_in, 256), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(256, 128), nn.GELU(), nn.Dropout(dropout * 0.5),
+                nn.Linear(128, 4),
+            )
+            for _ in range(num_excavators)
+        ])
+        # Keep excv_embed for downstream compatibility (not used in forward)
 
         # ── qpos components ──
         if qpos_mode == "none":
@@ -348,11 +354,12 @@ class ExcavatorVLA(nn.Module):
             for p in self.encoder.parameters():
                 if p.dim() > 1:
                     nn.init.xavier_uniform_(p, gain=0.5)
-        for module in self.action_head:
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight, gain=0.5)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+        for head in self.action_heads:
+            for module in head:
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight, gain=0.5)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
         nn.init.normal_(self.excv_embed.weight, mean=0.0, std=0.02)
         if self.qpos_mode == "none":
             pass  # no qpos parameters to init
@@ -407,10 +414,13 @@ class ExcavatorVLA(nn.Module):
             # Mamba: [B, T, D] — no position encoding needed
             encoded = self.encoder(features)             # [B, T, D]
 
-        # ── 4. Head: vision + excavator ID → base prediction ──
+        # ── 4. Head: per-excavator MLP — each machine has its own kinematics ──
         vision_feat = encoded[:, -1, :]                  # [B, D]
-        excv_feat = self.excv_embed(excavator_id)        # [B, D]
-        base_pred = self.action_head(torch.cat([vision_feat, excv_feat], dim=-1))
+        base_pred = torch.zeros(B, 4, device=vision_feat.device, dtype=vision_feat.dtype)
+        for excv_idx in range(self.action_heads.__len__()):
+            mask = (excavator_id == excv_idx)
+            if mask.any():
+                base_pred[mask] = self.action_heads[excv_idx](vision_feat[mask])
 
         # ── 5. qpos modulation residual (training only) ──
         if self.qpos_mode == "none":
