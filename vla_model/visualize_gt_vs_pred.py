@@ -437,7 +437,6 @@ def main():
             mode_tag += " [delta]"
         elif not is_absolute:
             mode_tag += " [legacy]"
-        mode_tag += f" [{encoder_type}]"
         cv2.putText(title_img, f"Frame: {i} / {N}  |  {mode_tag}  |  GT vs Prediction",
                     (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (50, 50, 50), 1, cv2.LINE_AA)
 
