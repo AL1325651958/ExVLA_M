@@ -20,8 +20,12 @@ class Config:
     dropout: float = 0.1           # moderate regularization
     drop_path_rate: float = 0.05   # light stochastic depth
     pretrained: bool = True
-    predict_delta: bool = False    # absolute qpos prediction
-    qpos_drop_prob: float = 0.3   # probability of masking qpos during training
+    predict_delta: bool = False       # absolute qpos prediction
+    qpos_mode: str = "modulation"      # "none" | "modulation" | "transformer"
+    qpos_drop_prob: float = 0.3        # probability of masking qpos during training
+    qpos_drop_schedule: bool = False   # linear ramp: drop_prob increases over epochs
+    qpos_drop_start: float = 0.0       #   epoch 0 drop probability
+    qpos_drop_end: float = 1.0         #   final-epoch drop probability (1.0 = pure vision)
 
     # Training
     batch_size: int = 32

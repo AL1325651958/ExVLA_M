@@ -144,22 +144,27 @@ class MambaBlock(nn.Module):
             y: [B, T, D]
         """
         B, T, D = x.shape
-        inner = int(D * 2)
+        inner = self.in_proj.weight.shape[0] // 2   # respect expand ratio
 
         residual = x
 
         # 1. Linear projection + SiLU activation (like Mamba's "selective" gate)
         proj = self.in_proj(x)                    # [B, T, inner * 2]
-        z, x_proj = proj.chunk(2, dim=-1)          # each [B, T, inner]
+        z, x_in = proj.chunk(2, dim=-1)           # each [B, T, inner]
 
         # 2. Causal 1D conv over time (maintains temporal locality)
-        x_proj_t = x_proj.transpose(1, 2)          # [B, inner, T]
-        x_conv = self.conv1d(x_proj_t)[:, :, :T]   # causal: trim future padding
-        x_conv = F.silu(x_conv)                    # activation after conv
-        x_conv = x_conv.transpose(1, 2)            # [B, T, inner]
+        x_in_t = x_in.transpose(1, 2)             # [B, inner, T]
+        x_conv = self.conv1d(x_in_t)[:, :, :T]    # causal: trim future padding
+        x_conv = F.silu(x_conv)                   # activation after conv
+        x_conv = x_conv.transpose(1, 2)           # [B, T, inner]
 
         # 3. Time-varying selection (simplified SSM scan)
-        dt = F.softplus(self.dt_proj(x_conv))      # [B, T, inner] always > 0
+        #    sigmoid bounds dt ∈ (0,1) so (1-dt) stays positive —
+        #    the recurrence h_t = (1-α)·h_{t-1} + α·x_t is then a
+        #    stable convex combination (EMA).  softplus would allow
+        #    dt > 1, flipping the decay term negative and causing
+        #    exponential blow-up → NaN.
+        dt = torch.sigmoid(self.dt_proj(x_conv))   # [B, T, inner] ∈ (0,1)
         state = self.x_proj(x_conv)                # [B, T, d_state]
 
         # Simplified selective scan: dt-weighted cumsum along time
@@ -305,7 +310,9 @@ class ExcavatorVLA(nn.Module):
         )
 
         # ── qpos components ──
-        if qpos_mode == "modulation":
+        if qpos_mode == "none":
+            self.qpos_mod = None     # pure vision — no GT involvement
+        elif qpos_mode == "modulation":
             self.qpos_mod = nn.Sequential(
                 nn.Linear(qpos_dim, 32), nn.GELU(), nn.Linear(32, 4),
             )
@@ -330,12 +337,20 @@ class ExcavatorVLA(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
         nn.init.normal_(self.excv_embed.weight, mean=0.0, std=0.02)
-        qpos_modules = self.qpos_mod if self.qpos_mode == "modulation" else self.qpos_proj
-        for module in qpos_modules:
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight, gain=0.1)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+        if self.qpos_mode == "none":
+            pass  # no qpos parameters to init
+        elif self.qpos_mode == "modulation":
+            for module in self.qpos_mod:
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight, gain=0.1)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+        elif self.qpos_mode == "transformer":
+            for module in self.qpos_proj:
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight, gain=0.1)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
 
     def forward(self, rgb, elevation, qpos=None, excavator_id=None):
         """
@@ -380,8 +395,10 @@ class ExcavatorVLA(nn.Module):
         excv_feat = self.excv_embed(excavator_id)        # [B, D]
         base_pred = self.action_head(torch.cat([vision_feat, excv_feat], dim=-1))
 
-        # ── 5. qpos modulation residual ──
-        if self.qpos_mode == "modulation" and qpos is not None and self.training:
+        # ── 5. qpos modulation residual (training only) ──
+        if self.qpos_mode == "none":
+            return base_pred
+        elif self.qpos_mode == "modulation" and qpos is not None and self.training:
             qpos_last = encode_joints_sincos(qpos[:, -1, :]) if self.use_sincos else qpos[:, -1, :]
             correction = self.qpos_mod(qpos_last)
             if self.qpos_drop_prob > 0:

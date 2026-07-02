@@ -168,6 +168,20 @@ def save_checkpoint(model, optimizer, scaler, epoch, metrics, config, is_best=Fa
     print(f"Checkpoint saved: {path}")
 
 
+def _qpos_drop_prob(epoch: int, total_epochs: int, config: Config) -> float:
+    """Compute qpos dropout probability for the current epoch.
+
+    With qpos_drop_schedule enabled, linearly ramps from qpos_drop_start
+    (epoch 0) to qpos_drop_end (final epoch).  The default schedule is
+    0.0 → 1.0, meaning the model starts with full GT assistance and
+    gradually transitions to pure vision by the final epoch.
+    """
+    if not config.qpos_drop_schedule:
+        return config.qpos_drop_prob
+    progress = epoch / max(total_epochs - 1, 1)
+    return config.qpos_drop_start + (config.qpos_drop_end - config.qpos_drop_start) * progress
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train ExcavatorVLA")
     parser.add_argument("--data_dir", type=str, default=None, help="Override data directory")
@@ -179,6 +193,11 @@ def main():
     parser.add_argument("--img_size", type=int, default=None, help="Override image size")
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
     parser.add_argument("--overfit", action="store_true", help="Overfit single episode")
+    parser.add_argument("--qpos_mode", type=str, default=None,
+                        choices=["none", "modulation", "transformer"],
+                        help="GT involvement: 'none'=pure vision, 'modulation'=residual (default), 'transformer'=inject into encoder")
+    parser.add_argument("--qpos_drop_schedule", action="store_true", default=None,
+                        help="Linearly ramp qpos_drop_prob from 0 to 1 over training")
     args = parser.parse_args()
 
     config = Config()
@@ -198,6 +217,10 @@ def main():
         config.sample_ratio = args.sample_ratio
     if args.img_size is not None:
         config.img_size = args.img_size
+    if args.qpos_mode is not None:
+        config.qpos_mode = args.qpos_mode
+    if args.qpos_drop_schedule is not None:
+        config.qpos_drop_schedule = args.qpos_drop_schedule
     # Mamba-specific default
     config.output_dir = "output/checkpoints_mamba"
 
@@ -249,7 +272,7 @@ def main():
         n_layers=config.n_layers,
         dropout=config.dropout,
         pretrained=config.pretrained,
-        qpos_mode="modulation",
+        qpos_mode=config.qpos_mode,
         qpos_drop_prob=config.qpos_drop_prob,
         encoder_type="mamba",
     ).to(config.device)
@@ -295,6 +318,12 @@ def main():
 
     for epoch in range(start_epoch, config.epochs):
         t0 = time.time()
+
+        # ── Scheduled qpos dropout ──
+        if config.qpos_drop_schedule and config.qpos_mode != "none":
+            model.qpos_drop_prob = _qpos_drop_prob(epoch, config.epochs, config)
+            if epoch == 0 or epoch == config.epochs - 1 or epoch % 10 == 0:
+                print(f"  qpos_drop_prob: {model.qpos_drop_prob:.3f}")
 
         # Train
         train_metrics = train_epoch(model, train_loader, optimizer, scaler, scheduler, criterion, config, epoch)
