@@ -192,10 +192,17 @@ def main():
     else:
         qpos_mode = "modulation"  # fallback
 
+    # Detect encoder type from state_dict keys
+    has_mamba_blocks = any("encoder.blocks" in k for k in state_keys)
+    if has_mamba_blocks:
+        encoder_type = "mamba"
+    else:
+        encoder_type = "transformer"
+
     if has_action_head:
         is_absolute = not args.delta
         tag = "delta" if args.delta else "absolute"
-        print(f"Model type: {tag} qpos ({qpos_mode})")
+        print(f"Model type: {tag} qpos ({qpos_mode}) encoder ({encoder_type})")
     elif has_delta_head:
         is_absolute = False
         print(f"Model type: delta (legacy)")
@@ -209,6 +216,7 @@ def main():
         n_layers=config.n_layers, ff_dim=config.ff_dim,
         dropout=0.0, pretrained=False,
         qpos_mode=qpos_mode,
+        encoder_type=encoder_type,
     ).to(device)
 
     # Handle old delta checkpoints: map delta_head weights to action_head
