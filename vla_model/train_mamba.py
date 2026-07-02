@@ -197,7 +197,11 @@ def main():
                         choices=["none", "modulation", "transformer"],
                         help="GT involvement: 'none'=pure vision, 'modulation'=residual (default), 'transformer'=inject into encoder")
     parser.add_argument("--qpos_drop_schedule", action="store_true", default=None,
-                        help="Linearly ramp qpos_drop_prob from 0 to 1 over training")
+                        help="Linearly ramp qpos_drop_prob over training")
+    parser.add_argument("--qpos_drop_start", type=float, default=None,
+                        help="Starting qpos drop prob (default 0.0)")
+    parser.add_argument("--qpos_drop_end", type=float, default=None,
+                        help="Final qpos drop prob (default 1.0)")
     args = parser.parse_args()
 
     config = Config()
@@ -221,6 +225,10 @@ def main():
         config.qpos_mode = args.qpos_mode
     if args.qpos_drop_schedule is not None:
         config.qpos_drop_schedule = args.qpos_drop_schedule
+    if args.qpos_drop_start is not None:
+        config.qpos_drop_start = args.qpos_drop_start
+    if args.qpos_drop_end is not None:
+        config.qpos_drop_end = args.qpos_drop_end
     # Mamba-specific default
     config.output_dir = "output/checkpoints_mamba"
 
