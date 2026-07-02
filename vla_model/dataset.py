@@ -31,7 +31,8 @@ class ExcavatorDataset(Dataset):
         img_size: int = 224,
         split: str = "train",
         train_split: float = 0.9,
-        sample_ratio: float = 1.0,  # 1.0=all, 0.2=20% for fast training
+        sample_ratio: float = 1.0,
+        force_excv_id: int = None,  # override all excavator_ids (single-machine training)
     ):
         self.data_dir = Path(data_dir)
         self.seq_len = seq_len
@@ -40,6 +41,7 @@ class ExcavatorDataset(Dataset):
         self.split = split
         self.train_split = train_split
         self.sample_ratio = sample_ratio
+        self.force_excv_id = force_excv_id
 
         # Find all H5/HDF5 files
         self.file_list = sorted(
@@ -132,6 +134,8 @@ class ExcavatorDataset(Dataset):
             return None
 
         excv_id = self._parse_excavator_id(fpath)
+        if self.force_excv_id is not None:
+            excv_id = self.force_excv_id
         return {
             "_h5": f,                          # keep file handle alive
             "mains_raw": mains_raw,            # h5py Dataset, lazy access

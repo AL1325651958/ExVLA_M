@@ -177,7 +177,7 @@ def main():
     if "config" in ckpt and hasattr(ckpt["config"], "hidden_dim"):
         config = ckpt["config"]
 
-    # Auto-detect model variant from state_dict keys
+    # Auto-detect model variant from state_dict keys AND shapes
     state_dict = ckpt["model_state_dict"]
     state_keys = set(state_dict.keys())
     has_delta_head = any("delta_head" in k for k in state_keys)
@@ -191,32 +191,29 @@ def main():
     elif has_qpos_mod:
         qpos_mode = "modulation"
     else:
-        qpos_mode = "modulation"  # fallback
+        qpos_mode = "modulation"
 
-    # Detect encoder type from state_dict keys
+    # Detect use_sincos from qpos_mod weight shape
+    use_sincos = False
+    if has_qpos_mod and "qpos_mod.0.weight" in state_dict:
+        use_sincos = state_dict["qpos_mod.0.weight"].shape[1] == 8
+    elif has_qpos_proj and "qpos_proj.0.weight" in state_dict:
+        use_sincos = state_dict["qpos_proj.0.weight"].shape[1] == 8
+
+    # Detect encoder type
     has_mamba_blocks = any("encoder.blocks" in k for k in state_keys)
-    if has_mamba_blocks:
-        encoder_type = "mamba"
-    else:
-        encoder_type = "transformer"
+    encoder_type = "mamba" if has_mamba_blocks else "transformer"
 
-    # Detect excv-specific heads
-    has_excv_heads = has_action_heads
+    # Detect old single-head (action_head with input 1024 = vision+excv concat)
+    is_old_single_head = False
+    if has_action_head and "action_head.0.weight" in state_dict:
+        is_old_single_head = state_dict["action_head.0.weight"].shape[1] == 1024
 
-    if has_excv_heads:
-        is_absolute = not args.delta
-        tag = "delta" if args.delta else "absolute"
-        print(f"Model type: {tag} qpos ({qpos_mode}) encoder ({encoder_type}) excv-heads")
-    elif has_action_head:
-        is_absolute = not args.delta
-        tag = "delta" if args.delta else "absolute"
-        print(f"Model type: {tag} qpos ({qpos_mode}) encoder ({encoder_type})")
-    elif has_delta_head:
-        is_absolute = False
-        print(f"Model type: delta (legacy)")
-    else:
-        is_absolute = False
-        print(f"Model type: unknown")
+    has_excv_heads = has_action_heads or is_old_single_head
+
+    is_absolute = not args.delta
+    print(f"Model: absolute, qpos=({qpos_mode}), encoder=({encoder_type}), "
+          f"sincos=({use_sincos}), heads=({'excv' if has_excv_heads else 'new'})")
 
     model = ExcavatorVLA(
         seq_len=args.seq_len,
@@ -225,14 +222,43 @@ def main():
         dropout=0.0, pretrained=False,
         qpos_mode=qpos_mode,
         encoder_type=encoder_type,
+        use_sincos=use_sincos,
     ).to(device)
 
-    # Handle old delta checkpoints: map delta_head weights to action_head
-    if has_delta_head and not has_action_head:
+    # Handle old single-head with vision+excv concat (1024) → per-excv (512 each)
+    if has_action_head and not has_action_heads and is_old_single_head:
+        sd_new = {}
+        old_head_prefix = "action_head."
+        new_head_prefix = "action_heads.0."
+        for k, v in state_dict.items():
+            if k.startswith(old_head_prefix):
+                # Replicate old head into all 4 per-excv slots
+                for excv_idx in range(4):
+                    new_key = k.replace(old_head_prefix, f"action_heads.{excv_idx}.")
+                    # Old head first layer: [256, 1024] → new: [256, 512]
+                    #   take first 512 of dim 1 (vision features, skip excv_embed part)
+                    if v.dim() == 2 and v.shape[1] == 1024 and "0.weight" in k:
+                        sd_new[new_key] = v[:, :512].clone()
+                    elif v.dim() == 2 and v.shape[1] == 1024 and "0.bias" in k:
+                        sd_new[new_key] = v.clone()  # bias is 256, same
+                    else:
+                        sd_new[new_key] = v.clone()
+            else:
+                sd_new[k] = v
+        state_dict = sd_new
+        print("  Remapped: action_head(1024) → action_heads.* (512 each, per-excv)")
+
+    # Handle old single-head (non-sincos, standard size)
+    elif has_action_head and not has_action_heads:
         sd_new = {}
         for k, v in state_dict.items():
-            sd_new[k.replace("delta_head", "action_head")] = v
+            if k.startswith("action_head."):
+                for excv_idx in range(4):
+                    sd_new[k.replace("action_head.", f"action_heads.{excv_idx}.")] = v.clone()
+            else:
+                sd_new[k] = v
         state_dict = sd_new
+        print("  Remapped: action_head → action_heads.* (4 copies)")
 
     # Handle old checkpoints: remap "transformer." → "encoder." for key compat
     has_old_transformer_key = any(k.startswith("transformer.") for k in state_dict)
