@@ -156,6 +156,8 @@ def main():
                         help="Number of prediction steps to draw (default: use model's action_chunk)")
     parser.add_argument("--rollout", action="store_true",
                         help="Closed-loop: first frame uses GT qpos, then chains own predictions")
+    parser.add_argument("--delta", action="store_true",
+                        help="Model outputs delta — convert to absolute with last_qpos + delta")
     args = parser.parse_args()
 
     device = args.device if torch.cuda.is_available() else "cpu"
@@ -295,11 +297,15 @@ def main():
 
         tgt_idx = start + T_img - 1
 
-        if is_absolute:
-            # Model outputs absolute qpos directly
-            val = pred[0].cpu().numpy()  # [4]
+        if args.delta:
+            # Delta model: convert to absolute
+            delta = pred[0].cpu().numpy()
+            val = qpos_pp[tgt_idx] + delta
+        elif is_absolute:
+            # Absolute model
+            val = pred[0].cpu().numpy()
         else:
-            # Legacy delta model: convert to absolute
+            # Legacy delta model (old delta_head ckpt)
             delta = pred[0].cpu().numpy()
             val = qpos_pp[tgt_idx] + delta
 
@@ -355,8 +361,10 @@ def main():
         # Title
         title_img = np.full((title_h, total_w, 3), 255, dtype=np.uint8)
         mode_tag = "ROLLOUT" if args.rollout else "open-loop"
-        if not is_absolute:
-            mode_tag += " [delta-legacy]"
+        if args.delta:
+            mode_tag += " [delta]"
+        elif not is_absolute:
+            mode_tag += " [legacy]"
         cv2.putText(title_img, f"Frame: {i} / {N}  |  {mode_tag}  |  GT vs Prediction",
                     (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (50, 50, 50), 1, cv2.LINE_AA)
 
