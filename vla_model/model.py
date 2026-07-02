@@ -96,29 +96,33 @@ class DropPath(nn.Module):
 # ---------------------------------------------------------------------------
 
 class MambaBlock(nn.Module):
-    """Selective state-space block (Mamba-style) with diagonal SSM recurrence.
+    """Selective state-space block with bottlenecked diagonal SSM.
 
-    Implements the discretized SSM:
-        h_t = Ā_t ⊙ h_{t-1} + B̄_t ⊙ x_t    (state update)
-        y_t = C_t · h_t                       (output from state)
+    Architecture (Mamba-inspired, bottlenecked for stability):
+        x → LayerNorm → Conv1d → SiLU → proj_down(ssm_dim) ─┐
+                                       ┌────────────────────┘
+                                       ↓
+                           SSM core (selective scan, d_state)
+                                       ↓
+                               norm → proj_up(inner) ─┐
+                                                       ├→ ⊗SiLU(z) → out
+        x → LayerNorm → in_proj → z (gate) ──────────┘
 
-    where Ā = exp(Δ⊗A) and B̄ = Δ⊗B are ZOH-discretized forms of the
-    continuous-time parameters.  B, C, Δ are all input-dependent
-    ("selective"), and A is a learnable negative-diagonal matrix that
-    guarantees stable exponential decay.
-
-    References
-    ----------
-    Gu & Dao, "Mamba: Linear-Time Sequence Modeling with Selective
-    State Spaces", 2023.  https://arxiv.org/abs/2312.00752
+    The SSM operates in a low-dimension bottleneck (ssm_dim=128 by default)
+    rather than the full inner=1024 space.  This keeps the serial-scan
+    gradient chain narrow and numerically stable while still learning
+    rich temporal selectivity.
     """
 
     def __init__(self, d_model: int = 512, d_state: int = 16, d_conv: int = 4,
-                 expand: int = 2, dropout: float = 0.1):
+                 expand: int = 2, dropout: float = 0.1,
+                 ssm_bottleneck: int = 128):
         super().__init__()
         self.d_model = d_model
         self.d_state = d_state
         inner = int(d_model * expand)
+        self.inner = inner
+        ssm_dim = ssm_bottleneck if ssm_bottleneck > 0 else inner
 
         # ── Input projection → gate + signal ──
         self.in_proj = nn.Linear(d_model, inner * 2, bias=False)
@@ -129,27 +133,31 @@ class MambaBlock(nn.Module):
             kernel_size=d_conv, padding=d_conv - 1, groups=inner,
         )
 
-        # ── Selective SSM core ──
-        # A: diagonal state-transition matrix (log-space; exponentiated
-        #    and negated for guaranteed stability,  A = -exp(A_log))
-        self.A_log = nn.Parameter(
-            torch.log(torch.arange(1, d_state + 1, dtype=torch.float32))
-        )
-        # B(x):  input → state   (selective)
-        self.B_proj = nn.Linear(inner, d_state, bias=False)
-        # C(x):  state → output  (selective)
-        self.C_proj = nn.Linear(inner, d_state, bias=False)
-        # Δ(x):  discretisation step  (selective; bias sets base rate)
-        self.dt_proj = nn.Linear(inner, inner, bias=True)
-        # D:  residual skip  (y = SSM(x) + D ⊙ x)
-        self.D = nn.Parameter(torch.ones(inner))
+        # ── Bottleneck: inner → ssm_dim → inner ──
+        self.ssm_down = nn.Linear(inner, ssm_dim, bias=False)
+        self.ssm_up   = nn.Linear(ssm_dim, inner, bias=False)
+
+        # ── Selective SSM core (operates on ssm_dim) ──
+        # A: diagonal state-transition (log-space → -exp(·) ≤ 0, stable)
+        A_init = torch.linspace(0.5, 3.0, d_state, dtype=torch.float32)
+        self.A_log = nn.Parameter(torch.log(A_init))
+        # B(x), C(x): input-dependent projections
+        self.B_proj = nn.Linear(ssm_dim, d_state, bias=False)
+        self.C_proj = nn.Linear(ssm_dim, d_state, bias=False)
+        # Δ(x): per-channel discretisation step
+        self.dt_proj = nn.Linear(ssm_dim, ssm_dim, bias=True)
+        # D: skip connection (1 per channel)
+        self.D = nn.Parameter(torch.ones(ssm_dim))
+
+        # ── Normalisation ──
+        self.ssm_norm = nn.LayerNorm(ssm_dim)
 
         # ── Output ──
         self.out_proj = nn.Linear(inner, d_model, bias=False)
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
-        # Initialise dt bias so softplus(·) ≈ 5e-2  (moderate base step)
+        # Init dt bias: softplus ≈ 0.05 base rate  (small step, slow decay)
         nn.init.constant_(self.dt_proj.bias, -3.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -159,64 +167,59 @@ class MambaBlock(nn.Module):
         Returns:
             y: [B, T, d_model]
         """
-        B, T, D_in = x.shape
-        inner = self.in_proj.weight.shape[0] // 2
+        B, T, _ = x.shape
+        inner = self.inner
         d_state = self.d_state
 
         residual = x
 
         # 1 ── Gate (z)  &  signal (x_sig) branches ──
-        proj = self.in_proj(x)                     # [B, T, inner·2]
-        z, x_sig = proj.chunk(2, dim=-1)           # [B, T, inner] each
+        proj = self.in_proj(self.norm(x))            # [B, T, inner·2]
+        z, x_sig = proj.chunk(2, dim=-1)             # [B, T, inner]
 
         # 2 ── Causal 1-D conv over time ──
         x_conv = self.conv1d(x_sig.transpose(1, 2))[:, :, :T]
-        x_conv = F.silu(x_conv.transpose(1, 2))     # [B, T, inner]
+        x_conv = F.silu(x_conv.transpose(1, 2))      # [B, T, inner]
 
-        # 3 ── Discretisation step  Δ(x) > 0 ──
-        dt = F.softplus(self.dt_proj(x_conv))       # [B, T, inner]
+        # 3 ── Bottleneck down: inner → ssm_dim ──
+        x_ssm_in = self.ssm_down(x_conv)             # [B, T, ssm_dim]
 
-        # 4 ── Selective projections  B(x), C(x) ──
-        B_sel = self.B_proj(x_conv)                # [B, T, d_state]
-        C_sel = self.C_proj(x_conv)                # [B, T, d_state]
+        # 4 ── Discretisation step Δ(x) ──
+        dt = F.softplus(self.dt_proj(x_ssm_in))      # [B, T, ssm_dim]
 
-        # 5 ── Diagonal state transition  A = -exp(A_log) ──
-        #      A[d_state] is negative → exp(Δt·A) ∈ (0, 1)  stable decay
-        A = -torch.exp(self.A_log)                 # [d_state]
+        # 5 ── Selective B(x), C(x) ──
+        B_sel = self.B_proj(x_ssm_in)                # [B, T, d_state]
+        C_sel = self.C_proj(x_ssm_in)                # [B, T, d_state]
 
-        # 6 ── ZOH discretisation ──
-        #      Ā = exp(Δ ⊗ A)       [B, T, inner, d_state]
-        #      B̄ = Δ · B             [B, T, inner, d_state]
-        A_bar = torch.exp(
-            dt.unsqueeze(-1) * A                   # Δ[b,t,i] * A[s]
-        )                                          # → [B, T, inner, d_state]
-        B_bar = (
-            dt.unsqueeze(-1) * B_sel.unsqueeze(2)  # Δ[b,t,i] * B[b,t,s]
-        )                                          # → [B, T, inner, d_state]
+        # 6 ── Diagonal A:  -exp(log) ≤ 0 → exp(Δt·A) ∈ (0,1] ──
+        A = -torch.exp(self.A_log)                   # [d_state]
 
-        # 7 ── Associative scan over time ──
-        #      h₀ = 0
-        #      h_t = Ā_t ⊙ h_{t-1} + B̄_t · x_sig_t
-        #      y_t = C_t · h_t
-        h = torch.zeros(B, inner, d_state, device=x.device, dtype=x.dtype)
+        # 7 ── ZOH discretisation ──
+        A_bar = torch.exp(dt.unsqueeze(-1) * A)      # [B,T,ssm,d_state]
+        B_bar = dt.unsqueeze(-1) * B_sel.unsqueeze(2) # [B,T,ssm,d_state]
+
+        # 8 ── Serial associative scan  h_t = Ā_t·h_{t-1} + B̄_t·x_t ──
+        h = torch.zeros(B, A_bar.shape[2], d_state,
+                        device=x.device, dtype=x.dtype)  # [B,ssm_dim,d_state]
         out_parts = []
-        for t in range(T):
-            # state update  [B, inner, d_state]
-            h = (A_bar[:, t] * h
-                 + B_bar[:, t] * x_conv[:, t].unsqueeze(-1))
-            # output from state  [B, inner]
-            y_t = (C_sel[:, t].unsqueeze(1) * h).sum(dim=-1)
+        for t_step in range(T):
+            h = (A_bar[:, t_step] * h
+                 + B_bar[:, t_step] * x_ssm_in[:, t_step].unsqueeze(-1))
+            y_t = (C_sel[:, t_step].unsqueeze(1) * h).sum(dim=-1)
             out_parts.append(y_t.unsqueeze(1))
-        x_ssm = torch.cat(out_parts, dim=1)        # [B, T, inner]
+        x_ssm = torch.cat(out_parts, dim=1)          # [B, T, ssm_dim]
 
-        # 8 ── Skip connection  D ⊙ x ──
-        x_ssm = x_ssm + x_conv * self.D
+        # 9 ── Normalise + skip ──
+        x_ssm = self.ssm_norm(x_ssm + x_ssm_in * self.D)
 
-        # 9 ── Gating  SiLU(z) ──
-        y = x_ssm * F.silu(z)                      # [B, T, inner]
+        # 10 ── Bottleneck up: ssm_dim → inner ──
+        x_ssm_up = self.ssm_up(x_ssm)                # [B, T, inner]
 
-        # 10 ── Output projection + residual ──
-        y = self.dropout(self.out_proj(y))         # [B, T, d_model]
+        # 11 ── Gating  SiLU(z) ──
+        y = x_ssm_up * F.silu(z)                     # [B, T, inner]
+
+        # 12 ── Output projection + residual ──
+        y = self.dropout(self.out_proj(y))           # [B, T, d_model]
         return self.norm(residual + y)
 
 
@@ -224,10 +227,11 @@ class MambaEncoder(nn.Module):
     """Stack of MambaBlocks — drop-in replacement for TransformerEncoder."""
 
     def __init__(self, d_model: int = 512, n_layers: int = 4, d_state: int = 16,
-                 d_conv: int = 4, expand: int = 2, dropout: float = 0.1):
+                 d_conv: int = 4, expand: int = 2, dropout: float = 0.1,
+                 ssm_bottleneck: int = 128):
         super().__init__()
         self.blocks = nn.ModuleList([
-            MambaBlock(d_model, d_state, d_conv, expand, dropout)
+            MambaBlock(d_model, d_state, d_conv, expand, dropout, ssm_bottleneck)
             for _ in range(n_layers)
         ])
 
@@ -293,6 +297,7 @@ class ExcavatorVLA(nn.Module):
         qpos_mode: str = "modulation", qpos_drop_prob=0.3,
         encoder_type: str = "transformer",
         mamba_d_state: int = 16, mamba_d_conv: int = 4, mamba_expand: int = 2,
+        mamba_ssm_bottleneck: int = 128,
         use_sincos: bool = False,
     ):
         """
@@ -300,7 +305,7 @@ class ExcavatorVLA(nn.Module):
             encoder_type: "transformer" or "mamba"
             qpos_mode:    "modulation" (head residual) or "transformer" (inject into encoder)
             use_sincos:   encode qpos as [sin(θ), cos(θ)] — eliminates 2π discontinuity
-            mamba_d_state, mamba_d_conv, mamba_expand: Mamba hyper-params
+            mamba_d_state, mamba_d_conv, mamba_expand, mamba_ssm_bottleneck: Mamba hyper-params
         """
         super().__init__()
         self.seq_len = seq_len
@@ -333,6 +338,7 @@ class ExcavatorVLA(nn.Module):
                 d_model=hidden_dim, n_layers=n_layers,
                 d_state=mamba_d_state, d_conv=mamba_d_conv,
                 expand=mamba_expand, dropout=dropout,
+                ssm_bottleneck=mamba_ssm_bottleneck,
             )
         else:
             raise ValueError(f"Unknown encoder_type: {encoder_type}")
