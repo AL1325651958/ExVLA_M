@@ -177,27 +177,38 @@ def main():
     if "config" in ckpt and hasattr(ckpt["config"], "hidden_dim"):
         config = ckpt["config"]
 
-    # Auto-detect: old ckpts have "delta_head", new ones have "action_head"
+    # Auto-detect model variant from state_dict keys
     state_dict = ckpt["model_state_dict"]
     state_keys = set(state_dict.keys())
     has_delta_head = any("delta_head" in k for k in state_keys)
     has_action_head = any("action_head" in k for k in state_keys)
+    has_qpos_proj = any("qpos_proj" in k for k in state_keys)
+    has_qpos_mod = any("qpos_mod" in k for k in state_keys)
+
+    if has_qpos_proj:
+        qpos_mode = "transformer"
+    elif has_qpos_mod:
+        qpos_mode = "modulation"
+    else:
+        qpos_mode = "modulation"  # fallback
 
     if has_action_head:
-        print("Model type: absolute qpos prediction")
-        is_absolute = True
+        is_absolute = not args.delta
+        tag = "delta" if args.delta else "absolute"
+        print(f"Model type: {tag} qpos ({qpos_mode})")
     elif has_delta_head:
-        print("Model type: delta prediction (legacy) — will convert to absolute")
         is_absolute = False
+        print(f"Model type: delta (legacy)")
     else:
-        print("Model type: unknown")
         is_absolute = False
+        print(f"Model type: unknown")
 
     model = ExcavatorVLA(
         seq_len=args.seq_len,
         hidden_dim=config.hidden_dim, n_heads=config.n_heads,
         n_layers=config.n_layers, ff_dim=config.ff_dim,
         dropout=0.0, pretrained=False,
+        qpos_mode=qpos_mode,
     ).to(device)
 
     # Handle old delta checkpoints: map delta_head weights to action_head
