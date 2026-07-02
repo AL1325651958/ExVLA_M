@@ -420,7 +420,8 @@ class ExcavatorVLA(nn.Module):
         for excv_idx in range(self.action_heads.__len__()):
             mask = (excavator_id == excv_idx)
             if mask.any():
-                base_pred[mask] = self.action_heads[excv_idx](vision_feat[mask])
+                head_out = self.action_heads[excv_idx](vision_feat[mask].float())
+                base_pred[mask] = head_out.to(vision_feat.dtype)
 
         # ── 5. qpos modulation residual (training only) ──
         if self.qpos_mode == "none":
