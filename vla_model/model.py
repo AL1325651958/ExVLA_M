@@ -96,58 +96,152 @@ class DropPath(nn.Module):
 # ---------------------------------------------------------------------------
 
 class MambaBlock(nn.Module):
-    """Causal depthwise conv + gated activation — local temporal mixing.
+    """Gated temporal-conv block with optional diagonal-SSM recurrence.
 
-    Stripped of the SSM recurrence.  At 4 layers of Conv1d(kernel=4),
-    the receptive field is 16 frames — the full sequence for seq_len=16.
-    No global state, no overfitting, no numerical instability.
+    Two modes, controlled by `d_state`:
+      d_state=0 → pure Conv1d+Gate  (fast, stable, no overfitting risk)
+      d_state>0 → Conv1d + SSM scan (selective state-space memory)
 
-    Architecture:
-        x → LayerNorm → Linear(2×inner) → [gate branch, signal branch]
-        signal → Causal Conv1d(k=4) → SiLU → ⊗ ← SiLU(gate)
-                                                 ↓
-                                        Linear(d_model) → + residual
+    The SSM is minimal by design to avoid overfitting:
+      - d_state=4  (not 16)  — just enough for one "memory slot" per joint
+      - dt is a single scalar per timestep shared across all channels
+      - Binary associative scan for O(log T) gradient depth
+      - A initialised for slow decay (τ ≈ 2-8 frames)
     """
 
-    def __init__(self, d_model: int = 512, d_conv: int = 4,
+    def __init__(self, d_model: int = 512, d_state: int = 0, d_conv: int = 4,
                  expand: int = 2, dropout: float = 0.1):
         super().__init__()
         self.d_model = d_model
+        self.d_state = d_state
         self.inner = int(d_model * expand)
 
+        # ── Gate + signal ──
         self.in_proj = nn.Linear(d_model, self.inner * 2, bias=False)
+
+        # ── Causal depthwise conv ──
         self.conv1d = nn.Conv1d(
             in_channels=self.inner, out_channels=self.inner,
             kernel_size=d_conv, padding=d_conv - 1, groups=self.inner,
         )
-        self.out_proj = nn.Linear(self.inner, d_model, bias=False)
+
+        # ── SSM (only if d_state > 0) ──
+        if d_state > 0:
+            # A: diagonal state transition,  A = -exp(A_log)
+            #    Init: τ (time-constant in frames) ≈ 2, 4, 6, 8
+            tau_frames = torch.linspace(2.0, 8.0, d_state, dtype=torch.float32)
+            self.A_log = nn.Parameter((1.0 / tau_frames).log())
+            # B, C: project inner → d_state  (per-channel selectivity)
+            self.B_proj = nn.Linear(self.inner, d_state, bias=False)
+            self.C_proj = nn.Linear(self.inner, d_state, bias=False)
+            # dt: single scalar per timestep (shared across channels)
+            self.dt_net = nn.Sequential(
+                nn.Linear(self.inner, 1, bias=True),
+            )
+            # D skip
+            self.D = nn.Parameter(torch.ones(self.inner))
+            # Init dt bias so sigmoid ≈ 0.3 (moderate step)
+            nn.init.constant_(self.dt_net[0].bias, -0.85)
+            self.norm_ssm = nn.LayerNorm(self.inner)
+
+        # ── Normalisation ──
         self.norm_in  = nn.LayerNorm(d_model)
         self.norm_out = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
+        self.dropout  = nn.Dropout(dropout)
 
+        # ── Output projection ──
+        self.out_proj = nn.Linear(self.inner, d_model, bias=False)
+
+    # ------------------------------------------------------------------
+    #  Prefix scan via cumsum  (closed-form, O(1) gradient)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _ssm_scan(dt: torch.Tensor, A: torch.Tensor,
+                  B: torch.Tensor, C: torch.Tensor,
+                  x: torch.Tensor) -> torch.Tensor:
+        """Closed-form prefix scan for the recurrence h_t = A_bar·h_{t-1} + B_bar·x.
+
+        Unrolling:  h[t] = Σ_{i≤t} exp(A·(cumΔ[t] - cumΔ[i])) · Δ[i]·B[i]·x[i]
+
+        Args:
+            dt:  [B, T, 1]     per-step scalar Δ  ∈ (0, 1)
+            A:   [S]            per-state decay    < 0
+            B:   [B, T, C, S]   input→state projection
+            C:   [B, T, C, S]   state→output projection
+            x:   [B, T, C]      signal after conv
+        Returns:
+            y:   [B, T, C]      SSM output
+        """
+        B, T, C, S = B.shape
+
+        cum_dt = dt.cumsum(dim=1)                        # [B, T, 1]
+
+        # term[t] = Δ[t] · B[t] · x[t]  →  [B, T, C, S]
+        term = dt.unsqueeze(-1) * B * x.unsqueeze(-1)
+
+        # decay[t] = exp(-A · cumΔ[t])   −A > 0
+        decay = torch.exp(
+            (-A).view(1, 1, 1, S) * cum_dt.unsqueeze(-1)
+        )                                               # [B, T, 1, S]
+
+        inner = torch.cumsum(decay * term, dim=1)        # [B, T, C, S]
+
+        # h[t] = exp(A · cumΔ[t]) · inner[t]
+        gain = torch.exp(
+            A.view(1, 1, 1, S) * cum_dt.unsqueeze(-1)
+        )                                               # [B, T, 1, S]
+        h = gain * inner                                 # [B, T, C, S]
+
+        return (C * h).sum(dim=-1)                       # [B, T, C]
+
+    # ------------------------------------------------------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, _ = x.shape
         residual = x
 
-        proj = self.in_proj(self.norm_in(x))            # [B, T, inner*2]
-        z, x_sig = proj.chunk(2, dim=-1)                # [B, T, inner]
+        # 1 ── Gate + signal ──
+        proj   = self.in_proj(self.norm_in(x))          # [B, T, inner*2]
+        z, x_s = proj.chunk(2, dim=-1)                  # [B, T, inner]
 
-        x_conv = self.conv1d(x_sig.transpose(1, 2))[:, :, :T]
-        x_conv = F.silu(x_conv.transpose(1, 2))          # [B, T, inner]
+        # 2 ── Causal conv ──
+        x_c = self.conv1d(x_s.transpose(1, 2))[:, :, :T]
+        x_c = F.silu(x_c.transpose(1, 2))               # [B, T, inner]
 
-        y = x_conv * F.silu(z)                           # gated conv
+        # 3 ── SSM scan (only if d_state > 0) ──
+        if self.d_state > 0:
+            # scalar dt per timestep ∈ (0, 1)
+            dt = torch.sigmoid(self.dt_net(x_c))        # [B, T, 1]
+            # B, C: per-channel selectivity  [B, T, inner] → [B, T, ds]
+            B_t = self.B_proj(x_c)                      # [B, T, ds]
+            C_t = self.C_proj(x_c)                      # [B, T, ds]
+            # A: diagonal decay  = -exp(A_log)  ∈ (-0.5, -0.125)
+            A = -torch.exp(self.A_log)                  # [ds]
+
+            # Broadcast B, C over inner dimension
+            # cumsum scan: d_state stays as the contraction dim
+            B_br = B_t.unsqueeze(2).expand(B, T, self.inner, self.d_state)
+            C_br = C_t.unsqueeze(2).expand(B, T, self.inner, self.d_state)
+
+            ssm_out = self._ssm_scan(dt, A, B_br, C_br, x_c)  # [B, T, inner]
+
+            # skip + norm
+            x_c = self.norm_ssm(ssm_out + x_c * self.D)
+
+        # 4 ── Gate + output ──
+        y = x_c * F.silu(z)                              # [B, T, inner]
         y = self.dropout(self.out_proj(y))               # [B, T, d_model]
         return self.norm_out(residual + y)
 
 
 class MambaEncoder(nn.Module):
-    """Stack of gated-conv blocks — drop-in replacement for TransformerEncoder."""
+    """Stack of MambaBlocks — gated-conv (or gated-conv+SSM)."""
 
     def __init__(self, d_model: int = 512, n_layers: int = 4,
-                 d_conv: int = 4, expand: int = 2, dropout: float = 0.1):
+                 d_state: int = 0, d_conv: int = 4, expand: int = 2,
+                 dropout: float = 0.1):
         super().__init__()
         self.blocks = nn.ModuleList([
-            MambaBlock(d_model, d_conv, expand, dropout)
+            MambaBlock(d_model, d_state, d_conv, expand, dropout)
             for _ in range(n_layers)
         ])
 
@@ -212,7 +306,7 @@ class ExcavatorVLA(nn.Module):
         dropout=0.1, drop_path_rate=0.05, pretrained=True, num_excavators=4,
         qpos_mode: str = "modulation", qpos_drop_prob=0.3,
         encoder_type: str = "transformer",
-        mamba_d_conv: int = 4, mamba_expand: int = 2,
+        mamba_d_state: int = 0, mamba_d_conv: int = 4, mamba_expand: int = 2,
         use_sincos: bool = False,
     ):
         """
@@ -220,6 +314,7 @@ class ExcavatorVLA(nn.Module):
             encoder_type: "transformer" or "mamba"
             qpos_mode:    "modulation" (head residual) or "transformer" (inject into encoder)
             use_sincos:   encode qpos as [sin(θ), cos(θ)] — eliminates 2π discontinuity
+            mamba_d_state: 0 = Conv1d only, 4 = +minimal SSM (1 slot/joint)
             mamba_d_conv, mamba_expand: Mamba hyper-params
         """
         super().__init__()
@@ -251,7 +346,8 @@ class ExcavatorVLA(nn.Module):
             # Mamba handles position natively — no explicit pos encoding needed
             self.encoder = MambaEncoder(
                 d_model=hidden_dim, n_layers=n_layers,
-                d_conv=mamba_d_conv, expand=mamba_expand, dropout=dropout,
+                d_state=mamba_d_state, d_conv=mamba_d_conv,
+                expand=mamba_expand, dropout=dropout,
             )
         else:
             raise ValueError(f"Unknown encoder_type: {encoder_type}")

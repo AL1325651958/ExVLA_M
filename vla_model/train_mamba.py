@@ -205,6 +205,8 @@ def main():
                         help="Final qpos drop prob (default 1.0)")
     parser.add_argument("--use_sincos", action="store_true", default=None,
                         help="Encode qpos as [sin(θ), cos(θ)] pairs — eliminates 2π discontinuity")
+    parser.add_argument("--mamba_d_state", type=int, default=None,
+                        help="SSM state dim (0=Conv only, 4=minimal, 16=full). Default: 0")
     args = parser.parse_args()
 
     config = Config()
@@ -234,6 +236,8 @@ def main():
         config.qpos_drop_end = args.qpos_drop_end
     if args.use_sincos is not None:
         config.use_sincos = args.use_sincos
+    if args.mamba_d_state is not None:
+        config.mamba_d_state = args.mamba_d_state
     # Mamba-specific default
     config.output_dir = "output/checkpoints_mamba"
 
@@ -289,6 +293,7 @@ def main():
         qpos_drop_prob=config.qpos_drop_prob,
         encoder_type="mamba",
         use_sincos=config.use_sincos,
+        mamba_d_state=config.mamba_d_state,
     ).to(config.device)
 
     params = count_parameters(model)
