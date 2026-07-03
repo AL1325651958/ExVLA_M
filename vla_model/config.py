@@ -26,6 +26,7 @@ class Config:
     qpos_drop_schedule: bool = False   # linear ramp: drop_prob increases over epochs
     qpos_drop_start: float = 0.0       #   epoch 0 drop probability
     qpos_drop_end: float = 1.0         #   final-epoch drop probability (1.0 = pure vision)
+    use_sincos: bool = False           # encode qpos as [sin(θ), cos(θ)] pairs
 
     # Training
     batch_size: int = 32
