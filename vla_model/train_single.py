@@ -54,9 +54,14 @@ def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, conf
 
         optimizer.zero_grad()
         with autocast():
-            action_pred = model(rgb, elevation, qpos, excavator_id)
-            action_label = action_gt.squeeze(1)
-            loss = criterion(action_pred, action_label)
+            action_pred = model(rgb, elevation, qpos, excavator_id)  # [B, K, 4]
+            action_label = action_gt   # [B, K, 4]
+            mse_loss = criterion(action_pred, action_label)
+            if config.action_chunk > 1:
+                smooth_loss = ((action_pred[:, 1:] - action_pred[:, :-1]) ** 2).mean()
+            else:
+                smooth_loss = 0.0
+            loss = mse_loss + config.smooth_loss_weight * smooth_loss
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -66,11 +71,11 @@ def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, conf
         scheduler.step()
 
         total_loss += loss.item()
-        mae = (action_pred.detach() - action_label).abs().mean(dim=0).cpu().numpy()
+        mae = (action_pred.detach()[:, 0, :] - action_label[:, 0, :]).abs().mean(dim=0).cpu().numpy()
         total_mae += mae
 
-        pred_cpu = action_pred.detach().cpu().numpy()
-        label_cpu = action_label.cpu().numpy()
+        pred_cpu = action_pred.detach().reshape(-1, 4).cpu().numpy()
+        label_cpu = action_label.reshape(-1, 4).cpu().numpy()
         ss_res += ((pred_cpu - label_cpu) ** 2).sum(axis=0)
         sum_y  += label_cpu.sum(axis=0)
         sum_y2 += (label_cpu ** 2).sum(axis=0)
@@ -103,16 +108,16 @@ def validate(model, dataloader, criterion, config):
         excavator_id = batch["excavator_id"].to(config.device)
         action_gt = batch["action"].to(config.device)
 
-        action_pred = model(rgb, elevation, qpos, excavator_id)
-        action_label = action_gt.squeeze(1)
+        action_pred = model(rgb, elevation, qpos, excavator_id)  # [B, K, 4]
+        action_label = action_gt   # [B, K, 4]
         loss = criterion(action_pred, action_label)
 
         total_loss += loss.item()
-        mae = (action_pred - action_label).abs().mean(dim=0).cpu().numpy()
+        mae = (action_pred[:, 0, :] - action_label[:, 0, :]).abs().mean(dim=0).cpu().numpy()
         total_mae += mae
 
-        pred_cpu = action_pred.cpu().numpy()
-        label_cpu = action_label.cpu().numpy()
+        pred_cpu = action_pred.reshape(-1, 4).cpu().numpy()
+        label_cpu = action_label.reshape(-1, 4).cpu().numpy()
         ss_res += ((pred_cpu - label_cpu) ** 2).sum(axis=0)
         sum_y  += label_cpu.sum(axis=0)
         sum_y2 += (label_cpu ** 2).sum(axis=0)
@@ -214,8 +219,10 @@ def main():
         n_heads=config.n_heads, n_layers=config.n_layers, ff_dim=config.ff_dim,
         dropout=config.dropout, drop_path_rate=config.drop_path_rate,
         pretrained=config.pretrained,
+        qpos_mode=config.qpos_mode,
         qpos_drop_prob=config.qpos_drop_prob,
         use_sincos=args.sincos,
+        action_chunk=config.action_chunk,
         num_excavators=1,
     ).to(config.device)
 

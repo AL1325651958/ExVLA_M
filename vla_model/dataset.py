@@ -187,14 +187,16 @@ class ExcavatorDataset(Dataset):
             elev_seq[t] = self._preprocess_image(ep["elevations_raw"][i], augment)
 
         qpos_seq = ep["qpos"][start:end]         # [T, 4]
-        # Target: absolute next qpos (not delta)
-        next_qpos = ep["action"][start + T - 1]   # [4] -- absolute joint angles
+        # Target: K future absolute qpos values (action_chunk steps)
+        #   action[i] ≈ qpos[i+1], so action[start+T-1] = first post-window qpos
+        tgt_start = start + T - 1
+        targets = ep["action"][tgt_start : tgt_start + K]  # [K, 4]
         excv_id = ep["excavator_id"]
 
         return {
             "rgb": torch.from_numpy(rgb_seq),
             "elevation": torch.from_numpy(elev_seq),
             "qpos": torch.from_numpy(qpos_seq.copy()),
-            "action": torch.from_numpy(next_qpos.reshape(1, 4).copy()),
+            "action": torch.from_numpy(targets.copy()),     # [K, 4]
             "excavator_id": torch.tensor(excv_id, dtype=torch.long),
         }
