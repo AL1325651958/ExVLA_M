@@ -211,9 +211,24 @@ def main():
 
     has_excv_heads = has_action_heads or is_old_single_head
 
-    is_absolute = not args.delta
+    # Detect num_excavators from checkpoint
+    if has_action_heads:
+        max_head_idx = 0
+        for k in state_keys:
+            if k.startswith("action_heads."):
+                try:
+                    idx = int(k.split(".")[1])
+                    max_head_idx = max(max_head_idx, idx)
+                except ValueError:
+                    pass
+        num_excv = max_head_idx + 1
+    else:
+        num_excv = 4 if is_old_single_head else 4  # old multi-head models had 4
+
     print(f"Model: absolute, qpos=({qpos_mode}), encoder=({encoder_type}), "
-          f"sincos=({use_sincos}), heads=({'excv' if has_excv_heads else 'new'})")
+          f"sincos=({use_sincos}), heads=excv({num_excv})")
+
+    is_absolute = not args.delta
 
     model = ExcavatorVLA(
         seq_len=args.seq_len,
@@ -223,6 +238,7 @@ def main():
         qpos_mode=qpos_mode,
         encoder_type=encoder_type,
         use_sincos=use_sincos,
+        num_excavators=num_excv,
     ).to(device)
 
     # Handle old single-head with vision+excv concat (1024) → per-excv (512 each)
@@ -233,7 +249,7 @@ def main():
         for k, v in state_dict.items():
             if k.startswith(old_head_prefix):
                 # Replicate old head into all 4 per-excv slots
-                for excv_idx in range(4):
+                for excv_idx in range(num_excv):
                     new_key = k.replace(old_head_prefix, f"action_heads.{excv_idx}.")
                     # Old head first layer: [256, 1024] → new: [256, 512]
                     #   take first 512 of dim 1 (vision features, skip excv_embed part)
@@ -253,7 +269,7 @@ def main():
         sd_new = {}
         for k, v in state_dict.items():
             if k.startswith("action_head."):
-                for excv_idx in range(4):
+                for excv_idx in range(num_excv):
                     sd_new[k.replace("action_head.", f"action_heads.{excv_idx}.")] = v.clone()
             else:
                 sd_new[k] = v

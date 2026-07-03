@@ -156,6 +156,8 @@ def main():
     parser.add_argument("--img_size", type=int, default=None)
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--overfit", action="store_true")
+    parser.add_argument("--sincos", action="store_true",
+                        help="Use sin/cos joint encoding (eliminates 2pi discontinuity)")
     args = parser.parse_args()
 
     excv_name = args.excavator
@@ -170,10 +172,11 @@ def main():
     if args.sample_ratio is not None: config.sample_ratio = args.sample_ratio
     if args.img_size is not None:     config.img_size = args.img_size
 
-    config.output_dir = f"output/checkpoints_excv_{excv_name}"
+    config.output_dir = f"output/checkpoints_excv_{excv_name}" + ("_sincos" if args.sincos else "")
     config.device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print(f"Single-excavator training: {excv_name}")
+    print(f"Sin/cos encoding: {args.sincos}")
     print(f"Data dir: {config.data_dir}")
     print(f"Output:   {config.output_dir}")
     print(f"Device:   {config.device}")
@@ -212,6 +215,7 @@ def main():
         dropout=config.dropout, drop_path_rate=config.drop_path_rate,
         pretrained=config.pretrained,
         qpos_drop_prob=config.qpos_drop_prob,
+        use_sincos=args.sincos,
         num_excavators=1,
     ).to(config.device)
 
