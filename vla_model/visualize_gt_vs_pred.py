@@ -225,8 +225,19 @@ def main():
     else:
         num_excv = 4 if is_old_single_head else 4  # old multi-head models had 4
 
-    print(f"Model: absolute, qpos=({qpos_mode}), encoder=({encoder_type}), "
-          f"sincos=({use_sincos}), heads=excv({num_excv})")
+    # Detect sin/cos output: last head layer has 8 output dims instead of 4
+    use_sincos_output = False
+    if has_action_heads:
+        # action_heads.0.0.weight: last layer is .4.weight
+        last_weight_key = "action_heads.0.4.weight"  # 4th linear in sequential
+        if last_weight_key in state_dict:
+            use_sincos_output = state_dict[last_weight_key].shape[0] % 8 == 0 and state_dict[last_weight_key].shape[0] > 4
+    elif has_action_head and "action_head.0.weight" in state_dict:
+        # Find last layer: search for highest numbered weight
+        pass
+
+    print(f"Model: qpos=({qpos_mode}), encoder=({encoder_type}), "
+          f"sincos_in=({use_sincos}), sincos_out=({use_sincos_output}), heads=excv({num_excv})")
 
     is_absolute = not args.delta
 
@@ -238,6 +249,7 @@ def main():
         qpos_mode=qpos_mode,
         encoder_type=encoder_type,
         use_sincos=use_sincos,
+        use_sincos_output=use_sincos_output,
         num_excavators=num_excv,
     ).to(device)
 
@@ -386,14 +398,18 @@ def main():
         tgt_idx = start + T_img - 1
 
         if args.delta:
-            # Delta model: convert to absolute
             delta = pred[0].cpu().numpy()
             val = qpos_pp[tgt_idx] + delta
+        elif use_sincos_output:
+            # Decode sin/cos → radians
+            from vla_model.model import decode_joints_sincos
+            raw = pred[0].cpu()  # [K, 8] or [8]
+            if raw.dim() == 1:
+                raw = raw.unsqueeze(0)  # [1, 8]
+            val = decode_joints_sincos(raw[0:1]).cpu().numpy()[0]  # [4]
         elif is_absolute:
-            # Absolute model
             val = pred[0].cpu().numpy()
         else:
-            # Legacy delta model (old delta_head ckpt)
             delta = pred[0].cpu().numpy()
             val = qpos_pp[tgt_idx] + delta
 

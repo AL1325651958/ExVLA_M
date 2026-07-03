@@ -62,14 +62,24 @@ def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, conf
         optimizer.zero_grad()
 
         with autocast():
-            action_pred = model(rgb, elevation, qpos, excavator_id)  # [B, K, 4]
-            action_label = action_gt   # [B, K, 4] — no squeeze needed for chunking
+            action_pred = model(rgb, elevation, qpos, excavator_id)  # [B, K, out] raw sin/cos or radians
+            action_label = action_gt   # [B, K, 4] radians
 
-            mse_loss = criterion(action_pred, action_label)
+            if config.use_sincos_output:
+                from vla_model.model import encode_joints_sincos, decode_joints_sincos
+                # Encode label to sin/cos for loss
+                label_sincos = encode_joints_sincos(action_label)  # [B, K, 8]
+                mse_loss = criterion(action_pred, label_sincos)
+                # Decode for MAE/R²
+                pred_rad = decode_joints_sincos(action_pred)  # [B, K, 4]
+                label_rad = action_label
+            else:
+                mse_loss = criterion(action_pred, action_label)
+                pred_rad = action_pred
+                label_rad = action_label
 
-            # Temporal smoothness: penalize large step-to-step jumps
             if config.action_chunk > 1:
-                smooth_loss = ((action_pred[:, 1:] - action_pred[:, :-1]) ** 2).mean()
+                smooth_loss = ((pred_rad[:, 1:] - pred_rad[:, :-1]) ** 2).mean()
             else:
                 smooth_loss = 0.0
 
@@ -83,13 +93,12 @@ def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, conf
         scheduler.step()
 
         total_loss += loss.item()
-        # MAE on first step only (comparable to single-step models)
-        mae = (action_pred.detach()[:, 0, :] - action_label[:, 0, :]).abs().mean(dim=0).cpu().numpy()
+        # MAE on first step in radian space
+        mae = (pred_rad.detach()[:, 0, :] - label_rad[:, 0, :]).abs().mean(dim=0).cpu().numpy()
         total_mae += mae
 
-        # Accumulate R² stats — flatten all steps
-        pred_cpu = action_pred.detach().reshape(-1, 4).cpu().numpy()
-        label_cpu = action_label.reshape(-1, 4).cpu().numpy()
+        pred_cpu = pred_rad.detach().reshape(-1, 4).cpu().numpy()
+        label_cpu = label_rad.reshape(-1, 4).cpu().numpy()
         ss_res += ((pred_cpu - label_cpu) ** 2).sum(axis=0)
         sum_y  += label_cpu.sum(axis=0)
         sum_y2 += (label_cpu ** 2).sum(axis=0)
@@ -131,17 +140,26 @@ def validate(model, dataloader, criterion, config):
         excavator_id = batch["excavator_id"].to(config.device)
         action_gt = batch["action"].to(config.device)
 
-        action_pred = model(rgb, elevation, qpos, excavator_id)  # [B, K, 4]
+        action_pred = model(rgb, elevation, qpos, excavator_id)  # [B, K, out]
         action_label = action_gt  # [B, K, 4]
-        loss = criterion(action_pred, action_label)
+
+        if config.use_sincos_output:
+            from vla_model.model import encode_joints_sincos, decode_joints_sincos
+            label_sincos = encode_joints_sincos(action_label)
+            loss = criterion(action_pred, label_sincos)
+            pred_rad = decode_joints_sincos(action_pred)
+            label_rad = action_label
+        else:
+            loss = criterion(action_pred, action_label)
+            pred_rad = action_pred
+            label_rad = action_label
 
         total_loss += loss.item()
-        # MAE on first step
-        mae = (action_pred[:, 0, :] - action_label[:, 0, :]).abs().mean(dim=0).cpu().numpy()
+        mae = (pred_rad[:, 0, :] - label_rad[:, 0, :]).abs().mean(dim=0).cpu().numpy()
         total_mae += mae
 
-        pred_cpu = action_pred.reshape(-1, 4).cpu().numpy()
-        label_cpu = action_label.reshape(-1, 4).cpu().numpy()
+        pred_cpu = pred_rad.reshape(-1, 4).cpu().numpy()
+        label_cpu = label_rad.reshape(-1, 4).cpu().numpy()
         ss_res += ((pred_cpu - label_cpu) ** 2).sum(axis=0)
         sum_y  += label_cpu.sum(axis=0)
         sum_y2 += (label_cpu ** 2).sum(axis=0)
@@ -186,6 +204,8 @@ def main():
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
     parser.add_argument("--overfit", action="store_true", help="Overfit single episode")
     parser.add_argument("--output_dir", type=str, default=None, help="Override checkpoint output directory")
+    parser.add_argument("--sincos-output", action="store_true",
+                        help="Predict [sin(θ), cos(θ)] — loss in circular space")
     args = parser.parse_args()
 
     config = Config()
@@ -265,6 +285,7 @@ def main():
         qpos_mode=config.qpos_mode,
         qpos_drop_prob=config.qpos_drop_prob,
         use_sincos=config.use_sincos,
+        use_sincos_output=args.sincos_output,
         action_chunk=config.action_chunk,
     ).to(config.device)
 

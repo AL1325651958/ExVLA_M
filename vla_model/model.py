@@ -308,13 +308,15 @@ class ExcavatorVLA(nn.Module):
         encoder_type: str = "transformer",
         mamba_d_state: int = 0, mamba_d_conv: int = 4, mamba_expand: int = 2,
         use_sincos: bool = False,
+        use_sincos_output: bool = False,
         action_chunk: int = 1,
     ):
         """
         Args:
             encoder_type: "transformer" or "mamba"
             qpos_mode:    "modulation" (head residual) or "transformer" (inject into encoder)
-            use_sincos:   encode qpos as [sin(θ), cos(θ)] — eliminates 2π discontinuity
+            use_sincos:   encode input qpos as [sin(θ), cos(θ)]
+            use_sincos_output: encode output as [sin(θ), cos(θ)] — loss in circular space
             action_chunk: number of future steps to predict (1=single, 5=chunking)
             mamba_d_state: 0 = Conv1d only, 4 = +minimal SSM (1 slot/joint)
             mamba_d_conv, mamba_expand: Mamba hyper-params
@@ -326,10 +328,12 @@ class ExcavatorVLA(nn.Module):
         self.qpos_drop_prob = qpos_drop_prob
         self.encoder_type = encoder_type
         self.use_sincos = use_sincos
+        self.use_sincos_output = use_sincos_output
         self.action_chunk = action_chunk
 
-        # qpos dimension: 4 for raw radians, 8 for sin/cos pairs
+        # Input/output dimensions
         qpos_dim = 8 if use_sincos else 4
+        out_dim = 8 if use_sincos_output else 4    # sin/cos pairs or raw radians
 
         # ── Vision backbone ──
         self.vision_encoder = TwoStreamEncoder(hidden_dim, pretrained=pretrained)
@@ -358,8 +362,10 @@ class ExcavatorVLA(nn.Module):
         # ── Excavator-specific prediction heads ──
         # Shared vision → per-excavator MLP → [action_chunk * 4]
         head_in = hidden_dim  # vision_feat only (excv_id selects the head)
-        head_out = action_chunk * 4
+        head_out = action_chunk * out_dim
         self.action_heads = nn.ModuleList([
+
+<｜｜DSML｜｜parameter name="replace_all" string="false">false
             nn.Sequential(
                 nn.Linear(head_in, 256), nn.GELU(), nn.Dropout(dropout),
                 nn.Linear(256, 128), nn.GELU(), nn.Dropout(dropout * 0.5),
@@ -374,7 +380,7 @@ class ExcavatorVLA(nn.Module):
             self.qpos_mod = None     # pure vision — no GT involvement
         elif qpos_mode == "modulation":
             self.qpos_mod = nn.Sequential(
-                nn.Linear(qpos_dim, 32), nn.GELU(), nn.Linear(32, 4),
+                nn.Linear(qpos_dim, 32), nn.GELU(), nn.Linear(32, out_dim),
             )
         elif qpos_mode == "transformer":
             self.qpos_proj = nn.Sequential(
@@ -452,10 +458,11 @@ class ExcavatorVLA(nn.Module):
             # Mamba: [B, T, D] — no position encoding needed
             encoded = self.encoder(features)             # [B, T, D]
 
-        # ── 4. Head: per-excavator MLP → [B, K, 4] absolute qpos ──
+        # ── 4. Head: per-excavator MLP → [B, K, out_dim] ──
         vision_feat = encoded[:, -1, :]                  # [B, D]
         K = self.action_chunk
-        base_pred = torch.zeros(B, K * 4, device=vision_feat.device, dtype=vision_feat.dtype)
+        out_dim = 8 if self.use_sincos_output else 4
+        base_pred = torch.zeros(B, K * out_dim, device=vision_feat.device, dtype=vision_feat.dtype)
         for excv_idx in range(len(self.action_heads)):
             mask = (excavator_id == excv_idx)
             if mask.any():
@@ -463,21 +470,20 @@ class ExcavatorVLA(nn.Module):
                 base_pred[mask] = head_out.to(vision_feat.dtype)
 
         if K == 1:
-            base_pred = base_pred.view(B, 4)              # [B, 4] — single-step compat
+            base_pred = base_pred.view(B, out_dim)
         else:
-            base_pred = base_pred.view(B, K, 4)           # [B, K, 4]
+            base_pred = base_pred.view(B, K, out_dim)
 
         # ── 5. qpos modulation residual (training only) ──
         if self.qpos_mode == "modulation" and qpos is not None and self.training:
             qpos_last = encode_joints_sincos(qpos[:, -1, :]) if self.use_sincos else qpos[:, -1, :]
-            correction = self.qpos_mod(qpos_last)          # [B, 4]
+            correction = self.qpos_mod(qpos_last)          # [B, out_dim]
             if self.qpos_drop_prob > 0:
                 mask = (torch.rand(B, 1, device=qpos.device) > self.qpos_drop_prob).float()
                 correction = correction * mask
             if K == 1:
                 return base_pred + correction
             else:
-                # Broadcast correction to all K steps
                 base_pred = base_pred + correction.unsqueeze(1)
                 return base_pred
         else:

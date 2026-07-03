@@ -54,11 +54,22 @@ def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, conf
 
         optimizer.zero_grad()
         with autocast():
-            action_pred = model(rgb, elevation, qpos, excavator_id)  # [B, K, 4]
+            action_pred = model(rgb, elevation, qpos, excavator_id)  # [B, K, out]
             action_label = action_gt   # [B, K, 4]
-            mse_loss = criterion(action_pred, action_label)
+
+            if config.use_sincos_output:
+                from vla_model.model import encode_joints_sincos, decode_joints_sincos
+                label_sincos = encode_joints_sincos(action_label)
+                mse_loss = criterion(action_pred, label_sincos)
+                pred_rad = decode_joints_sincos(action_pred)
+                label_rad = action_label
+            else:
+                mse_loss = criterion(action_pred, action_label)
+                pred_rad = action_pred
+                label_rad = action_label
+
             if config.action_chunk > 1:
-                smooth_loss = ((action_pred[:, 1:] - action_pred[:, :-1]) ** 2).mean()
+                smooth_loss = ((pred_rad[:, 1:] - pred_rad[:, :-1]) ** 2).mean()
             else:
                 smooth_loss = 0.0
             loss = mse_loss + config.smooth_loss_weight * smooth_loss
@@ -71,11 +82,11 @@ def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, conf
         scheduler.step()
 
         total_loss += loss.item()
-        mae = (action_pred.detach()[:, 0, :] - action_label[:, 0, :]).abs().mean(dim=0).cpu().numpy()
+        mae = (pred_rad.detach()[:, 0, :] - label_rad[:, 0, :]).abs().mean(dim=0).cpu().numpy()
         total_mae += mae
 
-        pred_cpu = action_pred.detach().reshape(-1, 4).cpu().numpy()
-        label_cpu = action_label.reshape(-1, 4).cpu().numpy()
+        pred_cpu = pred_rad.detach().reshape(-1, 4).cpu().numpy()
+        label_cpu = label_rad.reshape(-1, 4).cpu().numpy()
         ss_res += ((pred_cpu - label_cpu) ** 2).sum(axis=0)
         sum_y  += label_cpu.sum(axis=0)
         sum_y2 += (label_cpu ** 2).sum(axis=0)
@@ -108,16 +119,26 @@ def validate(model, dataloader, criterion, config):
         excavator_id = batch["excavator_id"].to(config.device)
         action_gt = batch["action"].to(config.device)
 
-        action_pred = model(rgb, elevation, qpos, excavator_id)  # [B, K, 4]
+        action_pred = model(rgb, elevation, qpos, excavator_id)  # [B, K, out]
         action_label = action_gt   # [B, K, 4]
-        loss = criterion(action_pred, action_label)
+
+        if config.use_sincos_output:
+            from vla_model.model import encode_joints_sincos, decode_joints_sincos
+            label_sincos = encode_joints_sincos(action_label)
+            loss = criterion(action_pred, label_sincos)
+            pred_rad = decode_joints_sincos(action_pred)
+            label_rad = action_label
+        else:
+            loss = criterion(action_pred, action_label)
+            pred_rad = action_pred
+            label_rad = action_label
 
         total_loss += loss.item()
-        mae = (action_pred[:, 0, :] - action_label[:, 0, :]).abs().mean(dim=0).cpu().numpy()
+        mae = (pred_rad[:, 0, :] - label_rad[:, 0, :]).abs().mean(dim=0).cpu().numpy()
         total_mae += mae
 
-        pred_cpu = action_pred.reshape(-1, 4).cpu().numpy()
-        label_cpu = action_label.reshape(-1, 4).cpu().numpy()
+        pred_cpu = pred_rad.reshape(-1, 4).cpu().numpy()
+        label_cpu = label_rad.reshape(-1, 4).cpu().numpy()
         ss_res += ((pred_cpu - label_cpu) ** 2).sum(axis=0)
         sum_y  += label_cpu.sum(axis=0)
         sum_y2 += (label_cpu ** 2).sum(axis=0)
@@ -162,7 +183,9 @@ def main():
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--overfit", action="store_true")
     parser.add_argument("--sincos", action="store_true",
-                        help="Use sin/cos joint encoding (eliminates 2pi discontinuity)")
+                        help="Use sin/cos for input qpos encoding")
+    parser.add_argument("--sincos-output", action="store_true",
+                        help="Predict [sin(θ), cos(θ)] — loss in circular space")
     parser.add_argument("--encoder", type=str, default="transformer",
                         choices=["transformer", "mamba"],
                         help="Temporal encoder type (default: transformer)")
@@ -179,10 +202,13 @@ def main():
     if args.seq_len:           config.seq_len = args.seq_len
     if args.sample_ratio is not None: config.sample_ratio = args.sample_ratio
     if args.img_size is not None:     config.img_size = args.img_size
+    if args.sincos_output:            config.use_sincos_output = True
 
     chunk_tag = f"_chunk{config.action_chunk}" if config.action_chunk > 1 else ""
     encoder_tag = f"_{args.encoder}" if args.encoder != "transformer" else ""
-    config.output_dir = f"output/checkpoints_excv_{excv_name}" + chunk_tag + encoder_tag + ("_sincos" if args.sincos else "")
+    sincos_tag = "_sincos" if args.sincos else ""
+    sout_tag = "_sincosout" if args.sincos_output else ""
+    config.output_dir = f"output/checkpoints_excv_{excv_name}" + chunk_tag + encoder_tag + sincos_tag + sout_tag
     config.device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print(f"Single-excavator training: {excv_name}")
@@ -228,6 +254,7 @@ def main():
         qpos_drop_prob=config.qpos_drop_prob,
         encoder_type=args.encoder,
         use_sincos=args.sincos,
+        use_sincos_output=args.sincos_output,
         action_chunk=config.action_chunk,
         num_excavators=1,
     ).to(config.device)
