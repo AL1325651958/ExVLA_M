@@ -163,6 +163,9 @@ def main():
     parser.add_argument("--overfit", action="store_true")
     parser.add_argument("--sincos", action="store_true",
                         help="Use sin/cos joint encoding (eliminates 2pi discontinuity)")
+    parser.add_argument("--encoder", type=str, default="transformer",
+                        choices=["transformer", "mamba"],
+                        help="Temporal encoder type (default: transformer)")
     args = parser.parse_args()
 
     excv_name = args.excavator
@@ -178,7 +181,8 @@ def main():
     if args.img_size is not None:     config.img_size = args.img_size
 
     chunk_tag = f"_chunk{config.action_chunk}" if config.action_chunk > 1 else ""
-    config.output_dir = f"output/checkpoints_excv_{excv_name}" + chunk_tag + ("_sincos" if args.sincos else "")
+    encoder_tag = f"_{args.encoder}" if args.encoder != "transformer" else ""
+    config.output_dir = f"output/checkpoints_excv_{excv_name}" + chunk_tag + encoder_tag + ("_sincos" if args.sincos else "")
     config.device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print(f"Single-excavator training: {excv_name}")
@@ -222,6 +226,7 @@ def main():
         pretrained=config.pretrained,
         qpos_mode=config.qpos_mode,
         qpos_drop_prob=config.qpos_drop_prob,
+        encoder_type=args.encoder,
         use_sincos=args.sincos,
         action_chunk=config.action_chunk,
         num_excavators=1,
