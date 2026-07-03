@@ -188,7 +188,8 @@ def main():
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
-    parser.add_argument("--seq_len", type=int, default=None)
+    parser.add_argument("--seq_len", type=int, default=16,
+                        help="Sequence length (Mamba: O(n), can go 16-32 easily)")
     parser.add_argument("--sample_ratio", type=float, default=None, help="Fraction of data to use (0.2=20%% for fast training)")
     parser.add_argument("--img_size", type=int, default=None, help="Override image size")
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
