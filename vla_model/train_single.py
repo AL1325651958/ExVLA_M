@@ -177,7 +177,8 @@ def main():
     if args.sample_ratio is not None: config.sample_ratio = args.sample_ratio
     if args.img_size is not None:     config.img_size = args.img_size
 
-    config.output_dir = f"output/checkpoints_excv_{excv_name}" + ("_sincos" if args.sincos else "")
+    chunk_tag = f"_chunk{config.action_chunk}" if config.action_chunk > 1 else ""
+    config.output_dir = f"output/checkpoints_excv_{excv_name}" + chunk_tag + ("_sincos" if args.sincos else "")
     config.device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print(f"Single-excavator training: {excv_name}")

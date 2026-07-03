@@ -191,6 +191,9 @@ def main():
     config = Config()
     if args.output_dir is not None:
         config.output_dir = args.output_dir
+    else:
+        chunk_tag = f"_chunk{config.action_chunk}" if config.action_chunk > 1 else ""
+        config.output_dir = f"output/checkpoints{chunk_tag}"
 
     # Override config with CLI args
     if args.data_dir:
