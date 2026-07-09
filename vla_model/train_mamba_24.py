@@ -69,7 +69,7 @@ def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, conf
 
         with autocast():
             action_pred = model(rgb, elevation, qpos, excavator_id)  # [B, 4] absolute
-            action_label = action_gt.squeeze(1)  # [B, 4]
+            action_label = action_gt[:, 0, :] if action_gt.dim() == 3 else action_gt  # [B, 4]
             loss = criterion(action_pred, action_label)
 
         scaler.scale(loss).backward()
@@ -128,7 +128,7 @@ def validate(model, dataloader, criterion, config):
         action_gt = batch["action"].to(config.device)
 
         action_pred = model(rgb, elevation, qpos, excavator_id)
-        action_label = action_gt.squeeze(1)
+        action_label = action_gt[:, 0, :] if action_gt.dim() == 3 else action_gt
         loss = criterion(action_pred, action_label)
 
         total_loss += loss.item()
@@ -204,8 +204,8 @@ def main():
                         help="Starting qpos drop prob (default 0.0)")
     parser.add_argument("--qpos_drop_end", type=float, default=None,
                         help="Final qpos drop prob (default 1.0)")
-    parser.add_argument("--use_sincos", action="store_true", default=None,
-                        help="Encode qpos as [sin(θ), cos(θ)] pairs — eliminates 2π discontinuity")
+    parser.add_argument("--no_sincos", action="store_true", default=False,
+                        help="Disable sin/cos encoding (use raw radians instead)")
     parser.add_argument("--mamba_d_state", type=int, default=None,
                         help="SSM state dim (0=Conv only, 4=minimal, 16=full). Default: 0")
     args = parser.parse_args()
