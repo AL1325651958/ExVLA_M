@@ -19,7 +19,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torch.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 
 # Add project root to path
@@ -67,7 +67,7 @@ def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, conf
 
         optimizer.zero_grad()
 
-        with autocast(device_type=config.device):
+        with autocast():
             action_pred = model(rgb, elevation, qpos, excavator_id)
             action_label = action_gt[:, 0] if action_gt.dim() == 3 else action_gt
             loss = criterion(action_pred, action_label)
@@ -308,7 +308,7 @@ def main():
     cosine = CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
     scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps])
 
-    scaler = GradScaler(device_type=config.device)
+    scaler = GradScaler()
     criterion = nn.MSELoss()
 
     # EMA (Exponential Moving Average) for better generalization
