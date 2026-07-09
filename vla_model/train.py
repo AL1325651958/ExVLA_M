@@ -204,8 +204,13 @@ def main():
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
     parser.add_argument("--overfit", action="store_true", help="Overfit single episode")
     parser.add_argument("--output_dir", type=str, default=None, help="Override checkpoint output directory")
+    parser.add_argument("--sincos", action="store_true",
+                        help="Encode input qpos as [sin(θ), cos(θ)] pairs")
     parser.add_argument("--sincos-output", action="store_true",
                         help="Predict [sin(θ), cos(θ)] — loss in circular space")
+    parser.add_argument("--encoder", type=str, default="transformer",
+                        choices=["transformer", "mamba"],
+                        help="Temporal encoder type")
     args = parser.parse_args()
 
     config = Config()
@@ -213,7 +218,10 @@ def main():
         config.output_dir = args.output_dir
     else:
         chunk_tag = f"_chunk{config.action_chunk}" if config.action_chunk > 1 else ""
-        config.output_dir = f"output/checkpoints{chunk_tag}"
+        enc_tag = f"_{args.encoder}" if args.encoder != "transformer" else ""
+        sincos_tag = "_sincos" if args.sincos else ""
+        sout_tag = "_sincosout" if args.sincos_output else ""
+        config.output_dir = f"output/checkpoints_multi{chunk_tag}{enc_tag}{sincos_tag}{sout_tag}"
 
     # Override config with CLI args
     if args.data_dir:
@@ -230,6 +238,10 @@ def main():
         config.sample_ratio = args.sample_ratio
     if args.img_size is not None:
         config.img_size = args.img_size
+    if args.sincos:
+        config.use_sincos = True
+    if args.sincos_output:
+        config.use_sincos_output = True
 
     # Device
     config.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -284,8 +296,9 @@ def main():
         pretrained=config.pretrained,
         qpos_mode=config.qpos_mode,
         qpos_drop_prob=config.qpos_drop_prob,
+        encoder_type=args.encoder,
         use_sincos=config.use_sincos,
-        use_sincos_output=args.sincos_output,
+        use_sincos_output=config.use_sincos_output,
         action_chunk=config.action_chunk,
     ).to(config.device)
 
