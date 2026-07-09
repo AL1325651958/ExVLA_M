@@ -26,3 +26,10 @@ Thumbs.db
 # Jupyter
 .ipynb_checkpoints/
 端到端VLA.pdf
+
+# Misc files
+*.pdf
+*.pptx
+*.zip
+.claude/settings.json
+scripts/sim/
