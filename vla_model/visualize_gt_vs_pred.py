@@ -193,12 +193,38 @@ def main():
     else:
         qpos_mode = "modulation"
 
-    # Detect use_sincos from qpos_mod weight shape
+    # Detect use_sincos (input) from qpos_mod first layer's INPUT dim
     use_sincos = False
     if has_qpos_mod and "qpos_mod.0.weight" in state_dict:
         use_sincos = state_dict["qpos_mod.0.weight"].shape[1] == 8
     elif has_qpos_proj and "qpos_proj.0.weight" in state_dict:
         use_sincos = state_dict["qpos_proj.0.weight"].shape[1] == 8
+
+    # Detect use_sincos_output: find last Linear layer in action_heads, check output dim
+    use_sincos_output = False
+    action_chunk = 1
+    if has_action_heads:
+        # Find all weight keys for head 0, pick the highest index (last Linear)
+        head0_weight_keys = sorted(
+            [k for k in state_keys if k.startswith("action_heads.0.") and k.endswith(".weight")],
+            key=lambda x: int(x.split(".")[2])
+        )
+        if head0_weight_keys:
+            last_key = head0_weight_keys[-1]
+            last_out = state_dict[last_key].shape[0]  # output dim of last layer
+            # Try to determine chunk vs out_dim: find best-fit partition
+            # Check qpos_mod OUT dim for hint
+            if has_qpos_mod and "qpos_mod.2.weight" in state_dict:
+                out_dim_hint = state_dict["qpos_mod.2.weight"].shape[0]
+                if out_dim_hint == 8:
+                    use_sincos_output = True
+                    action_chunk = last_out // 8
+                else:
+                    use_sincos_output = False
+                    action_chunk = last_out // 4
+            else:
+                use_sincos_output = (last_out % 8 == 0 and last_out > 4)
+                action_chunk = last_out // (8 if use_sincos_output else 4)
 
     # Detect encoder type
     has_mamba_blocks = any("encoder.blocks" in k for k in state_keys)
@@ -225,19 +251,8 @@ def main():
     else:
         num_excv = 4 if is_old_single_head else 4  # old multi-head models had 4
 
-    # Detect sin/cos output: last head layer has 8 output dims instead of 4
-    use_sincos_output = False
-    if has_action_heads:
-        # action_heads.0.0.weight: last layer is .4.weight
-        last_weight_key = "action_heads.0.4.weight"  # 4th linear in sequential
-        if last_weight_key in state_dict:
-            use_sincos_output = state_dict[last_weight_key].shape[0] % 8 == 0 and state_dict[last_weight_key].shape[0] > 4
-    elif has_action_head and "action_head.0.weight" in state_dict:
-        # Find last layer: search for highest numbered weight
-        pass
-
-    print(f"Model: qpos=({qpos_mode}), encoder=({encoder_type}), "
-          f"sincos_in=({use_sincos}), sincos_out=({use_sincos_output}), heads=excv({num_excv})")
+    print(f"Model: qpos=({qpos_mode}), encoder=({encoder_type}), sincos_in=({use_sincos}), "
+          f"sincos_out=({use_sincos_output}), chunk=({action_chunk}), heads=excv({num_excv})")
 
     is_absolute = not args.delta
 
@@ -250,6 +265,7 @@ def main():
         encoder_type=encoder_type,
         use_sincos=use_sincos,
         use_sincos_output=use_sincos_output,
+        action_chunk=action_chunk,
         num_excavators=num_excv,
     ).to(device)
 
