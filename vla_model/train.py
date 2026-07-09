@@ -204,6 +204,7 @@ def main():
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
     parser.add_argument("--overfit", action="store_true", help="Overfit single episode")
     parser.add_argument("--output_dir", type=str, default=None, help="Override checkpoint output directory")
+    parser.add_argument("--action_chunk", type=int, default=None, help="Number of future steps to predict (default: 5)")
     parser.add_argument("--sincos", action="store_true",
                         help="Encode input qpos as [sin(θ), cos(θ)] pairs")
     parser.add_argument("--sincos-output", action="store_true",
@@ -238,6 +239,8 @@ def main():
         config.sample_ratio = args.sample_ratio
     if args.img_size is not None:
         config.img_size = args.img_size
+    if args.action_chunk is not None:
+        config.action_chunk = args.action_chunk
     if args.sincos:
         config.use_sincos = True
     if args.sincos_output:
