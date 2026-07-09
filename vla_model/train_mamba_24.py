@@ -19,7 +19,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 
 # Add project root to path
@@ -67,9 +67,9 @@ def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, conf
 
         optimizer.zero_grad()
 
-        with autocast():
-            action_pred = model(rgb, elevation, qpos, excavator_id)  # [B, 4] absolute
-            action_label = action_gt[:, 0, :] if action_gt.dim() == 3 else action_gt  # [B, 4]
+        with autocast(device_type=config.device):
+            action_pred = model(rgb, elevation, qpos, excavator_id)
+            action_label = action_gt[:, 0] if action_gt.dim() == 3 else action_gt
             loss = criterion(action_pred, action_label)
 
         scaler.scale(loss).backward()
@@ -128,7 +128,7 @@ def validate(model, dataloader, criterion, config):
         action_gt = batch["action"].to(config.device)
 
         action_pred = model(rgb, elevation, qpos, excavator_id)
-        action_label = action_gt[:, 0, :] if action_gt.dim() == 3 else action_gt
+        action_label = action_gt[:, 0] if action_gt.dim() == 3 else action_gt
         loss = criterion(action_pred, action_label)
 
         total_loss += loss.item()
@@ -235,10 +235,10 @@ def main():
         config.qpos_drop_start = args.qpos_drop_start
     if args.qpos_drop_end is not None:
         config.qpos_drop_end = args.qpos_drop_end
-    if args.use_sincos is not None:
-        config.use_sincos = args.use_sincos
     if args.mamba_d_state is not None:
         config.mamba_d_state = args.mamba_d_state
+    # sin/cos encoding ON by default
+    config.use_sincos = not args.no_sincos
     # 24-frame Mamba output directory
     config.output_dir = "output/checkpoints_mamba_24"
 
@@ -308,7 +308,7 @@ def main():
     cosine = CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
     scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps])
 
-    scaler = GradScaler()
+    scaler = GradScaler(device_type=config.device)
     criterion = nn.MSELoss()
 
     # EMA (Exponential Moving Average) for better generalization
