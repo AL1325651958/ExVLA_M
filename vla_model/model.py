@@ -1,11 +1,3 @@
-"""ExcavatorVLA: vision-first architecture with privileged qpos modulation.
-
-Encoder options: Transformer (default) or Mamba (O(n) state-space model).
-Vision (RGB+Elevation) is the primary predictor. qpos acts as a small
-residual correction at the head level during training only.
-Inference: pure vision, zero qpos dependency.
-"""
-
 import warnings
 warnings.filterwarnings("ignore", message="enable_nested_tensor is True")
 
@@ -14,11 +6,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import resnet18, ResNet18_Weights
 import math
-
-
-# ---------------------------------------------------------------------------
-#  Components
-# ---------------------------------------------------------------------------
 
 class ImageEncoder(nn.Module):
     """Encode a single image stream using ResNet-18."""
@@ -90,79 +77,82 @@ class DropPath(nn.Module):
         random_tensor.floor_()
         return x.div(keep_prob) * random_tensor
 
-
-# ---------------------------------------------------------------------------
-#  Mamba-style block  (selective state-space, O(n) complexity)
-# ---------------------------------------------------------------------------
-
 class MambaBlock(nn.Module):
-    """Selective state-space block (Mamba-style) with diagonal SSM recurrence."""
+    """Gated temporal-conv block with optional diagonal-SSM recurrence.
 
-    def __init__(self, d_model: int = 512, d_state: int = 16, d_conv: int = 4,
+    d_state=0 → pure Conv1d+Gate  (fast, stable)
+    d_state>0 → Conv1d + SSM scan (selective state-space memory)
+    """
+
+    def __init__(self, d_model: int = 512, d_state: int = 0, d_conv: int = 4,
                  expand: int = 2, dropout: float = 0.1):
         super().__init__()
         self.d_model = d_model
         self.d_state = d_state
-        inner = int(d_model * expand)
+        self.inner = int(d_model * expand)
 
-        self.in_proj = nn.Linear(d_model, inner * 2, bias=False)
+        self.in_proj = nn.Linear(d_model, self.inner * 2, bias=False)
         self.conv1d = nn.Conv1d(
-            in_channels=inner, out_channels=inner,
-            kernel_size=d_conv, padding=d_conv - 1, groups=inner,
+            in_channels=self.inner, out_channels=self.inner,
+            kernel_size=d_conv, padding=d_conv - 1, groups=self.inner,
         )
-        self.A_log = nn.Parameter(
-            torch.log(torch.arange(1, d_state + 1, dtype=torch.float32))
-        )
-        self.B_proj = nn.Linear(inner, d_state, bias=False)
-        self.C_proj = nn.Linear(inner, d_state, bias=False)
-        self.dt_proj = nn.Linear(inner, inner, bias=True)
-        self.D = nn.Parameter(torch.ones(inner))
-        self.out_proj = nn.Linear(inner, d_model, bias=False)
-        self.norm = nn.LayerNorm(d_model)
+        if d_state > 0:
+            tau_frames = torch.linspace(2.0, 8.0, d_state, dtype=torch.float32)
+            self.A_log = nn.Parameter((1.0 / tau_frames).log())
+            self.B_proj = nn.Linear(self.inner, d_state, bias=False)
+            self.C_proj = nn.Linear(self.inner, d_state, bias=False)
+            self.dt_net = nn.Sequential(nn.Linear(self.inner, 1, bias=True))
+            self.D = nn.Parameter(torch.ones(self.inner))
+            nn.init.constant_(self.dt_net[0].bias, -0.85)
+            self.norm_ssm = nn.LayerNorm(self.inner)
+
+        self.out_proj = nn.Linear(self.inner, d_model, bias=False)
+        self.norm_in = nn.LayerNorm(d_model)
+        self.norm_out = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
-        nn.init.constant_(self.dt_proj.bias, -3.0)
+
+    @staticmethod
+    def _ssm_scan(dt, A, B, C, x):
+        B_n, T, C_n, S = B.shape
+        cum_dt = dt.cumsum(dim=1)
+        term = dt.unsqueeze(-1) * B * x.unsqueeze(-1)
+        decay = torch.exp((-A).view(1, 1, 1, S) * cum_dt.unsqueeze(-1))
+        inner = torch.cumsum(decay * term, dim=1)
+        gain = torch.exp(A.view(1, 1, 1, S) * cum_dt.unsqueeze(-1))
+        h = gain * inner
+        return (C * h).sum(dim=-1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, D_in = x.shape
-        inner = self.in_proj.weight.shape[0] // 2
-        d_state = self.d_state
+        B, T, _ = x.shape
         residual = x
 
-        proj = self.in_proj(x)                      # [B, T, inner*2]
-        z, x_sig = proj.chunk(2, dim=-1)            # [B, T, inner] each
+        proj = self.in_proj(self.norm_in(x))
+        z, x_s = proj.chunk(2, dim=-1)
 
-        x_conv = self.conv1d(x_sig.transpose(1, 2))[:, :, :T]
-        x_conv = F.silu(x_conv.transpose(1, 2))      # [B, T, inner]
+        x_c = self.conv1d(x_s.transpose(1, 2))[:, :, :T]
+        x_c = F.silu(x_c.transpose(1, 2))
 
-        dt = F.softplus(self.dt_proj(x_conv))        # [B, T, inner]
-        B_sel = self.B_proj(x_conv)                  # [B, T, d_state]
-        C_sel = self.C_proj(x_conv)                  # [B, T, d_state]
+        if self.d_state > 0:
+            dt = torch.sigmoid(self.dt_net(x_c))
+            A = -torch.exp(self.A_log)
+            B_t = self.B_proj(x_c)
+            C_t = self.C_proj(x_c)
+            B_br = B_t.unsqueeze(2).expand(B, T, self.inner, self.d_state)
+            C_br = C_t.unsqueeze(2).expand(B, T, self.inner, self.d_state)
+            ssm_out = self._ssm_scan(dt, A, B_br, C_br, x_c)
+            x_c = self.norm_ssm(ssm_out + x_c * self.D)
 
-        A = -torch.exp(self.A_log)                   # [d_state]
-
-        # ZOH discretization + selective SSM scan
-        dt_A = dt.unsqueeze(-1) * A                  # [B, T, inner, d_state]
-        A_bar = torch.exp(dt_A)                       # element-wise exp
-        B_bar = dt.unsqueeze(-1) * B_sel.unsqueeze(2) # [B, T, inner, d_state]
-
-        # Selective scan (sequential — could be parallelized with associative scan)
-        h = torch.zeros(B, inner, d_state, device=x.device, dtype=x.dtype)
-        y_ssm = torch.zeros(B, T, inner, device=x.device, dtype=x.dtype)
-        for t_step in range(T):
-            h = A_bar[:, t_step] * h + B_bar[:, t_step]
-            y_ssm[:, t_step] = (h * C_sel[:, t_step].unsqueeze(2)).sum(dim=-1)
-
-        y = y_ssm + self.D * x_conv                   # [B, T, inner]
-        y = y * F.silu(z)                              # gating
+        y = x_c * F.silu(z)
         y = self.dropout(self.out_proj(y))
-        return self.norm(residual + y)
+        return self.norm_out(residual + y)
 
 
 class MambaEncoder(nn.Module):
     """Stack of MambaBlocks — drop-in replacement for TransformerEncoder."""
 
-    def __init__(self, d_model: int = 512, n_layers: int = 4, d_state: int = 16,
-                 d_conv: int = 4, expand: int = 2, dropout: float = 0.1):
+    def __init__(self, d_model: int = 512, n_layers: int = 4,
+                 d_state: int = 0, d_conv: int = 4, expand: int = 2,
+                 dropout: float = 0.1):
         super().__init__()
         self.blocks = nn.ModuleList([
             MambaBlock(d_model, d_state, d_conv, expand, dropout)
@@ -175,11 +165,6 @@ class MambaEncoder(nn.Module):
             x = block(x)
         return x
 
-
-# ---------------------------------------------------------------------------
-#  Joint encoding helpers
-# ---------------------------------------------------------------------------
-
 def encode_joints_sincos(qpos_rad: torch.Tensor) -> torch.Tensor:
     sin = torch.sin(qpos_rad)
     cos = torch.cos(qpos_rad)
@@ -189,11 +174,6 @@ def encode_joints_sincos(qpos_rad: torch.Tensor) -> torch.Tensor:
 def decode_joints_sincos(sincos: torch.Tensor) -> torch.Tensor:
     sin, cos = sincos.chunk(2, dim=-1)
     return torch.atan2(sin, cos)
-
-
-# ---------------------------------------------------------------------------
-#  Main model
-# ---------------------------------------------------------------------------
 
 class ExcavatorVLA(nn.Module):
     """Vision-first VLA with swappable temporal encoder.
@@ -366,8 +346,6 @@ class ExcavatorVLA(nn.Module):
                 return base_pred + correction.unsqueeze(1)
         else:
             return base_pred
-
-
 def count_parameters(model: nn.Module) -> dict:
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
