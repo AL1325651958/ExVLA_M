@@ -282,19 +282,13 @@ class ExcavatorVLAYolo(nn.Module):
         masks_spatial = masks_flat.view(B, self.num_regions, T, G, G)
 
         # Soft union gate via element-wise max: if ANY region activates a position,
-        # that position passes through with at most that activation strength.
-        # Numerically stable (no prod), avoids saturation.
+        # that position passes through. Small floor prevents complete zero-out
+        # which would cause LayerNorm NaN inside encoder.
         gate = masks_flat.max(dim=1).values  # [B, T*G^2], ∈ [0,1]
+        gate = gate.clamp(min=0.02)
         gated_tokens = tokens * gate.unsqueeze(-1)
 
-        # ── Causal temporal mask: token at time t cannot attend to t′ > t ──
-        # Within the SAME timestep, all G² spatial tokens can attend to each other.
-        # Across timesteps: only past → future (causal), no future → past.
-        time_per_token = torch.arange(T * G * G, device=tokens.device) // (G * G)
-        causal_mask = (time_per_token.unsqueeze(0) > time_per_token.unsqueeze(1)) * float('-inf')
-
-        # Encoder can only mix information among mask-selected, causally-valid positions
-        memory = self.encoder(gated_tokens, mask=causal_mask)
+        memory = self.encoder(gated_tokens)
 
         queries = self.query_tokens.expand(B, -1, -1)
         decoded = self.decoder(queries, memory)
