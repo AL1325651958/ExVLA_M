@@ -17,13 +17,13 @@ def load_yolo_backbone(checkpoint_path="yolov5s.pt"):
 
     print("Loading official YOLOv5s weights...")
     try:
-        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     except FileNotFoundError:
         import urllib.request
         url = "https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5s.pt"
         print(f"  Downloading {url} ...")
         urllib.request.urlretrieve(url, checkpoint_path)
-        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
     if isinstance(ckpt, dict) and "model" in ckpt:
         yolo_state = ckpt["model"].float().state_dict()
