@@ -64,15 +64,36 @@ class TransformerLayer(nn.Module):
         super().__init__()
 """)
 
-# models/yolo.py
+# models/yolo.py — YOLOv5 puts Model, DetectionModel, Detect, Segment, Pose here
 (_STUB_DIR / "models" / "yolo.py").write_text("""
+import torch
 import torch.nn as nn
 class Model(nn.Module):
-    def __init__(self, cfg='yolov5s.yaml', ch=3, nc=None):
+    def __init__(self, cfg='yolov5s.yaml', ch=3, nc=None, anchors=None):
         super().__init__()
 class DetectionModel(nn.Module):
-    def __init__(self, cfg='yolov5s.yaml', ch=3, nc=None):
+    def __init__(self, cfg='yolov5s.yaml', ch=3, nc=None, anchors=None):
         super().__init__()
+class ClassificationModel(nn.Module):
+    def __init__(self, cfg=None, model=None, ch=3, nc=1000, cutoff=10):
+        super().__init__()
+class Ensemble(nn.ModuleList):
+    pass
+class Detect(nn.Module):
+    stride: torch.Tensor
+    def __init__(self, nc=80, anchors=(), ch=(), inplace=True):
+        super().__init__()
+class Segment(Detect):
+    pass
+class Pose(Detect):
+    pass
+class DDetect(nn.Module):
+    def __init__(self, nc=80, anchors=(), ch=()):
+        super().__init__()
+class DSegment(DDetect):
+    pass
+class DPose(DDetect):
+    pass
 """)
 
 # utils/ stuff (some checkpoints reference it)
