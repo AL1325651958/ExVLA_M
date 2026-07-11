@@ -203,7 +203,7 @@ class ExcavatorVLAYolo(nn.Module):
         )
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=max(2, n_layers // 2))
 
-        self.delta_head = nn.Sequential(
+        self.action_head = nn.Sequential(
             nn.Linear(hidden_dim, 256), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(256, 128), nn.GELU(), nn.Dropout(dropout * 0.5),
             nn.Linear(128, out_dim),
@@ -218,7 +218,7 @@ class ExcavatorVLAYolo(nn.Module):
         for p in self.decoder.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p, gain=0.5)
-        for module in self.delta_head:
+        for module in self.action_head:
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight, gain=0.5)
                 if module.bias is not None:
@@ -231,7 +231,7 @@ class ExcavatorVLAYolo(nn.Module):
                     if module.bias is not None:
                         nn.init.zeros_(module.bias)
 
-    def decode_delta(self, raw):
+    def decode_action(self, raw):
         if self.use_sincos_output:
             sin, cos = raw.chunk(2, dim=-1)
             return torch.atan2(sin, cos)
@@ -278,16 +278,16 @@ class ExcavatorVLAYolo(nn.Module):
         queries = self.query_tokens.expand(B, -1, -1)
         decoded = self.decoder(queries, memory)
         pool = decoded.mean(dim=1)
-        delta = self.delta_head(pool)
+        action = self.action_head(pool)
 
         if self.qpos_mode == "modulation" and qpos is not None and self.training:
             correction = self.qpos_mod(qpos[:, -1, :])
             if self.qpos_drop_prob > 0:
                 correction = correction * (torch.rand(B, 1, device=qpos.device) > self.qpos_drop_prob).float()
-            delta = delta + correction
+            action = action + correction
 
         avg_masks = masks.mean(dim=2)
-        return delta, avg_masks
+        return action, avg_masks
 
 
 def count_parameters(model):

@@ -120,6 +120,7 @@ class ExcavatorDataset(Dataset):
             mains_raw = f['observations/images/main']      # [N, H, W, 3] uint8 BGR
             elevations_raw = f['observations/images/elevation']  # [N, 200, 200, 3]
             qpos = f['observations/qpos'][:].astype(np.float32)
+            # action = absolute qpos of NEXT frame (i.e. the target joint angles)
             if 'action' in f:
                 action = f['action'][:].astype(np.float32)
             else:

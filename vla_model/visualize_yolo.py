@@ -255,8 +255,8 @@ def main():
             raw_out, masks = model(rgb_seq, elev_seq, qpos_seq, excv_tensor)
 
         tgt_idx = start + T - 1
-        delta_pred = model.decode_delta(raw_out)[0].cpu().numpy()  # [4]
-        predictions[tgt_idx] = delta_pred
+        action_pred = model.decode_action(raw_out)[0].cpu().numpy()  # [4]
+        predictions[tgt_idx] = action_pred
         all_masks[tgt_idx] = masks[0].cpu().numpy()  # [4, G, G]
 
     # ── MAE ──

@@ -60,17 +60,17 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch):
         elevation = batch["elevation"].to(config.device)
         qpos = batch["qpos"].to(config.device)
         excavator_id = batch["excavator_id"].to(config.device)
-        action_gt = batch["action"].to(config.device)  # [B, 1, 4] raw radians delta
+        action_gt = batch["action"].to(config.device)  # [B, 1, 4] absolute joint angles (rad)
 
         optimizer.zero_grad()
 
         with autocast():
             raw_out, masks = model(rgb, elevation, qpos, excavator_id)  # [B, out_dim], [B, 4, G, G]
-            delta_gt_rad = action_gt.squeeze(1)                          # [B, 4]
+            action_gt_rad = action_gt.squeeze(1)                          # [B, 4]
             if use_sincos:
-                target = _delta_to_sincos(delta_gt_rad)                  # [B, 8]
+                target = _delta_to_sincos(action_gt_rad)                  # [B, 8]
             else:
-                target = delta_gt_rad
+                target = action_gt_rad
 
             # 1. Prediction loss
             pred_loss = criterion(raw_out, target)
@@ -101,12 +101,12 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch):
         scaler.update()
 
         total_loss += loss.item()
-        delta_pred_rad = model.decode_delta(raw_out.detach())   # [B, 4] rad
-        mae = (delta_pred_rad - delta_gt_rad).abs().mean(dim=0).cpu().numpy()
+        action_pred_rad = model.decode_action(raw_out.detach())   # [B, 4] rad
+        mae = (action_pred_rad - action_gt_rad).abs().mean(dim=0).cpu().numpy()
         total_mae += mae
 
-        pred_cpu = delta_pred_rad.cpu().numpy()
-        label_cpu = delta_gt_rad.cpu().numpy()
+        pred_cpu = action_pred_rad.cpu().numpy()
+        label_cpu = action_gt_rad.cpu().numpy()
         ss_res += ((pred_cpu - label_cpu) ** 2).sum(axis=0)
         sum_y  += label_cpu.sum(axis=0)
         sum_y2 += (label_cpu ** 2).sum(axis=0)
@@ -146,20 +146,20 @@ def validate(model, dataloader, criterion, config):
         action_gt = batch["action"].to(config.device)
 
         raw_out, _ = model(rgb, elevation, qpos, excavator_id)
-        delta_gt_rad = action_gt.squeeze(1)
+        action_gt_rad = action_gt.squeeze(1)
         if use_sincos:
-            target = _delta_to_sincos(delta_gt_rad)
+            target = _delta_to_sincos(action_gt_rad)
         else:
-            target = delta_gt_rad
+            target = action_gt_rad
         loss = criterion(raw_out, target)
 
         total_loss += loss.item()
-        delta_pred_rad = model.decode_delta(raw_out)
-        mae = (delta_pred_rad - delta_gt_rad).abs().mean(dim=0).cpu().numpy()
+        action_pred_rad = model.decode_action(raw_out)
+        mae = (action_pred_rad - action_gt_rad).abs().mean(dim=0).cpu().numpy()
         total_mae += mae
 
-        pred_cpu = delta_pred_rad.cpu().numpy()
-        label_cpu = delta_gt_rad.cpu().numpy()
+        pred_cpu = action_pred_rad.cpu().numpy()
+        label_cpu = action_gt_rad.cpu().numpy()
         ss_res += ((pred_cpu - label_cpu) ** 2).sum(axis=0)
         sum_y  += label_cpu.sum(axis=0)
         sum_y2 += (label_cpu ** 2).sum(axis=0)
