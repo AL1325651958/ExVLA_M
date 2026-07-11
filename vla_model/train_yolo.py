@@ -244,12 +244,21 @@ def main():
     best_loss = float("inf")
     if args.resume:
         ckpt = torch.load(args.resume, map_location=config.device, weights_only=False)
-        # strict=False: allows pretrained backbone checkpoints with different head dims
-        missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
-        if missing:
-            print(f"  [resume] missing keys (ok - randomly init): {len(missing)}")
-        if unexpected:
-            print(f"  [resume] unexpected keys (ignored): {len(unexpected)}")
+        resume_state = ckpt["model_state_dict"]
+
+        # Filter: only load keys that match in both name AND shape
+        # (allows loading backbone-only pretrained checkpoints with different head dims)
+        model_state = model.state_dict()
+        filtered_state = {}
+        skipped = 0
+        for k, v in resume_state.items():
+            if k in model_state and model_state[k].shape == v.shape:
+                filtered_state[k] = v
+            else:
+                skipped += 1
+        model.load_state_dict(filtered_state, strict=False)
+        print(f"  [resume] loaded {len(filtered_state)} keys, skipped {skipped} (size mismatch or missing)")
+
         # Only load optimizer/scaler if this is a full training checkpoint (not backbone-only)
         if "optimizer_state_dict" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
