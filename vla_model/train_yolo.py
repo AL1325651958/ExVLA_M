@@ -251,8 +251,8 @@ def main():
     print(f"Model parameters: {params['total']:,} total, {params['trainable']:,} trainable")
     G = config.img_size // 16
     print(f"  Grid size: {G}×{G}")
-    print(f"  Tokens per sequence: {config.seq_len} × {G}² grid + {model.num_queries} queries = "
-          f"{config.seq_len * G ** 2 + model.num_queries}")
+    print(f"  Tokens per sequence: {config.seq_len} × {G}² grid + {model.num_joints} queries = "
+          f"{config.seq_len * G ** 2 + model.num_joints}")
 
     # ── Optimiser + scheduler ──
     optimizer = AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
