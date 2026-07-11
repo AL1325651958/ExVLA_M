@@ -315,14 +315,14 @@ class ExcavatorVLAYolo(nn.Module):
         for eid in range(self.num_excavators):
             mask_e = (excavator_id == eid)
             if mask_e.any():
-                action[mask_e] = self.action_heads[eid](pool[mask_e])
+                action[mask_e] = self.action_heads[eid](pool[mask_e]).float()
 
         if self.qpos_mods is not None and qpos is not None and self.training:
             correction = torch.zeros(B, self.out_dim, device=action.device, dtype=action.dtype)
             for eid in range(self.num_excavators):
                 mask_e = (excavator_id == eid)
                 if mask_e.any():
-                    correction[mask_e] = self.qpos_mods[eid](qpos[mask_e, -1, :])
+                    correction[mask_e] = self.qpos_mods[eid](qpos[mask_e, -1, :]).float()
             if self.qpos_drop_prob > 0:
                 correction = correction * (torch.rand(B, 1, device=qpos.device) > self.qpos_drop_prob).float()
             action = action + correction
