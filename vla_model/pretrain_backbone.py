@@ -13,11 +13,17 @@ _MODEL_CFG = dict(seq_len=8, img_size=224, hidden_dim=768, n_heads=12,
 
 
 def load_yolo_backbone(checkpoint_path="yolov5s.pt"):
-    """Load YOLOv5s via ultralytics YOLO class, extract backbone state_dict."""
-    print("Loading YOLOv5s via ultralytics...")
-    from ultralytics import YOLO
-    m = YOLO(checkpoint_path, verbose=False)
-    yolo_state = {k: v.float() for k, v in m.model.state_dict().items()}
+    """Load YOLOv5s checkpoint and extract backbone state_dict.
+    Uses torch.hub (only yolov5s, no extra download like ultralytics.YOLO does).
+    """
+    print("Loading YOLOv5s via torch.hub...")
+    import sys
+    old_stdout = sys.stdout
+    sys.stdout = open('/dev/null', 'w')
+    model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True, verbose=False)
+    sys.stdout.close()
+    sys.stdout = old_stdout
+    yolo_state = {k: v.float() for k, v in model.state_dict().items()}
     print(f"  YOLO keys: {len(yolo_state)} total")
     return yolo_state
 
