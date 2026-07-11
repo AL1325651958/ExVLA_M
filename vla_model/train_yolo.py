@@ -75,12 +75,11 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch):
             # 1. Prediction loss
             pred_loss = criterion(raw_out, target)
 
-            # 2. Sparsity: each region mask should be concentrated (low entropy)
-            #    H = -Σ p·log(p), high entropy = uniform = bad
+            # 2. Sparsity: each region mask should be concentrated (LOW entropy)
+            #    Penalize high entropy → encourages peaked masks
             eps = 1e-8
             entropy = -(masks * torch.log(masks + eps)).sum(dim=(-2, -1)).mean()
-            # Encouraging LOW entropy (1e-3 weight — very light)
-            sparsity_loss = -0.001 * entropy
+            sparsity_loss = 0.1 * entropy
 
             # 3. Diversity: different regions should focus on different cells
             K = masks.size(1)  # num_regions

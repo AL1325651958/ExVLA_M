@@ -273,7 +273,7 @@ class ExcavatorVLAYolo(nn.Module):
 
         raw_scores = self.mask_head(memory)
         raw_scores = raw_scores.view(B, T, G * G, self.num_regions).permute(0, 3, 1, 2)
-        masks = F.softmax(raw_scores, dim=-1).view(B, self.num_regions, T, G, G)
+        masks = F.softmax(raw_scores / 0.1, dim=-1).view(B, self.num_regions, T, G, G)
 
         queries = self.query_tokens.expand(B, -1, -1)
         decoded = self.decoder(queries, memory)
