@@ -7,7 +7,7 @@ class Config:
     # Data
     data_dir: str = "data/excavator-motion"
     seq_len: int = 8
-    action_chunk: int = 5          # predict this many future steps (1=single step)
+    action_chunk: int = 1          # single step (YOLO model default)
     img_size: int = 224            # can override with --img_size
     train_split: float = 0.9
     sample_ratio: float = 0.2
