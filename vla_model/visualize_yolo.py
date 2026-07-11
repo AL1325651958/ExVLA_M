@@ -152,29 +152,51 @@ def main():
     sd_keys = set(state_dict.keys())
 
     # ── Detect checkpoint version ──
-    is_v2 = any("delta_head" in k for k in sd_keys)       # V2: single shared head
-    is_v3 = any("action_head" in k for k in sd_keys)      # V3-V4: action_head (shared)
-    is_v5 = any("action_heads" in k for k in sd_keys)     # V5: per-excavator heads
-    version_label = "V2" if is_v2 else "V3/V4" if is_v3 else "V5"
+    is_v2 = any("delta_head" in k for k in sd_keys)
+    is_v3 = any("action_head" in k and "action_heads" not in k for k in sd_keys)
+    is_v5 = any("action_heads" in k for k in sd_keys)
+    is_v6 = any("joint_queries" in k for k in sd_keys) or \
+            any("action_heads.0.0" in k for k in sd_keys)
+    version_label = "V2" if is_v2 else "V3/V4" if is_v3 else "V5" if not is_v6 else "V6"
     print(f"  Detected checkpoint version: {version_label}")
 
-    # ── Remap old keys → V5 format (action_heads, qpos_mods) ──
+    # ── Remap old keys → V6 format ──
     remapped = {}
     for k, v in list(state_dict.items()):
         if is_v2 and "delta_head" in k:
-            # V2 delta_head → V5 action_heads.0 (single head, copied to all slots)
+            suffix = k.replace("delta_head.", "")
             for eid in range(4):
-                remapped[k.replace("delta_head", f"action_heads.{eid}")] = v.clone()
-        elif is_v3 and "action_head" in k:
+                for j in range(4):
+                    # V2 delta_head.{layer} → V6 action_heads.{eid}.{j}.{layer}
+                    remapped[f"action_heads.{eid}.{j}.{suffix}"] = v.clone()
+        elif is_v3 and "action_head." in k:
+            suffix = k.replace("action_head.", "")
             for eid in range(4):
-                remapped[k.replace("action_head", f"action_heads.{eid}")] = v.clone()
+                for j in range(4):
+                    if suffix.startswith("0.weight") or suffix.startswith("2.weight"):
+                        continue  # dim mismatch: 512→256 ok, 128→8 vs 128→2, skip
+                    remapped[f"action_heads.{eid}.{j}.{suffix}"] = v.clone()
+        elif is_v5 and "action_heads." in k:
+            parts = k.split(".")
+            eid = int(parts[1])
+            rest = ".".join(parts[2:])  # e.g. "0.weight", "6.bias"
+            # V5 head: Sequential[0..6], output layer is 6 (dim 8≠2, skip it)
+            if rest.startswith("6."):
+                continue
+            for j in range(4):
+                remapped[f"action_heads.{eid}.{j}.{rest}"] = v.clone()
         elif is_v2 and "qpos_mod." in k:
+            suffix = k.replace("qpos_mod.", "")
             for eid in range(4):
-                remapped[k.replace("qpos_mod.", f"qpos_mods.{eid}.")] = v.clone()
+                remapped[f"qpos_mods.{eid}.{suffix}"] = v.clone()
         elif is_v3 and "qpos_mod." in k:
+            suffix = k.replace("qpos_mod.", "")
             for eid in range(4):
-                remapped[k.replace("qpos_mod.", f"qpos_mods.{eid}.")] = v.clone()
+                remapped[f"qpos_mods.{eid}.{suffix}"] = v.clone()
     state_dict.update(remapped)
+    # Remap old query parameter name (after remapped dict applied)
+    if "query_tokens" in state_dict and "joint_queries" not in state_dict:
+        state_dict["joint_queries"] = state_dict.pop("query_tokens")
 
     # Auto-detect model config from state_dict
     hidden_dim = state_dict.get("encoder.layers.0.self_attn.in_proj_weight",
@@ -191,11 +213,15 @@ def main():
     has_qpos_mod = any("qpos_mod" in k for k in sd_keys)
 
     use_sincos_output = False
-    for prefix in ["qpos_mods.0.2.weight", "qpos_mod.2.weight",
-                   "action_heads.0.3.weight", "action_head.3.weight",
-                   "delta_head.3.weight"]:
-        if prefix in state_dict and state_dict[prefix].shape[0] == 8:
-            use_sincos_output = True
+    for prefix in ["action_heads.0.0.6.weight",  # V6: per-joint head last layer
+                   "action_heads.0.3.weight",    # V5: shared head last layer
+                   "action_head.3.weight",       # V3: single head last layer
+                   "delta_head.3.weight",        # V2
+                   "qpos_mods.0.2.weight",       # V5 qpos
+                   "qpos_mod.2.weight"]:         # V2/V3 qpos
+        if prefix in state_dict:
+            shape_out = state_dict[prefix].shape[0]
+            use_sincos_output = (shape_out == 8 or shape_out == 2)  # 2 = per-joint sin/cos
             break
 
     print(f"  Detected: hidden_dim={hidden_dim}, n_layers={n_layers}, ff_dim={ff_dim}, "

@@ -150,8 +150,10 @@ class ExcavatorVLAYolo(nn.Module):
         self.use_sincos_output = use_sincos_output
         self.qpos_mode = qpos_mode
         self.qpos_drop_prob = qpos_drop_prob
-        self.out_dim = 8 if use_sincos_output else 4
-        out_dim = self.out_dim
+        self.num_joints = 4
+        self.out_dim_per_joint = 2 if use_sincos_output else 1
+        total_out = self.num_joints * self.out_dim_per_joint
+        self.out_dim = total_out
 
         neck_out = 256
         grid_dim = 256
@@ -178,7 +180,7 @@ class ExcavatorVLAYolo(nn.Module):
 
         if qpos_mode == "modulation":
             self.qpos_mods = nn.ModuleList([
-                nn.Sequential(nn.Linear(4, 32), nn.GELU(), nn.Linear(32, out_dim))
+                nn.Sequential(nn.Linear(4, 32), nn.GELU(), nn.Linear(32, total_out))
                 for _ in range(num_excavators)
             ])
         elif qpos_mode == "transformer":
@@ -192,8 +194,9 @@ class ExcavatorVLAYolo(nn.Module):
         self.excv_embed = nn.Embedding(num_excavators, hidden_dim)
         self.pos_embed = SpatioTemporalPosEmbed(seq_len, grid_size, hidden_dim)
 
-        self.num_queries = 4
-        self.query_tokens = nn.Parameter(torch.randn(1, self.num_queries, hidden_dim) * 0.02)
+        # 4 joint-specific learnable queries [1, 4, D]
+        # Query j corresponds to mask j and predicts joint j
+        self.joint_queries = nn.Parameter(torch.randn(1, self.num_joints, hidden_dim) * 0.02)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim, nhead=n_heads, dim_feedforward=ff_dim,
@@ -207,13 +210,16 @@ class ExcavatorVLAYolo(nn.Module):
         )
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=max(2, n_layers // 2))
 
-        # Per-excavator action heads — different machines have different joint ranges
+        # Per-excavator per-joint action heads
+        # action_heads[excavator][joint]: Linear(512→256→128→2) for sin/cos
         self.action_heads = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(hidden_dim, 256), nn.GELU(), nn.Dropout(dropout),
-                nn.Linear(256, 128), nn.GELU(), nn.Dropout(dropout * 0.5),
-                nn.Linear(128, out_dim),
-            ) for _ in range(num_excavators)
+            nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(hidden_dim, 256), nn.GELU(), nn.Dropout(dropout),
+                    nn.Linear(256, 128), nn.GELU(), nn.Dropout(dropout * 0.5),
+                    nn.Linear(128, self.out_dim_per_joint),
+                ) for _ in range(self.num_joints)
+            ]) for _ in range(num_excavators)
         ])
 
         self._init_weights()
@@ -225,12 +231,13 @@ class ExcavatorVLAYolo(nn.Module):
         for p in self.decoder.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p, gain=0.5)
-        for head in self.action_heads:
-            for module in head:
-                if isinstance(module, nn.Linear):
-                    nn.init.xavier_uniform_(module.weight, gain=0.5)
-                    if module.bias is not None:
-                        nn.init.zeros_(module.bias)
+        for excv_heads in self.action_heads:
+            for head in excv_heads:
+                for module in head:
+                    if isinstance(module, nn.Linear):
+                        nn.init.xavier_uniform_(module.weight, gain=0.5)
+                        if module.bias is not None:
+                            nn.init.zeros_(module.bias)
         nn.init.normal_(self.excv_embed.weight, mean=0.0, std=0.02)
         if self.qpos_mods is not None:
             for mod in self.qpos_mods:
@@ -241,16 +248,18 @@ class ExcavatorVLAYolo(nn.Module):
                             nn.init.zeros_(module.bias)
 
     def decode_action(self, raw):
+        """raw: [B, 8] = [sin0,cos0, sin1,cos1, sin2,cos2, sin3,cos3] → [B, 4] rad"""
         if self.use_sincos_output:
-            sin, cos = raw.chunk(2, dim=-1)
+            raw_4d = raw.view(-1, self.num_joints, 2)
+            sin, cos = raw_4d[..., 0], raw_4d[..., 1]
             return torch.atan2(sin, cos)
         return raw
 
     def forward(self, rgb, elevation, qpos=None, excavator_id=None):
         B, T = rgb.shape[:2]
-        H, W = rgb.shape[3], rgb.shape[4]
         G = self.grid_size
         D = self.hidden_dim
+        H, W = rgb.shape[3], rgb.shape[4]
 
         rgb_flat = rgb.reshape(B * T, 3, H, W)
         elev_flat = elevation.reshape(B * T, 3, H, W)
@@ -278,45 +287,38 @@ class ExcavatorVLAYolo(nn.Module):
         if excavator_id is not None:
             tokens = tokens + self.excv_embed(excavator_id).unsqueeze(1)
 
-        # ── Masks BEFORE encoder: causal gate on INPUT tokens ──
-        # mask_head sees spatially-specific pre-encoder tokens and selects
-        # task-relevant regions. Encoder is forced to route information ONLY
-        # through selected tokens → masks must focus or prediction fails.
-        raw_scores = self.mask_head(tokens)  # [B, T*G^2, 4]
-
-        # Sigmoid activation: each region independently decides per-position relevance.
-        # Unlike softmax, this allows positions to be "off" for ALL regions (background).
-        region_acts = torch.sigmoid(raw_scores)  # [B, T*G^2, 4], each in [0,1]
-        masks_flat = region_acts.permute(0, 2, 1)  # [B, 4, T*G^2]
+        # ── 4 region masks (sigmoid, independent per-position) ──
+        raw_scores = self.mask_head(tokens)                      # [B, N, 4]
+        masks_flat = torch.sigmoid(raw_scores).permute(0, 2, 1)  # [B, 4, N]
         masks_spatial = masks_flat.view(B, self.num_regions, T, G, G)
 
-        # Soft union gate via element-wise max: if ANY region activates a position,
-        # that position passes through. Small floor prevents complete zero-out
-        # which would cause LayerNorm NaN inside encoder.
-        gate = masks_flat.max(dim=1).values  # [B, T*G^2], ∈ [0,1]
-        gate = gate.clamp(min=0.02)
+        # ── Soft union gate: 1 − ∏(1−Mₖ) + continuous floor ──
+        # Prod is safe here: sigmoid outputs are in [0,1], so (1-p) ∈ [0,1].
+        gate = 1.0 - (1.0 - masks_flat).prod(dim=1)              # [B, N]
+        gate = 0.02 + 0.98 * gate                                 # continuous floor
         gated_tokens = tokens * gate.unsqueeze(-1)
 
-        # ── Causal mask for encoder self-attention ──
-        # Token at time t can only attend to tokens at time ≤ t.
-        # Within the same timestep: all G² spatial tokens see each other.
-        # -1e9 is amp-safe (fp16 inf can cause NaN in softmax denominator).
-        token_time = torch.arange(T * G * G, device=tokens.device) // (G * G)     # [N]
+        # ── Block-causal mask: same timestep tokens see each other ──
+        token_time = torch.arange(T * G * G, device=tokens.device) // (G * G)
         causal_mask = (token_time.unsqueeze(1) < token_time.unsqueeze(0)).float() * (-1e9)
 
-        memory = self.encoder(gated_tokens, mask=causal_mask)
+        memory = self.encoder(gated_tokens, mask=causal_mask)    # [B, N, D]
 
-        queries = self.query_tokens.expand(B, -1, -1)
-        decoded = self.decoder(queries, memory)
-        pool = decoded.mean(dim=1)                                          # [B, D]
+        # ── Structured decoder: 4 joint queries → 4 per-joint heads ──
+        queries = self.joint_queries.expand(B, -1, -1)           # [B, 4, D]
+        decoded = self.decoder(queries, memory)                   # [B, 4, D]
 
-        # Per-excavator action heads — each machine type has its own predictor
-        action = torch.zeros(B, self.out_dim, device=pool.device, dtype=pool.dtype)
+        # Per-excavator per-joint heads — no pooling
+        action = torch.zeros(B, self.out_dim, device=decoded.device, dtype=decoded.dtype)
         for eid in range(self.num_excavators):
             mask_e = (excavator_id == eid)
             if mask_e.any():
-                action[mask_e] = self.action_heads[eid](pool[mask_e]).float()
+                acts_e = []
+                for j in range(self.num_joints):
+                    acts_e.append(self.action_heads[eid][j](decoded[mask_e, j]))
+                action[mask_e] = torch.cat(acts_e, dim=-1).float()
 
+        # ── Qpos modulation (train-only, per-excavator) ──
         if self.qpos_mods is not None and qpos is not None and self.training:
             correction = torch.zeros(B, self.out_dim, device=action.device, dtype=action.dtype)
             for eid in range(self.num_excavators):
@@ -327,8 +329,8 @@ class ExcavatorVLAYolo(nn.Module):
                 correction = correction * (torch.rand(B, 1, device=qpos.device) > self.qpos_drop_prob).float()
             action = action + correction
 
-        avg_masks = masks_spatial.mean(dim=2)  # [B, 4, G, G] for viz
-        return action, avg_masks, masks_spatial  # [B,4], [B,4,G,G], [B,4,T,G,G]
+        avg_masks = masks_spatial.mean(dim=2)                    # [B, 4, G, G]
+        return action, avg_masks, masks_spatial                  # [B,8], [B,4,G,G], [B,4,T,G,G]
 
 
 def count_parameters(model):
