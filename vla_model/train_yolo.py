@@ -72,7 +72,7 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch):
 
             # 3. Diversity: different regions should focus on different cells
             K = masks.size(1)  # num_regions
-            masks_flat = masks.reshape(B, K, -1)
+            masks_flat = masks.reshape(masks.size(0), K, -1)
             overlap = torch.bmm(masks_flat, masks_flat.transpose(1, 2))
             eye = torch.eye(K, device=masks.device).unsqueeze(0)
             off_diag = overlap * (1 - eye)
