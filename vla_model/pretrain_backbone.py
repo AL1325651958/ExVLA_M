@@ -13,21 +13,11 @@ _MODEL_CFG = dict(seq_len=8, img_size=224, hidden_dim=768, n_heads=12,
 
 
 def load_yolo_backbone(checkpoint_path="yolov5s.pt"):
-    """Load YOLOv5s via ultralytics, extract backbone state_dict."""
-    print("Loading official YOLOv5s weights via ultralytics...")
-    try:
-        from ultralytics import YOLO
-        yolo_model = YOLO(checkpoint_path)
-        yolo_state = {k: v.float() for k, v in yolo_model.model.state_dict().items()}
-    except Exception:
-        import urllib.request
-        url = "https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5s.pt"
-        print(f"  Downloading {url} ...")
-        urllib.request.urlretrieve(url, checkpoint_path)
-        from ultralytics import YOLO
-        yolo_model = YOLO(checkpoint_path)
-        yolo_state = {k: v.float() for k, v in yolo_model.model.state_dict().items()}
-
+    """Load YOLOv5s via ultralytics YOLO class, extract backbone state_dict."""
+    print("Loading YOLOv5s via ultralytics...")
+    from ultralytics import YOLO
+    m = YOLO(checkpoint_path, verbose=False)
+    yolo_state = {k: v.float() for k, v in m.model.state_dict().items()}
     print(f"  YOLO keys: {len(yolo_state)} total")
     return yolo_state
 
