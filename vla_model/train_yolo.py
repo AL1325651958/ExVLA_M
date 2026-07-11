@@ -170,6 +170,7 @@ def main():
     parser.add_argument("--sample_ratio", type=float, default=None)
     parser.add_argument("--img_size", type=int, default=None)
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--overfit", action="store_true")
     args = parser.parse_args()
 
@@ -177,14 +178,10 @@ def main():
 
     # ── CLI overrides ──
     for key in ("data_dir", "epochs", "batch_size", "lr", "seq_len",
-                "sample_ratio", "img_size"):
+                "sample_ratio", "img_size", "output_dir"):
         val = getattr(args, key, None)
         if val is not None:
             setattr(config, key, val)
-
-    # ── Special YOLO defaults ──
-    if config.img_size == 224:
-        config.img_size = 224  # keep divisible by 32 (grid = 7)
 
     config.device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {config.device}")
@@ -219,9 +216,10 @@ def main():
 
     params = count_parameters(model)
     print(f"Model parameters: {params['total']:,} total, {params['trainable']:,} trainable")
-    print(f"  Grid size: {config.img_size // 32}×{config.img_size // 32}")
-    print(f"  Tokens per sequence: {config.seq_len} × {config.img_size // 32}² + 1 CLS = "
-          f"{config.seq_len * (config.img_size // 32) ** 2 + 1}")
+    G = config.img_size // 16
+    print(f"  Grid size: {G}×{G}")
+    print(f"  Tokens per sequence: {config.seq_len} × {G}² grid + {model.num_queries} queries = "
+          f"{config.seq_len * G ** 2 + model.num_queries}")
 
     # ── Optimiser + scheduler ──
     optimizer = AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
