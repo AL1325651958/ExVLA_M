@@ -193,12 +193,10 @@ def main():
         mains = f['observations/images/main'][:]
         elevations = f['observations/images/elevation'][:]
         qpos = f['observations/qpos'][:].astype(np.float32)
-        if 'action' in f:
-            targets = f['action'][:].astype(np.float32)
-        else:
-            targets = np.zeros_like(qpos)
-            targets[:-1] = qpos[1:]
-            targets[-1] = qpos[-1]
+        # Target = next frame's absolute joint angle (matching dataset.py)
+        targets = np.zeros_like(qpos)
+        targets[:-1] = qpos[1:]
+        targets[-1] = qpos[-1]
 
     N = len(targets)
     T = args.seq_len
@@ -296,9 +294,7 @@ def main():
             # Render 4 mask panels
             masks_i = all_masks[i]  # [4, G, G]
             mask_panels = []
-            raw_rgb_bgr = cv2.resize(mains[i], (G, G))  # raw small RGB for overlay
 
-            # Scale raw image to mask_w × mask_h
             raw_display = cv2.resize(mains[i], (mask_w, mask_h))
             for k in range(4):
                 panel = render_masks(raw_display, masks_i[k], k, G)
