@@ -281,9 +281,10 @@ class ExcavatorVLAYolo(nn.Module):
         masks_flat = region_acts.permute(0, 2, 1)  # [B, 4, T*G^2]
         masks_spatial = masks_flat.view(B, self.num_regions, T, G, G)
 
-        # Soft union gate: prob that ≥1 region cares about this position.
-        # gate ∈ [0,1]; 1−∏(1−pₖ) avoids the hard-clamp saturation problem.
-        gate = 1 - (1 - masks_flat).prod(dim=1)  # [B, T*G^2]
+        # Soft union gate via element-wise max: if ANY region activates a position,
+        # that position passes through with at most that activation strength.
+        # Numerically stable (no prod), avoids saturation.
+        gate = masks_flat.max(dim=1).values  # [B, T*G^2], ∈ [0,1]
         gated_tokens = tokens * gate.unsqueeze(-1)
 
         # ── Causal temporal mask: token at time t cannot attend to t′ > t ──

@@ -76,22 +76,19 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch):
             pred_loss = criterion(raw_out, target)
 
             # 2. Sparsity: penalise mask activations → few positions activated per region
-            #    L1 on sigmoid outputs: ~0 when focused, large when activations spread
-            sparsity_loss = 0.05 * masks_spatial.mean()
+            sparsity_loss = 0.01 * masks_spatial.mean()
 
             # 3. Diversity: minimize overlap between region spatial patterns
-            #    masks_spatial: [B, K, T, G, G] → flatten to [B, K, T*G*G]
             K = masks_spatial.size(1)
             mf = masks_spatial.reshape(masks_spatial.size(0), K, -1)  # [B, K, T*G*G]
             overlap = torch.bmm(mf, mf.transpose(1, 2))               # [B, K, K]
             eye = torch.eye(K, device=masks_spatial.device).unsqueeze(0)
             off_diag = overlap * (1 - eye)
-            diversity_loss = 0.05 * off_diag.sum(dim=(-2, -1)).mean()
+            diversity_loss = 0.02 * off_diag.sum(dim=(-2, -1)).mean()
 
             # 4. Temporal smoothness: adjacent-frame masks should change slowly
-            #    masks_spatial: [B, K, T, G, G]
             temp_diff = (masks_spatial[:, :, 1:] - masks_spatial[:, :, :-1]).abs().mean()
-            temp_loss = 0.02 * temp_diff
+            temp_loss = 0.01 * temp_diff
 
             loss = pred_loss + sparsity_loss + diversity_loss + temp_loss
 
