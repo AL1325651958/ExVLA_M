@@ -31,26 +31,35 @@ from vla_model.dataset import ExcavatorDataset
 #  Training utilities  (same as train.py)
 # ---------------------------------------------------------------------------
 
+def _delta_to_sincos(delta_rad: torch.Tensor) -> torch.Tensor:
+    """[B, 4] rad → [B, 8] sin/cos pairs."""
+    return torch.cat([torch.sin(delta_rad), torch.cos(delta_rad)], dim=-1)
+
+
 def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch):
     model.train()
     total_loss = 0.0
     total_mae = np.zeros(4)
     n_batches = 0
-
+    use_sincos = getattr(model, 'use_sincos_output', False)
     pbar = tqdm(dataloader, desc=f"Train Epoch {epoch+1}")
     for step, batch in enumerate(pbar):
         rgb = batch["rgb"].to(config.device)
         elevation = batch["elevation"].to(config.device)
         qpos = batch["qpos"].to(config.device)
         excavator_id = batch["excavator_id"].to(config.device)
-        action_gt = batch["action"].to(config.device)  # [B, 1, 4]
+        action_gt = batch["action"].to(config.device)  # [B, 1, 4] raw radians delta
 
         optimizer.zero_grad()
 
         with autocast():
-            delta_pred = model(rgb, elevation, qpos, excavator_id)  # [B, 4]
-            delta_gt   = action_gt.squeeze(1)                        # [B, 4]
-            loss = criterion(delta_pred, delta_gt)
+            raw_out = model(rgb, elevation, qpos, excavator_id)  # [B, out_dim]
+            delta_gt_rad = action_gt.squeeze(1)                    # [B, 4]
+            if use_sincos:
+                target = _delta_to_sincos(delta_gt_rad)            # [B, 8]
+            else:
+                target = delta_gt_rad
+            loss = criterion(raw_out, target)
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -59,7 +68,8 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch):
         scaler.update()
 
         total_loss += loss.item()
-        mae = (delta_pred.detach() - delta_gt).abs().mean(dim=0).cpu().numpy()
+        delta_pred_rad = model.decode_delta(raw_out.detach())   # [B, 4] rad
+        mae = (delta_pred_rad - delta_gt_rad).abs().mean(dim=0).cpu().numpy()
         total_mae += mae
         n_batches += 1
 
@@ -79,6 +89,7 @@ def validate(model, dataloader, criterion, config):
     total_loss = 0.0
     total_mae = np.zeros(4)
     n_batches = 0
+    use_sincos = getattr(model, 'use_sincos_output', False)
 
     for batch in tqdm(dataloader, desc="Validating"):
         rgb = batch["rgb"].to(config.device)
@@ -87,12 +98,17 @@ def validate(model, dataloader, criterion, config):
         excavator_id = batch["excavator_id"].to(config.device)
         action_gt = batch["action"].to(config.device)
 
-        delta_pred = model(rgb, elevation, qpos, excavator_id)
-        delta_gt   = action_gt.squeeze(1)
-        loss       = criterion(delta_pred, delta_gt)
+        raw_out = model(rgb, elevation, qpos, excavator_id)
+        delta_gt_rad = action_gt.squeeze(1)
+        if use_sincos:
+            target = _delta_to_sincos(delta_gt_rad)
+        else:
+            target = delta_gt_rad
+        loss = criterion(raw_out, target)
 
         total_loss += loss.item()
-        mae = (delta_pred - delta_gt).abs().mean(dim=0).cpu().numpy()
+        delta_pred_rad = model.decode_delta(raw_out)
+        mae = (delta_pred_rad - delta_gt_rad).abs().mean(dim=0).cpu().numpy()
         total_mae += mae
         n_batches += 1
 

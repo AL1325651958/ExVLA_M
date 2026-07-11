@@ -160,15 +160,22 @@ class ExcavatorVLAYolo(nn.Module):
         dropout: float = 0.1,
         pretrained: bool = True,
         num_excavators: int = 4,
+        use_sincos_output: bool = True,  # output [sin,cos] instead of raw rad
+        qpos_mode: str = "modulation",    # "none" | "modulation" (aux) | "transformer" (inject into tokens)
+        qpos_drop_prob: float = 0.3,      # randomly drop qpos during training
     ):
         super().__init__()
         self.seq_len = seq_len
         self.hidden_dim = hidden_dim
         self.img_size = img_size
+        self.use_sincos_output = use_sincos_output
+        self.qpos_mode = qpos_mode
+        self.qpos_drop_prob = qpos_drop_prob
+        out_dim = 8 if use_sincos_output else 4
 
         # ── Spatial backbone ──
-        grid_size = img_size // 32  # 224 → 7, 384 → 12
-        grid_dim_raw = 1024          # RGB(512) + Elev(512)
+        grid_size = img_size // 32
+        grid_dim_raw = 1024
         self.grid_size = grid_size
         self.grid_dim_raw = grid_dim_raw
         self.spatial_net = TwoStreamGrid(pretrained=pretrained)
@@ -176,11 +183,20 @@ class ExcavatorVLAYolo(nn.Module):
         # ── Grid → token projection ──
         self.grid_proj = nn.Linear(grid_dim_raw, hidden_dim)
 
-        # ── Proprioception projector ──
-        self.qpos_proj = nn.Sequential(
-            nn.Linear(4, hidden_dim // 4), nn.GELU(),
-            nn.Linear(hidden_dim // 4, hidden_dim),
-        )
+        # ── Proprioception (auxiliary, training only) ──
+        if qpos_mode == "modulation":
+            # Small MLP: qpos → residual correction at head level
+            self.qpos_mod = nn.Sequential(
+                nn.Linear(4, 32), nn.GELU(), nn.Linear(32, out_dim),
+            )
+        elif qpos_mode == "transformer":
+            # Project qpos into token space
+            self.qpos_proj = nn.Sequential(
+                nn.Linear(4, hidden_dim // 4), nn.GELU(),
+                nn.Linear(hidden_dim // 4, hidden_dim),
+            )
+        else:
+            self.qpos_mod = None   # "none" — pure vision
 
         # ── Excavator ID embedding ──
         self.excv_embed = nn.Embedding(num_excavators, hidden_dim)
@@ -202,7 +218,7 @@ class ExcavatorVLAYolo(nn.Module):
         self.delta_head = nn.Sequential(
             nn.Linear(hidden_dim, 256), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(256, 128), nn.GELU(), nn.Dropout(dropout * 0.5),
-            nn.Linear(128, 4),
+            nn.Linear(128, out_dim),
         )
 
         self._init_weights()
@@ -217,9 +233,32 @@ class ExcavatorVLAYolo(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
         nn.init.normal_(self.excv_embed.weight, mean=0.0, std=0.02)
+        if self.qpos_mode == "modulation":
+            for module in self.qpos_mod:
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight, gain=0.1)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+        elif self.qpos_mode == "transformer":
+            for module in self.qpos_proj:
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight, gain=0.5)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+
+    def decode_delta(self, raw: torch.Tensor) -> torch.Tensor:
+        """Convert model output to radians.  If sin/cos, do atan2; else identity."""
+        if self.use_sincos_output:
+            sin, cos = raw.chunk(2, dim=-1)
+            return torch.atan2(sin, cos)
+        return raw
 
     def forward(self, rgb, elevation, qpos=None, excavator_id=None):
-        """Returns delta [B, 4]."""
+        """
+        Returns:
+            raw [B, out_dim]: if sincos → [sin,cos]×4, else raw radians
+            Use decode_delta(raw) to get radians.
+        """
         B, T = rgb.shape[:2]
         H, W = rgb.shape[3], rgb.shape[4]
         G = self.grid_size  # grid size (e.g. 7)
@@ -234,9 +273,13 @@ class ExcavatorVLAYolo(nn.Module):
         grid = self.grid_proj(grid)                              # [B*T, G, G, D]
         grid = grid.view(B, T, G, G, D)                          # [B, T, G, G, D]
 
-        # ── Step 2: Add proprioception (per-frame, per-grid-cell) ──
-        if qpos is not None:
-            qpos_feat = self.qpos_proj(qpos)                     # [B, T, D]
+        # ── Step 2: qpos injection (transformer mode, training only) ──
+        if self.qpos_mode == "transformer" and qpos is not None and self.training:
+            if self.qpos_drop_prob > 0:
+                mask = (torch.rand(B, 1, 1, 1, 1, device=qpos.device) > self.qpos_drop_prob).float()
+            else:
+                mask = 1.0
+            qpos_feat = self.qpos_proj(qpos) * mask              # [B, T, D]
             grid = grid + qpos_feat.unsqueeze(2).unsqueeze(2)    # broadcast over grid
 
         # ── Step 3: Position encoding ──
@@ -258,7 +301,16 @@ class ExcavatorVLAYolo(nn.Module):
 
         # ── Step 8: CLS readout → delta ──
         cls_feat = encoded[:, 0, :]                              # [B, D]
-        delta = self.delta_head(cls_feat)                        # [B, 4]
+        delta = self.delta_head(cls_feat)                        # [B, out_dim]
+
+        # ── Step 9: qpos modulation residual (training only) ──
+        if self.qpos_mode == "modulation" and qpos is not None and self.training:
+            qpos_last = qpos[:, -1, :]                           # [B, 4]  last frame qpos delta ref
+            correction = self.qpos_mod(qpos_last)                 # [B, out_dim]
+            if self.qpos_drop_prob > 0:
+                mask = (torch.rand(B, 1, device=qpos.device) > self.qpos_drop_prob).float()
+                correction = correction * mask
+            delta = delta + correction
 
         return delta
 
