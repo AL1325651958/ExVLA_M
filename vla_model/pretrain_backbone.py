@@ -1,148 +1,215 @@
 """
 Load YOLOv5s pretrained backbone weights into our CSPDarknet.
-Run once on the server to generate a pretrained checkpoint, then use in training.
+Run ONCE on the server — generates a pretrained checkpoint for training.
+
+Strategy: create a minimal stub package so pickle can deserialize yolov5s.pt
+without needing the full yolov5 repo (no network, no clone, no pip install).
 """
+import os, sys
+from pathlib import Path
+
+# ── Step 0: create stub package (if not already present) ──────────────────
+_STUB_DIR = Path(__file__).resolve().parent / "_yolo_stub"
+_STUB_DIR.mkdir(exist_ok=True)
+
+(_STUB_DIR / "models").mkdir(exist_ok=True)
+(_STUB_DIR / "models" / "__init__.py").touch(exist_ok=True)
+(_STUB_DIR / "models" / "experimental.py").write_text("def attempt_load(*a,**k): pass\n")
+(_STUB_DIR / "utils").mkdir(exist_ok=True)
+(_STUB_DIR / "utils" / "__init__.py").touch(exist_ok=True)
+
+# models/common.py  —  classes pickle will encounter
+(_STUB_DIR / "models" / "common.py").write_text("""
+import torch.nn as nn
+class Conv(nn.Module):
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
+        super().__init__()
+class Bottleneck(nn.Module):
+    def __init__(self, c1, c2, shortcut=True, g=1, e=0.5):
+        super().__init__()
+class BottleneckCSP(nn.Module):
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        super().__init__()
+class C3(nn.Module):
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        super().__init__()
+class SPPF(nn.Module):
+    def __init__(self, c1, c2, k=5):
+        super().__init__()
+class Concat(nn.Module):
+    def __init__(self, dimension=1):
+        super().__init__()
+class Detect(nn.Module):
+    def __init__(self, nc=80, anchors=()):
+        super().__init__()
+class GhostConv(nn.Module):
+    def __init__(self, c1, c2, k=1, s=1, g=1, act=True):
+        super().__init__()
+class GhostBottleneck(nn.Module):
+    def __init__(self, c1, c2, k=3, s=1):
+        super().__init__()
+class DWConv(Conv):
+    pass
+class Focus(nn.Module):
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):
+        super().__init__()
+class Contract(nn.Module):
+    def __init__(self, gain=2):
+        super().__init__()
+class Expand(nn.Module):
+    def __init__(self, gain=2):
+        super().__init__()
+class TransformerLayer(nn.Module):
+    def __init__(self, c1, c2, num_heads=8):
+        super().__init__()
+""")
+
+# models/yolo.py
+(_STUB_DIR / "models" / "yolo.py").write_text("""
+import torch.nn as nn
+class Model(nn.Module):
+    def __init__(self, cfg='yolov5s.yaml', ch=3, nc=None):
+        super().__init__()
+class DetectionModel(nn.Module):
+    def __init__(self, cfg='yolov5s.yaml', ch=3, nc=None):
+        super().__init__()
+""")
+
+# utils/ stuff (some checkpoints reference it)
+(_STUB_DIR / "utils" / "general.py").write_text("def check_version(*a,**k): pass\n")
+(_STUB_DIR / "utils" / "loss.py").write_text("class FocalLoss: pass\n")
+(_STUB_DIR / "utils" / "activations.py").write_text("class SiLU: pass\n")
+(_STUB_DIR / "utils" / "metrics.py").write_text("def fitness(*a,**k): return 0\n")
+
+sys.path.insert(0, str(_STUB_DIR))
+
+
+# ── Step 1: load checkpoint ───────────────────────────────────────────────
 import torch
 import torch.nn as nn
+
 from model_yolo import ExcavatorVLAYolo
-import warnings
-warnings.filterwarnings("ignore")
 
 _MODEL_CFG = dict(seq_len=8, img_size=224, hidden_dim=768, n_heads=12,
                    n_layers=6, ff_dim=3072, dropout=0.1, num_excavators=4)
 
 
-def load_yolo_backbone(checkpoint_path="yolov5s.pt"):
-    """Load YOLOv5s checkpoint and extract backbone state_dict.
-    Uses torch.hub (only yolov5s, no extra download like ultralytics.YOLO does).
-    """
-    print("Loading YOLOv5s via torch.hub...")
-    import sys
-    old_stdout = sys.stdout
-    sys.stdout = open('/dev/null', 'w')
-    model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True, verbose=False)
-    sys.stdout.close()
-    sys.stdout = old_stdout
-    yolo_state = {k: v.float() for k, v in model.state_dict().items()}
-    print(f"  YOLO keys: {len(yolo_state)} total")
-    return yolo_state
+def load_yolov5s(checkpoint_path="yolov5s.pt"):
+    """Load the raw YOLOv5s checkpoint with stub modules."""
+    print(f"Loading {checkpoint_path} ...")
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    print(f"  keys: {list(ckpt.keys())}")
+
+    # YOLOv5 saves the full model in ckpt['model']; extract state_dict
+    if "model" in ckpt:
+        model_obj = ckpt["model"]
+        if hasattr(model_obj, "state_dict"):
+            state = {k: v.float() for k, v in model_obj.state_dict().items()}
+        else:
+            state = {k: v.float() for k, v in model_obj.float().items()}
+    else:
+        state = {k: v.float() for k, v in ckpt.items()}
+
+    print(f"  {len(state)} weight tensors extracted")
+    return state
 
 
-class BackboneLoader:
-    """Map YOLOv5s backbone weights → our CSPDarknet keys."""
-
-    _YOLO_TO_OUR = {
-        # YOLOv5s stem [model.0] → our stem
-        "model.0.conv.weight": "rgb_backbone.stem.conv.weight",
-        "model.0.bn.weight": "rgb_backbone.stem.bn.weight",
-        "model.0.bn.bias": "rgb_backbone.stem.bn.bias",
-        "model.0.bn.running_mean": "rgb_backbone.stem.bn.running_mean",
-        "model.0.bn.running_var": "rgb_backbone.stem.bn.running_var",
-        "model.0.bn.num_batches_tracked": "rgb_backbone.stem.bn.num_batches_tracked",
-
-        # Stage 1 down [model.1] → s1_down
-        "model.1.conv.weight": "rgb_backbone.s1_down.conv.weight",
-        "model.1.bn.weight": "rgb_backbone.s1_down.bn.weight",
-        "model.1.bn.bias": "rgb_backbone.s1_down.bn.bias",
-        "model.1.bn.running_mean": "rgb_backbone.s1_down.bn.running_mean",
-        "model.1.bn.running_var": "rgb_backbone.s1_down.bn.running_var",
-        "model.1.bn.num_batches_tracked": "rgb_backbone.s1_down.bn.num_batches_tracked",
-    }
-
-    _YOLO_CSP_PREFIXES = {
-        "model.2": "s1_csp",     # index 2 → stage1 CSP
-        "model.4": "s2_csp",     # index 4 → stage2 CSP
-        "model.6": "s3_csp",     # index 6 → stage3 CSP
-        "model.9": "s4_csp",     # index 9 → stage4 CSP
-    }
-
-    # Downsample convs between CSP blocks
-    _YOLO_DOWN = {
-        "model.3": "s2_down",   # index 3 → s2_down
-        "model.5": "s3_down",   # index 5 → s3_down
-        "model.7": "s4_down",   # index 7 → s4_down
-    }
-
-    def __init__(self, our_model):
-        self.model = our_model
-        self.state = self.model.state_dict()
-
-    def _copy_tensor(self, our_key, yolo_state, yolo_key):
-        if yolo_key in yolo_state and our_key in self.state:
-            w = yolo_state[yolo_key]
-            if self.state[our_key].shape == w.shape:
-                self.state[our_key].copy_(w)
-                return True
-        return False
-
-    def _copy_csp(self, csp_prefix, yolo_prefix, yolo_csp_idx, yolo_state):
-        """Copy all weights from a YOLO CSP block to our CSPLayer."""
-        # cv1, cv2, cv3: 1x1 convs
-        for i_conv, name in [(0, "cv1"), (1, "cv2"), (2, "cv3")]:
-            yk = f"model.{yolo_csp_idx}.cv{i_conv+1}.conv.weight"
-            ok = f"rgb_backbone.{csp_prefix}.{name}.conv.weight"
-            self._copy_tensor(ok, yolo_state, yk)
-            for bn_attr in ["weight", "bias", "running_mean", "running_var", "num_batches_tracked"]:
-                self._copy_tensor(ok.replace(".conv.weight", f".bn.{bn_attr}"),
-                                  yolo_state, yk.replace(".conv.weight", f".bn.{bn_attr}"))
-
-        # Internal blocks: YOLO has m.0.cv1, m.0.cv2 → our blocks.0
-        for b_idx in range(3):  # max 3 internal blocks
-            for c_idx, conv_name in [(1, "cv1"), (2, "cv2")]:
-                yk = f"model.{yolo_csp_idx}.m.{b_idx}.cv{c_idx}.conv.weight"
-                ok = f"rgb_backbone.{csp_prefix}.blocks.{b_idx}.conv.weight" if conv_name == "cv1" else None
-                # YOLO internal blocks are BottleneckCSP → skip complex mapping for now
-                # Just try simple conv → conv mapping
-                ok_simple = f"rgb_backbone.{csp_prefix}.blocks.{b_idx}.conv.weight"
-                self._copy_tensor(ok_simple, yolo_state, yk)
-
-    def _copy_down(self, csp_prefix, yolo_idx, yolo_state):
-        yk = f"model.{yolo_idx}.conv.weight"
-        ok = f"rgb_backbone.{csp_prefix}.conv.weight"
-        self._copy_tensor(ok, yolo_state, yk)
-        for bn_attr in ["weight", "bias", "running_mean", "running_var", "num_batches_tracked"]:
-            self._copy_tensor(ok.replace(".conv.weight", f".bn.{bn_attr}"),
-                              yolo_state, yk.replace(".conv.weight", f".bn.{bn_attr}"))
-
-    def load(self, yolo_state):
-        loaded = 0
-        # Stem + first stage
-        for yk, ok in self._YOLO_TO_OUR.items():
-            if self._copy_tensor(ok, yolo_state, yk):
-                loaded += 1
-
-        # CSP blocks
-        for yolo_prefix, csp_name in self._YOLO_CSP_PREFIXES.items():
-            yolo_idx = int(yolo_prefix.split(".")[1])
-            self._copy_csp(csp_name, yolo_prefix, yolo_idx, yolo_state)
-
-        # Downsample convs
-        for yolo_prefix, down_name in self._YOLO_DOWN.items():
-            yolo_idx = int(yolo_prefix.split(".")[1])
-            self._copy_down(down_name, yolo_idx, yolo_state)
-
-        # Copy RGB backbone to Elevation backbone
-        for key in list(self.state.keys()):
-            if key.startswith("rgb_backbone."):
-                elev_key = key.replace("rgb_backbone.", "elev_backbone.")
-                if elev_key in self.state:
-                    self.state[elev_key].copy_(self.state[key])
-
-        self.model.load_state_dict(self.state, strict=False)
-        print(f"  Loaded {loaded} exact matches + CSP blocks → RGB & Elevation backbones")
-        return self.model
+# ── Step 2: map YOLO keys → our CSPDarknet keys ───────────────────────────
+def map_conv(yolo_prefix, our_prefix, yolo_state, our_state):
+    """Map a ConvBNSiLU block: conv.weight, bn.weight/bias/running_mean/running_var, bn.num_batches_tracked"""
+    loaded = 0
+    for yk, ok in [
+        (f"{yolo_prefix}.conv.weight", f"{our_prefix}.conv.weight"),
+        (f"{yolo_prefix}.bn.weight", f"{our_prefix}.bn.weight"),
+        (f"{yolo_prefix}.bn.bias", f"{our_prefix}.bn.bias"),
+        (f"{yolo_prefix}.bn.running_mean", f"{our_prefix}.bn.running_mean"),
+        (f"{yolo_prefix}.bn.running_var", f"{our_prefix}.bn.running_var"),
+        (f"{yolo_prefix}.bn.num_batches_tracked", f"{our_prefix}.bn.num_batches_tracked"),
+    ]:
+        if yk in yolo_state and ok in our_state and yolo_state[yk].shape == our_state[ok].shape:
+            our_state[ok].copy_(yolo_state[yk])
+            loaded += 1
+    return loaded
 
 
+def map_csp(yolo_idx, csp_name, yolo_state, our_state):
+    """Map a whole CSPLayer: cv1, cv2, cv3 (+ BN), internal blocks."""
+    loaded = 0
+    prefix_our = f"rgb_backbone.{csp_name}"
+    prefix_yolo = f"model.{yolo_idx}"
+
+    # cv1, cv2, cv3: three 1x1 convs
+    for cv_num in [1, 2, 3]:
+        loaded += map_conv(f"{prefix_yolo}.cv{cv_num}", f"{prefix_our}.cv{cv_num}",
+                           yolo_state, our_state)
+
+    # Internal blocks: model.{idx}.m.{b}.cv1 / cv2  →  our blocks.{b}
+    for b in range(3):
+        our_blk = f"{prefix_our}.blocks.{b}"
+        yolo_blk = f"{prefix_yolo}.m.{b}"
+        # Try cv1 (1x1) → our block's conv
+        if f"{yolo_blk}.cv1.conv.weight" in yolo_state:
+            loaded += map_conv(f"{yolo_blk}.cv1", our_blk, yolo_state, our_state)
+        elif f"{yolo_blk}.cv2.conv.weight" in yolo_state:
+            loaded += map_conv(f"{yolo_blk}.cv2", our_blk, yolo_state, our_state)
+
+    return loaded
+
+
+def map_down(yolo_idx, down_name, yolo_state, our_state):
+    """Map a downsampling conv: model.{idx} → rgb_backbone.{down_name}"""
+    return map_conv(f"model.{yolo_idx}", f"rgb_backbone.{down_name}", yolo_state, our_state)
+
+
+# ── Step 3: main ──────────────────────────────────────────────────────────
 def main():
-    model = ExcavatorVLAYolo(**_MODEL_CFG)
-    yolo_state = load_yolo_backbone("yolov5s.pt")
-    loader = BackboneLoader(model)
-    loader.load(yolo_state)
+    yolo_state = load_yolov5s("yolov5s.pt")
 
-    out_path = "output/checkpoints/yolo_backbone_pretrained.pt"
-    torch.save({"model_state_dict": model.state_dict(), "description": "CSPDarknet backbone from YOLOv5s"}, out_path)
-    print(f"\nSaved pretrained backbone to: {out_path}")
-    print("Use: python vla_model/train_yolo.py --resume output/checkpoints/yolo_backbone_pretrained.pt")
+    model = ExcavatorVLAYolo(**_MODEL_CFG)
+    our_state = model.state_dict()
+
+    loaded = 0
+
+    # Stem: model.0 → rgb_backbone.stem
+    loaded += map_conv("model.0", "rgb_backbone.stem", yolo_state, our_state)
+
+    # Stage 1: model.1 = s1_down, model.2 = s1_csp
+    loaded += map_down(1, "s1_down", yolo_state, our_state)
+    loaded += map_csp(2, "s1_csp", yolo_state, our_state)
+
+    # Stage 2: model.3 = s2_down, model.4 = s2_csp
+    loaded += map_down(3, "s2_down", yolo_state, our_state)
+    loaded += map_csp(4, "s2_csp", yolo_state, our_state)
+
+    # Stage 3: model.5 = s3_down, model.6 = s3_csp
+    loaded += map_down(5, "s3_down", yolo_state, our_state)
+    loaded += map_csp(6, "s3_csp", yolo_state, our_state)
+
+    # Stage 4: model.7 = s4_down, model.9 = s4_csp  (YOLOv5s: model.8 = C3, model.9 = SPPF)
+    loaded += map_down(7, "s4_down", yolo_state, our_state)
+    # model.9 in YOLOv5s is SPPF (not CSP) — skip or try partial
+    loaded += map_csp(9, "s4_csp", yolo_state, our_state)
+
+    # Copy RGB backbone → Elevation backbone
+    for key in list(our_state.keys()):
+        if key.startswith("rgb_backbone."):
+            elev_key = key.replace("rgb_backbone.", "elev_backbone.")
+            if elev_key in our_state:
+                our_state[elev_key].copy_(our_state[key])
+
+    model.load_state_dict(our_state, strict=False)
+    print(f"\n  {loaded} weight tensors mapped → RGB & Elevation backbones")
+
+    # Save
+    out_dir = Path("output/checkpoints")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "yolo_backbone_pretrained.pt"
+    torch.save({
+        "model_state_dict": model.state_dict(),
+        "description": "CSPDarknet backbone from YOLOv5s",
+    }, out_path)
+    print(f"Saved → {out_path}")
+    print(f"\nUse: python vla_model/train_yolo.py --resume {out_path}")
 
 
 if __name__ == "__main__":
