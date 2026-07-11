@@ -81,14 +81,14 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch):
             # 3. Diversity: minimize overlap between region spatial patterns
             K = masks_spatial.size(1)
             mf = masks_spatial.reshape(masks_spatial.size(0), K, -1)  # [B, K, T*G*G]
-            overlap = torch.bmm(mf, mf.transpose(1, 2))               # [B, K, K]
+            overlap = torch.bmm(mf, mf.transpose(1, 2)) / mf.size(-1)  # [B,K,K] normed
             eye = torch.eye(K, device=masks_spatial.device).unsqueeze(0)
-            off_diag = overlap * (1 - eye)
-            diversity_loss = 0.02 * off_diag.sum(dim=(-2, -1)).mean()
+            off_diag = (overlap * (1 - eye)).pow(2)
+            diversity_loss = 0.5 * off_diag.sum(dim=(-2, -1)).mean()
 
             # 4. Temporal smoothness: adjacent-frame masks should change slowly
             temp_diff = (masks_spatial[:, :, 1:] - masks_spatial[:, :, :-1]).abs().mean()
-            temp_loss = 0.01 * temp_diff
+            temp_loss = 0.02 * temp_diff
 
             loss = pred_loss + sparsity_loss + diversity_loss + temp_loss
 
