@@ -274,15 +274,14 @@ def main():
     curve_h = CURVE_H_PER_JOINT * 4
 
     if not args.no_masks:
-        # Layout: [ Main RGB | Mask 0 | Mask 1 ]
-        #         [   Elev   | Mask 2 | Mask 3 ]
-        #         [       Curves                ]
         mask_w = MASK_W
+        mask_h = MASK_H
         img_row_w = MAIN_W + 2 * mask_w
         top_h = MAIN_H + ELEV_H + PAD
     else:
         img_row_w = MAIN_W + ELEV_W
         mask_w = 0
+        mask_h = 0
         top_h = MAIN_H
 
     title_h = 30
@@ -311,11 +310,6 @@ def main():
                 mask_panels.append(panel)
 
             top_row = np.concatenate([main_rgb] + mask_panels[:2], axis=1)
-            bot_row = np.concatenate(
-                [resize_keep_aspect(elev, mask_w, mask_h) if k == 0 else mask_panels[k + 1]
-                 for k in range(-1, 1)], axis=1
-            )
-            # Actually: [Elev | Mask2 | Mask3]
             bot_row = np.concatenate([elev, mask_panels[2], mask_panels[3]], axis=1)
             top_section = np.concatenate([top_row, bot_row], axis=0)
         else:
