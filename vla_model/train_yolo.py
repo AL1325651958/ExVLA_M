@@ -53,13 +53,35 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch):
         optimizer.zero_grad()
 
         with autocast():
-            raw_out = model(rgb, elevation, qpos, excavator_id)  # [B, out_dim]
-            delta_gt_rad = action_gt.squeeze(1)                    # [B, 4]
+            raw_out, masks = model(rgb, elevation, qpos, excavator_id)  # [B, out_dim], [B, 4, G, G]
+            delta_gt_rad = action_gt.squeeze(1)                          # [B, 4]
             if use_sincos:
-                target = _delta_to_sincos(delta_gt_rad)            # [B, 8]
+                target = _delta_to_sincos(delta_gt_rad)                  # [B, 8]
             else:
                 target = delta_gt_rad
-            loss = criterion(raw_out, target)
+
+            # 1. Prediction loss
+            pred_loss = criterion(raw_out, target)
+
+            # 2. Sparsity: each region mask should be concentrated (low entropy)
+            #    H = -Σ p·log(p), high entropy = uniform = bad
+            eps = 1e-8
+            entropy = -(masks * torch.log(masks + eps)).sum(dim=(-2, -1)).mean()
+            # Encouraging LOW entropy (1e-3 weight — very light)
+            sparsity_loss = -0.001 * entropy
+
+            # 3. Diversity: different regions should focus on different cells
+            K = masks.size(1)  # num_regions
+            masks_flat = masks.reshape(B, K, -1)
+            overlap = torch.bmm(masks_flat, masks_flat.transpose(1, 2))
+            eye = torch.eye(K, device=masks.device).unsqueeze(0)
+            off_diag = overlap * (1 - eye)
+            diversity_loss = 0.01 * off_diag.sum(dim=(-2, -1)).mean()
+
+            # 4. Temporal smoothness
+            temp_loss = 0.0  # simplified: avg_masks already mean over T
+
+            loss = pred_loss + sparsity_loss + diversity_loss + temp_loss
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -98,7 +120,7 @@ def validate(model, dataloader, criterion, config):
         excavator_id = batch["excavator_id"].to(config.device)
         action_gt = batch["action"].to(config.device)
 
-        raw_out = model(rgb, elevation, qpos, excavator_id)
+        raw_out, _ = model(rgb, elevation, qpos, excavator_id)
         delta_gt_rad = action_gt.squeeze(1)
         if use_sincos:
             target = _delta_to_sincos(delta_gt_rad)

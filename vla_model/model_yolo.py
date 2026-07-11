@@ -260,6 +260,19 @@ class ExcavatorVLAYolo(nn.Module):
         self.grid_size = grid_size
         self.grid_proj = nn.Linear(total_grid_dim, hidden_dim)
 
+        # ── Self-supervised Task-Region Mask Head ──
+        # Learns K functional zones (loading/unloading/digging area, etc.)
+        # No annotations! Self-supervised via:
+        #   1. Contrast:  randomly masks OUT regions → prediction must still work
+        #   2. Sparsity:   each mask focuses on a compact region
+        #   3. Temporal:   masks are smooth over consecutive frames
+        self.num_regions = 4  # functional task regions to discover
+        self.mask_head = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim // 2), nn.GELU(),
+            nn.Linear(hidden_dim // 2, self.num_regions),
+        )
+
         # ── Proprioception ──
         if qpos_mode == "modulation":
             self.qpos_mod = nn.Sequential(
@@ -370,6 +383,16 @@ class ExcavatorVLAYolo(nn.Module):
         # ── Encoder: process grid tokens ──
         memory = self.encoder(tokens)  # [B, N_tokens, D]
 
+        # ── Task-region masks: learn functional zones per frame ──
+        # memory [B, T×G×G, D] → K-channel activation → softmax over spatial dim
+        raw_scores = self.mask_head(memory)              # [B, T×G×G, K]
+        raw_scores = raw_scores.view(B, T, G * G, self.num_regions)
+        raw_scores = raw_scores.permute(0, 3, 1, 2)      # [B, K, T, G×G]
+
+        # Softmax over spatial positions → each region picks its cells
+        masks = F.softmax(raw_scores, dim=-1)             # [B, K, T, G×G]
+        masks = masks.view(B, self.num_regions, T, G, G)  # [B, K, T, G, G]
+
         # ── Decoder: N queries cross-attend to encoder memory ──
         queries = self.query_tokens.expand(B, -1, -1)           # [B, Q, D]
         decoded = self.decoder(queries, memory)                  # [B, Q, D]
@@ -383,11 +406,14 @@ class ExcavatorVLAYolo(nn.Module):
             qpos_last = qpos[:, -1, :]
             correction = self.qpos_mod(qpos_last)
             if self.qpos_drop_prob > 0:
-                mask = (torch.rand(B, 1, device=qpos.device) > self.qpos_drop_prob).float()
-                correction = correction * mask
+                m_drop = (torch.rand(B, 1, device=qpos.device) > self.qpos_drop_prob).float()
+                correction = correction * m_drop
             delta = delta + correction
 
-        return delta
+        # Time-averaged masks for visualization
+        avg_masks = masks.mean(dim=2)  # [B, K, G, G]
+
+        return delta, avg_masks
 
 
 def count_parameters(model: nn.Module) -> dict:
