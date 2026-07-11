@@ -149,25 +149,54 @@ def main():
     print(f"Loading: {args.checkpoint}")
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     state_dict = ckpt["model_state_dict"]
+    sd_keys = set(state_dict.keys())
+
+    # ── Detect checkpoint version ──
+    is_v2 = any("delta_head" in k for k in sd_keys)       # V2: single shared head
+    is_v3 = any("action_head" in k for k in sd_keys)      # V3-V4: action_head (shared)
+    is_v5 = any("action_heads" in k for k in sd_keys)     # V5: per-excavator heads
+    version_label = "V2" if is_v2 else "V3/V4" if is_v3 else "V5"
+    print(f"  Detected checkpoint version: {version_label}")
+
+    # ── Remap old keys → V5 format (action_heads, qpos_mods) ──
+    remapped = {}
+    for k, v in list(state_dict.items()):
+        if is_v2 and "delta_head" in k:
+            # V2 delta_head → V5 action_heads.0 (single head, copied to all slots)
+            for eid in range(4):
+                remapped[k.replace("delta_head", f"action_heads.{eid}")] = v.clone()
+        elif is_v3 and "action_head" in k:
+            for eid in range(4):
+                remapped[k.replace("action_head", f"action_heads.{eid}")] = v.clone()
+        elif is_v2 and "qpos_mod." in k:
+            for eid in range(4):
+                remapped[k.replace("qpos_mod.", f"qpos_mods.{eid}.")] = v.clone()
+        elif is_v3 and "qpos_mod." in k:
+            for eid in range(4):
+                remapped[k.replace("qpos_mod.", f"qpos_mods.{eid}.")] = v.clone()
+    state_dict.update(remapped)
 
     # Auto-detect model config from state_dict
-    sd_keys = set(state_dict.keys())
-    # hidden_dim from encoder first layer
     hidden_dim = state_dict.get("encoder.layers.0.self_attn.in_proj_weight",
                                  state_dict.get("encoder.layers.0.linear1.weight")).shape[1]
     n_heads = 8
-    # n_layers: count encoder layers
     enc_layer_idxs = set()
     for k in sd_keys:
         if k.startswith("encoder.layers."):
             idx = int(k.split(".")[2])
             enc_layer_idxs.add(idx)
     n_layers = max(enc_layer_idxs) + 1 if enc_layer_idxs else 4
-    # ff_dim
     ff_dim = state_dict.get(f"encoder.layers.0.linear1.weight").shape[0]
 
-    use_sincos_output = "qpos_mod.2.weight" in state_dict and state_dict["qpos_mod.2.weight"].shape[0] == 8
-    has_qpos_mod = "qpos_mod.0.weight" in state_dict
+    has_qpos_mod = any("qpos_mod" in k for k in sd_keys)
+
+    use_sincos_output = False
+    for prefix in ["qpos_mods.0.2.weight", "qpos_mod.2.weight",
+                   "action_heads.0.3.weight", "action_head.3.weight",
+                   "delta_head.3.weight"]:
+        if prefix in state_dict and state_dict[prefix].shape[0] == 8:
+            use_sincos_output = True
+            break
 
     print(f"  Detected: hidden_dim={hidden_dim}, n_layers={n_layers}, ff_dim={ff_dim}, "
           f"sincos_output={use_sincos_output}")
@@ -250,12 +279,19 @@ def main():
         qpos_seq = torch.from_numpy(qpos[start:end]).unsqueeze(0).to(device)
 
         with torch.no_grad():
-            raw_out, masks_avg, _ = model(rgb_seq, elev_seq, qpos_seq, excv_tensor)
+            outputs = model(rgb_seq, elev_seq, qpos_seq, excv_tensor)
+            # V2/V3: (action, masks) — 2 outputs; V4/V5: (action, avg, spatial) — 3 outputs
+            raw_out = outputs[0]
+            masks_data = outputs[1]  # [1, 4, G, G] avg mask
 
         tgt_idx = start + T - 1
-        action_pred = model.decode_action(raw_out)[0].cpu().numpy()  # [4]
+        # V2: decode_delta, V3+: decode_action
+        if hasattr(model, 'decode_action'):
+            action_pred = model.decode_action(raw_out)[0].cpu().numpy()
+        else:
+            action_pred = model.decode_delta(raw_out)[0].cpu().numpy()
         predictions[tgt_idx] = action_pred
-        all_masks[tgt_idx] = masks_avg[0].cpu().numpy()  # [4, G, G]
+        all_masks[tgt_idx] = masks_data[0].cpu().numpy()  # [4, G, G]
 
     # ── MAE ──
     valid = ~np.isnan(predictions[:, 0])
