@@ -65,7 +65,7 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch):
         optimizer.zero_grad()
 
         with autocast():
-            raw_out, masks = model(rgb, elevation, qpos, excavator_id)  # [B, out_dim], [B, 4, G, G]
+            raw_out, masks_avg, masks_spatial = model(rgb, elevation, qpos, excavator_id)
             action_gt_rad = action_gt.squeeze(1)                          # [B, 4]
             if use_sincos:
                 target = _delta_to_sincos(action_gt_rad)                  # [B, 8]
@@ -75,22 +75,23 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch):
             # 1. Prediction loss
             pred_loss = criterion(raw_out, target)
 
-            # 2. Sparsity: each region mask should be concentrated (LOW entropy)
-            #    Penalize high entropy → encourages peaked masks
-            eps = 1e-8
-            entropy = -(masks * torch.log(masks + eps)).sum(dim=(-2, -1)).mean()
-            sparsity_loss = 0.1 * entropy
+            # 2. Sparsity: penalise mask activations → few positions activated per region
+            #    L1 on sigmoid outputs: ~0 when focused, large when activations spread
+            sparsity_loss = 0.05 * masks_spatial.mean()
 
-            # 3. Diversity: different regions should focus on different cells
-            K = masks.size(1)  # num_regions
-            masks_flat = masks.reshape(masks.size(0), K, -1)
-            overlap = torch.bmm(masks_flat, masks_flat.transpose(1, 2))
-            eye = torch.eye(K, device=masks.device).unsqueeze(0)
+            # 3. Diversity: minimize overlap between region spatial patterns
+            #    masks_spatial: [B, K, T, G, G] → flatten to [B, K, T*G*G]
+            K = masks_spatial.size(1)
+            mf = masks_spatial.reshape(masks_spatial.size(0), K, -1)  # [B, K, T*G*G]
+            overlap = torch.bmm(mf, mf.transpose(1, 2))               # [B, K, K]
+            eye = torch.eye(K, device=masks_spatial.device).unsqueeze(0)
             off_diag = overlap * (1 - eye)
-            diversity_loss = 0.01 * off_diag.sum(dim=(-2, -1)).mean()
+            diversity_loss = 0.05 * off_diag.sum(dim=(-2, -1)).mean()
 
-            # 4. Temporal smoothness
-            temp_loss = 0.0  # simplified: avg_masks already mean over T
+            # 4. Temporal smoothness: adjacent-frame masks should change slowly
+            #    masks_spatial: [B, K, T, G, G]
+            temp_diff = (masks_spatial[:, :, 1:] - masks_spatial[:, :, :-1]).abs().mean()
+            temp_loss = 0.02 * temp_diff
 
             loss = pred_loss + sparsity_loss + diversity_loss + temp_loss
 
@@ -145,7 +146,7 @@ def validate(model, dataloader, criterion, config):
         excavator_id = batch["excavator_id"].to(config.device)
         action_gt = batch["action"].to(config.device)
 
-        raw_out, _ = model(rgb, elevation, qpos, excavator_id)
+        raw_out, _, _ = model(rgb, elevation, qpos, excavator_id)
         action_gt_rad = action_gt.squeeze(1)
         if use_sincos:
             target = _delta_to_sincos(action_gt_rad)

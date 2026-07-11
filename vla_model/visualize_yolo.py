@@ -250,12 +250,12 @@ def main():
         qpos_seq = torch.from_numpy(qpos[start:end]).unsqueeze(0).to(device)
 
         with torch.no_grad():
-            raw_out, masks = model(rgb_seq, elev_seq, qpos_seq, excv_tensor)
+            raw_out, masks_avg, _ = model(rgb_seq, elev_seq, qpos_seq, excv_tensor)
 
         tgt_idx = start + T - 1
         action_pred = model.decode_action(raw_out)[0].cpu().numpy()  # [4]
         predictions[tgt_idx] = action_pred
-        all_masks[tgt_idx] = masks[0].cpu().numpy()  # [4, G, G]
+        all_masks[tgt_idx] = masks_avg[0].cpu().numpy()  # [4, G, G]
 
     # ── MAE ──
     valid = ~np.isnan(predictions[:, 0])
