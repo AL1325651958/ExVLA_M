@@ -288,7 +288,14 @@ class ExcavatorVLAYolo(nn.Module):
         gate = gate.clamp(min=0.02)
         gated_tokens = tokens * gate.unsqueeze(-1)
 
-        memory = self.encoder(gated_tokens)
+        # ── Causal mask for encoder self-attention ──
+        # Token at time t can only attend to tokens at time ≤ t.
+        # Within the same timestep: all G² spatial tokens see each other.
+        # -1e9 is amp-safe (fp16 inf can cause NaN in softmax denominator).
+        token_time = torch.arange(T * G * G, device=tokens.device) // (G * G)     # [N]
+        causal_mask = (token_time.unsqueeze(1) < token_time.unsqueeze(0)).float() * (-1e9)
+
+        memory = self.encoder(gated_tokens, mask=causal_mask)
 
         queries = self.query_tokens.expand(B, -1, -1)
         decoded = self.decoder(queries, memory)
