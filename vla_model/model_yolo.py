@@ -269,22 +269,24 @@ class ExcavatorVLAYolo(nn.Module):
         if excavator_id is not None:
             tokens = tokens + self.excv_embed(excavator_id).unsqueeze(1)
 
-        memory = self.encoder(tokens)
+        # ── Masks BEFORE encoder: causal gate on INPUT tokens ──
+        # mask_head sees position-aware tokens and selects useful spatial regions.
+        # Encoder is then forced to route information ONLY through selected tokens,
+        # which means masks must focus on task-relevant areas or prediction fails.
+        raw_scores = self.mask_head(tokens)  # [B, T*G^2, num_regions]
+        raw_scores = raw_scores.view(B, T * G * G, self.num_regions).permute(0, 2, 1)
+        masks = F.softmax(raw_scores / 0.1, dim=-1)  # [B, 4, T*G^2] — peaked per-region
+        masks_spatial = masks.view(B, self.num_regions, T, G, G)  # for return + loss
 
-        raw_scores = self.mask_head(memory)
-        raw_scores = raw_scores.view(B, T, G * G, self.num_regions).permute(0, 3, 1, 2)
-        # Temperature-scaled softmax: each mask is a peaked distribution over spatial grid
-        masks = F.softmax(raw_scores / 0.1, dim=-1).view(B, self.num_regions, T, G, G)
+        # Union gate: any token selected by ≥1 mask survives
+        gate = masks.sum(dim=1).clamp(0, 1)  # [B, T*G^2]
+        gated_tokens = tokens * gate.unsqueeze(-1)  # suppressed tokens → 0
 
-        # ── Causal gating: decoder can ONLY attend through mask-selected regions ──
-        # masks_flat: [B, 4, T*G^2], sum over masks → gate [B, T*G^2]
-        masks_flat = masks.reshape(B, self.num_regions, T * G * G)
-        gate = masks_flat.sum(dim=1).clamp(0, 1)  # [B, T*G^2]
-        # Tokens ignored by ALL masks → suppressed; tokens any mask selects → preserved
-        gated_memory = memory * gate.unsqueeze(-1)  # [B, T*G^2, D]
+        # Encoder can only mix information among mask-selected positions
+        memory = self.encoder(gated_tokens)
 
         queries = self.query_tokens.expand(B, -1, -1)
-        decoded = self.decoder(queries, gated_memory)
+        decoded = self.decoder(queries, memory)
         pool = decoded.mean(dim=1)
         action = self.action_head(pool)
 
@@ -294,7 +296,7 @@ class ExcavatorVLAYolo(nn.Module):
                 correction = correction * (torch.rand(B, 1, device=qpos.device) > self.qpos_drop_prob).float()
             action = action + correction
 
-        avg_masks = masks.mean(dim=2)
+        avg_masks = masks_spatial.mean(dim=2)
         return action, avg_masks
 
 
