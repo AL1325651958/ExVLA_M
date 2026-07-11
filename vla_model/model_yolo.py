@@ -150,7 +150,8 @@ class ExcavatorVLAYolo(nn.Module):
         self.use_sincos_output = use_sincos_output
         self.qpos_mode = qpos_mode
         self.qpos_drop_prob = qpos_drop_prob
-        out_dim = 8 if use_sincos_output else 4
+        self.out_dim = 8 if use_sincos_output else 4
+        out_dim = self.out_dim
 
         neck_out = 256
         grid_dim = 256
@@ -173,17 +174,20 @@ class ExcavatorVLAYolo(nn.Module):
             nn.Linear(hidden_dim // 2, self.num_regions),
         )
 
+        self.num_excavators = num_excavators
+
         if qpos_mode == "modulation":
-            self.qpos_mod = nn.Sequential(
-                nn.Linear(4, 32), nn.GELU(), nn.Linear(32, out_dim),
-            )
+            self.qpos_mods = nn.ModuleList([
+                nn.Sequential(nn.Linear(4, 32), nn.GELU(), nn.Linear(32, out_dim))
+                for _ in range(num_excavators)
+            ])
         elif qpos_mode == "transformer":
             self.qpos_proj = nn.Sequential(
                 nn.Linear(4, hidden_dim // 4), nn.GELU(),
                 nn.Linear(hidden_dim // 4, hidden_dim),
             )
         else:
-            self.qpos_mod = None
+            self.qpos_mods = None
 
         self.excv_embed = nn.Embedding(num_excavators, hidden_dim)
         self.pos_embed = SpatioTemporalPosEmbed(seq_len, grid_size, hidden_dim)
@@ -203,11 +207,14 @@ class ExcavatorVLAYolo(nn.Module):
         )
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=max(2, n_layers // 2))
 
-        self.action_head = nn.Sequential(
-            nn.Linear(hidden_dim, 256), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(256, 128), nn.GELU(), nn.Dropout(dropout * 0.5),
-            nn.Linear(128, out_dim),
-        )
+        # Per-excavator action heads — different machines have different joint ranges
+        self.action_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_dim, 256), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(256, 128), nn.GELU(), nn.Dropout(dropout * 0.5),
+                nn.Linear(128, out_dim),
+            ) for _ in range(num_excavators)
+        ])
 
         self._init_weights()
 
@@ -218,18 +225,20 @@ class ExcavatorVLAYolo(nn.Module):
         for p in self.decoder.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p, gain=0.5)
-        for module in self.action_head:
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight, gain=0.5)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-        nn.init.normal_(self.excv_embed.weight, mean=0.0, std=0.02)
-        if self.qpos_mode == "modulation":
-            for module in self.qpos_mod:
+        for head in self.action_heads:
+            for module in head:
                 if isinstance(module, nn.Linear):
-                    nn.init.xavier_uniform_(module.weight, gain=0.1)
+                    nn.init.xavier_uniform_(module.weight, gain=0.5)
                     if module.bias is not None:
                         nn.init.zeros_(module.bias)
+        nn.init.normal_(self.excv_embed.weight, mean=0.0, std=0.02)
+        if self.qpos_mods is not None:
+            for mod in self.qpos_mods:
+                for module in mod:
+                    if isinstance(module, nn.Linear):
+                        nn.init.xavier_uniform_(module.weight, gain=0.1)
+                        if module.bias is not None:
+                            nn.init.zeros_(module.bias)
 
     def decode_action(self, raw):
         if self.use_sincos_output:
@@ -299,11 +308,21 @@ class ExcavatorVLAYolo(nn.Module):
 
         queries = self.query_tokens.expand(B, -1, -1)
         decoded = self.decoder(queries, memory)
-        pool = decoded.mean(dim=1)
-        action = self.action_head(pool)
+        pool = decoded.mean(dim=1)                                          # [B, D]
 
-        if self.qpos_mode == "modulation" and qpos is not None and self.training:
-            correction = self.qpos_mod(qpos[:, -1, :])
+        # Per-excavator action heads — each machine type has its own predictor
+        action = torch.zeros(B, self.out_dim, device=pool.device, dtype=pool.dtype)
+        for eid in range(self.num_excavators):
+            mask_e = (excavator_id == eid)
+            if mask_e.any():
+                action[mask_e] = self.action_heads[eid](pool[mask_e])
+
+        if self.qpos_mods is not None and qpos is not None and self.training:
+            correction = torch.zeros(B, self.out_dim, device=action.device, dtype=action.dtype)
+            for eid in range(self.num_excavators):
+                mask_e = (excavator_id == eid)
+                if mask_e.any():
+                    correction[mask_e] = self.qpos_mods[eid](qpos[mask_e, -1, :])
             if self.qpos_drop_prob > 0:
                 correction = correction * (torch.rand(B, 1, device=qpos.device) > self.qpos_drop_prob).float()
             action = action + correction
