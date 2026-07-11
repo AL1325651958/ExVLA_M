@@ -244,11 +244,19 @@ def main():
     best_loss = float("inf")
     if args.resume:
         ckpt = torch.load(args.resume, map_location=config.device, weights_only=False)
-        model.load_state_dict(ckpt["model_state_dict"])
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        scaler.load_state_dict(ckpt["scaler_state_dict"])
-        start_epoch = ckpt["epoch"]
-        best_loss = ckpt["metrics"].get("loss", float("inf"))
+        # strict=False: allows pretrained backbone checkpoints with different head dims
+        missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        if missing:
+            print(f"  [resume] missing keys (ok - randomly init): {len(missing)}")
+        if unexpected:
+            print(f"  [resume] unexpected keys (ignored): {len(unexpected)}")
+        # Only load optimizer/scaler if this is a full training checkpoint (not backbone-only)
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if "scaler_state_dict" in ckpt:
+            scaler.load_state_dict(ckpt["scaler_state_dict"])
+        start_epoch = ckpt.get("epoch", 0)
+        best_loss = ckpt.get("metrics", {}).get("loss", float("inf"))
         print(f"Resumed from {args.resume} at epoch {start_epoch}")
 
     # ── Training loop ──
