@@ -57,26 +57,24 @@ def resize_keep_aspect(img, target_w, target_h):
                               cv2.BORDER_CONSTANT, value=[255, 255, 255])
 
 
-def render_masks(rgb_bgr, masks, G):
-    """Overlay 4 region masks on the RGB image.
-    masks: [4, G, G] numpy, each in [0,1]
-    Returns: BGR image with heatmap overlays.
+def render_masks(rgb_bgr, mask, color_idx, G):
+    """Overlay a single region mask on the RGB image.
+    mask: [G, G] numpy, values in [0,1]
+    color_idx: 0-3 index into REGION_COLORS
+    Returns: BGR image with heatmap overlay.
     """
     h, w = rgb_bgr.shape[:2]
     overlay = rgb_bgr.copy().astype(np.float32)
 
-    for k in range(4):
-        mask = cv2.resize(masks[k], (w, h), interpolation=cv2.INTER_LINEAR)
-        mask = np.clip(mask, 0, 1)
-        # Normalize to [0,1] for consistent brightness
-        m_min, m_max = mask.min(), mask.max()
-        if m_max > m_min:
-            mask = (mask - m_min) / (m_max - m_min)
-        color = np.array(REGION_COLORS[k], dtype=np.float32)
-        # Blend: mask * color + (1-mask) * original
-        alpha = 0.45
-        for c in range(3):
-            overlay[:, :, c] = overlay[:, :, c] * (1 - alpha * mask) + color[c] * (alpha * mask)
+    mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_LINEAR)
+    mask = np.clip(mask, 0, 1)
+    m_min, m_max = mask.min(), mask.max()
+    if m_max > m_min:
+        mask = (mask - m_min) / (m_max - m_min)
+    color = np.array(REGION_COLORS[color_idx], dtype=np.float32)
+    alpha = 0.45
+    for c in range(3):
+        overlay[:, :, c] = overlay[:, :, c] * (1 - alpha * mask) + color[c] * (alpha * mask)
 
     return np.clip(overlay, 0, 255).astype(np.uint8)
 
@@ -303,7 +301,7 @@ def main():
             # Scale raw image to mask_w × mask_h
             raw_display = cv2.resize(mains[i], (mask_w, mask_h))
             for k in range(4):
-                panel = render_masks(raw_display, masks_i[k:k+1], G)
+                panel = render_masks(raw_display, masks_i[k], k, G)
                 # Add region label
                 cv2.putText(panel, REGION_NAMES[k], (5, 18),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
