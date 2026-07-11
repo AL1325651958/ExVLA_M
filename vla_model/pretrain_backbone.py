@@ -13,24 +13,21 @@ _MODEL_CFG = dict(seq_len=8, img_size=224, hidden_dim=768, n_heads=12,
 
 
 def load_yolo_backbone(checkpoint_path="yolov5s.pt"):
-    """Download & load official YOLOv5s.pt, extract backbone state_dict."""
-
-    print("Loading official YOLOv5s weights...")
+    """Load YOLOv5s via ultralytics, extract backbone state_dict."""
+    print("Loading official YOLOv5s weights via ultralytics...")
     try:
-        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    except FileNotFoundError:
+        from ultralytics import YOLO
+        yolo_model = YOLO(checkpoint_path)
+        yolo_state = {k: v.float() for k, v in yolo_model.model.state_dict().items()}
+    except Exception:
         import urllib.request
         url = "https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5s.pt"
         print(f"  Downloading {url} ...")
         urllib.request.urlretrieve(url, checkpoint_path)
-        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        from ultralytics import YOLO
+        yolo_model = YOLO(checkpoint_path)
+        yolo_state = {k: v.float() for k, v in yolo_model.model.state_dict().items()}
 
-    if isinstance(ckpt, dict) and "model" in ckpt:
-        yolo_state = ckpt["model"].float().state_dict()
-    else:
-        yolo_state = ckpt.float().state_dict()
-
-    # YOLOv5s key prefix — we need model.0 to model.9 (backbone only)
     print(f"  YOLO keys: {len(yolo_state)} total")
     return yolo_state
 
