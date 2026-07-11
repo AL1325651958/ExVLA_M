@@ -120,13 +120,11 @@ class ExcavatorDataset(Dataset):
             mains_raw = f['observations/images/main']      # [N, H, W, 3] uint8 BGR
             elevations_raw = f['observations/images/elevation']  # [N, 200, 200, 3]
             qpos = f['observations/qpos'][:].astype(np.float32)
-            # action = absolute qpos of NEXT frame (i.e. the target joint angles)
-            if 'action' in f:
-                action = f['action'][:].astype(np.float32)
-            else:
-                action = np.zeros_like(qpos)
-                action[:-1] = qpos[1:]
-                action[-1] = qpos[-1]
+            # Target = NEXT frame's absolute joint angles (always use qpos[1:])
+            # Different data sources have inconsistent 'action' keys, so we unify.
+            action = np.zeros_like(qpos)
+            action[:-1] = qpos[1:]
+            action[-1] = qpos[-1]
         except OSError as e:
             print(f"  SKIP corrupted file: {fpath}: {e}")
             return None
