@@ -53,18 +53,46 @@ class ExcavatorDataset(Dataset):
             self.file_list = [str(c) for c in candidates]
         print(f"[{split}] Found {len(self.file_list)} episode(s)")
 
-        # Determine which file indices belong to this split FIRST
-        n_files = len(self.file_list)
-        n_train_files = max(1, int(n_files * train_split))
-        self.train_files = set(range(n_train_files))
-        self.val_files   = set(range(n_train_files, n_files))
+        # ── Stratified train/val split by excavator type ──
+        # Group files by excavator, shuffle each group, then split proportionally.
+        # This ensures every excavator type appears in both train and val.
+        import random
+        rng = random.Random(42)
+
+        groups = {}  # excv_id -> list of (global_idx, filepath)
+        for fidx, fpath in enumerate(self.file_list):
+            eid = self._parse_excavator_id(fpath)
+            groups.setdefault(eid, []).append((fidx, fpath))
+
+        train_indices, val_indices = [], []
+        for eid, items in groups.items():
+            rng.shuffle(items)
+            n_train = max(1, int(len(items) * train_split))
+            train_indices.extend([x[0] for x in items[:n_train]])
+            val_indices.extend([x[0] for x in items[n_train:]])
+
+        self.train_files = set(train_indices)
+        self.val_files   = set(val_indices)
 
         if split == "train":
             my_files = self.train_files
         elif split == "val":
             my_files = self.val_files
         else:
-            my_files = set(range(n_files))
+            my_files = set(range(len(self.file_list)))
+
+        # Report split composition
+        train_by_excv = {}
+        val_by_excv = {}
+        for fidx in self.train_files:
+            eid = self._parse_excavator_id(self.file_list[fidx])
+            train_by_excv[eid] = train_by_excv.get(eid, 0) + 1
+        for fidx in self.val_files:
+            eid = self._parse_excavator_id(self.file_list[fidx])
+            val_by_excv[eid] = val_by_excv.get(eid, 0) + 1
+        all_eids = sorted(set(list(train_by_excv.keys()) + list(val_by_excv.keys())))
+        print(f"[{split}] Split: train={{{', '.join(f'{k}:{train_by_excv.get(k,0)}' for k in all_eids)}}}, "
+              f"val={{{', '.join(f'{k}:{val_by_excv.get(k,0)}' for k in all_eids)}}}")
 
         # ---- Pre-load only OUR split's episodes into memory ----
         self._episodes = []
