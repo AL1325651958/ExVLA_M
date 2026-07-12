@@ -40,8 +40,10 @@ def _compute_r2(ss_res, sum_y, sum_y2, n):
 
 
 def _delta_to_sincos(delta_rad: torch.Tensor) -> torch.Tensor:
-    """[B, 4] rad → [B, 8] sin/cos pairs."""
-    return torch.cat([torch.sin(delta_rad), torch.cos(delta_rad)], dim=-1)
+    """[B, 4] rad → [B, 8] sin/cos pairs (interleaved: s0,c0, s1,c1, s2,c2, s3,c3)."""
+    sin = torch.sin(delta_rad)
+    cos = torch.cos(delta_rad)
+    return torch.stack([sin, cos], dim=-1).reshape(delta_rad.size(0), -1)
 
 
 def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch):
@@ -245,6 +247,9 @@ def main():
         hidden_dim=config.hidden_dim, n_heads=config.n_heads,
         n_layers=config.n_layers, ff_dim=config.ff_dim,
         dropout=config.dropout, pretrained=config.pretrained,
+        use_sincos_output=config.use_sincos_output,
+        qpos_mode=config.qpos_mode,
+        qpos_drop_prob=config.qpos_drop_prob,
     ).to(config.device)
 
     params = count_parameters(model)
