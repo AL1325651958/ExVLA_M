@@ -259,3 +259,49 @@ Forward 时按 `excavator_id` 路由到对应 head。
 **损失**: MSE ×1.0 + L1稀疏×0.01 + 归一化重叠²×0.5 + 时序平滑×0.02
 
 **参数量**: ~37.3M (hidden_dim=512)
+
+---
+
+## V6 — Per-Joint 结构化查询（无 Pooling）
+
+**commit**: `fc82931`
+
+**改动**:
+- 取消 decoder 输出的 pooling：`decoded [B, 4, D]` → 4 个独立 joint feature
+- 每个 joint 独立一个 `action_head[excv][joint]`，共 4×4=16 个微型 MLP
+- `action_heads[excv]` 从单层列表变为嵌套 `ModuleList[ModuleList]`
+- `joint_queries` 替换 `query_tokens`
+- 软联合门控 `prod()` 替换 `max()`
+
+**问题**: sin/cos 编码顺序不一致 → loss NaN → 回退到 `use_sincos_output=False`
+
+---
+
+## V7 — Joint-aware Spatial Action Mask（联合感知空间动作掩膜）
+
+**commit**: `8810261`
+
+**核心创新**: 每个关节掩膜独立门控该关节的 decoder 输入
+
+```
+masks [B, 4, N]
+         │
+  ┌──────┼──────┬──────┐
+  ▼      ▼      ▼      ▼
+memory⊙mask_0  memory⊙mask_1  memory⊙mask_2  memory⊙mask_3
+  │      │      │      │
+Query_0 Query_1 Query_2 Query_3   (各自独立的 decoder 视角)
+  │      │      │      │
+Head[excv][0]  Head[excv][1]  Head[excv][2]  Head[excv][3]
+  │      │      │      │
+Boom   Arm   Bucket  Swing
+```
+
+Mask → Feature → Joint → Action 闭环约束：每个 mask_j 是关节 j 的 decoder **唯一的特征入口**，掩膜聚焦错误则关节预测崩溃。
+
+**数据集改进** (`75c940b`):
+- 训练/验证按挖机类型分层划分，每款挖机都在 val 中出现
+- 修复旧的连续索引划分（val 全是 75）导致的评估虚高
+
+**参数量**: 39.7M (4×4 action heads)
+**当前状态**: 训练中，epoch 3 Train R² 0.74，Val R² 0.52
