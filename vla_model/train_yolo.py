@@ -39,11 +39,17 @@ def _compute_r2(ss_res, sum_y, sum_y2, n):
     return r2, float(r2.mean())
 
 
-def _delta_to_sincos(delta_rad: torch.Tensor) -> torch.Tensor:
-    """[B, 4] rad → [B, 8] sin/cos pairs (interleaved: s0,c0, s1,c1, s2,c2, s3,c3)."""
-    sin = torch.sin(delta_rad)
-    cos = torch.cos(delta_rad)
-    return torch.stack([sin, cos], dim=-1).reshape(delta_rad.size(0), -1)
+def _rad_to_output(rad: torch.Tensor, out_dims=(2, 1, 2, 2)) -> torch.Tensor:
+    """Convert [B, 4] rad to mixed output: Boom(s/c), Arm(scalar), Bucket(s/c), Swing(s/c).
+    Returns [B, 7]."""
+    out = []
+    for j, dim in enumerate(out_dims):
+        if dim == 2:
+            out.append(torch.sin(rad[:, j:j+1]))
+            out.append(torch.cos(rad[:, j:j+1]))
+        else:
+            out.append(rad[:, j:j+1])
+    return torch.cat(out, dim=-1)
 
 
 def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch):
@@ -55,7 +61,7 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch):
     sum_y2 = np.zeros(4)
     n_total = 0
     n_batches = 0
-    use_sincos = getattr(model, 'use_sincos_output', False)
+    out_dims = getattr(model, 'out_dims', (2, 2, 2, 2))  # fallback for old checkpoints
     pbar = tqdm(dataloader, desc=f"Train Epoch {epoch+1}")
     for step, batch in enumerate(pbar):
         rgb = batch["rgb"].to(config.device)
@@ -68,11 +74,8 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch):
 
         with autocast():
             raw_out, masks_avg, masks_spatial = model(rgb, elevation, qpos, excavator_id)
-            action_gt_rad = action_gt.squeeze(1)                          # [B, 4]
-            if use_sincos:
-                target = _delta_to_sincos(action_gt_rad)                  # [B, 8]
-            else:
-                target = action_gt_rad
+            action_gt_rad = action_gt.squeeze(1)              # [B, 4]
+            target = _rad_to_output(action_gt_rad, out_dims)  # [B, 7] mixed
 
             # 1. Prediction loss
             pred_loss = criterion(raw_out, target)
@@ -136,7 +139,7 @@ def validate(model, dataloader, criterion, config):
     sum_y2 = np.zeros(4)
     n_total = 0
     n_batches = 0
-    use_sincos = getattr(model, 'use_sincos_output', False)
+    out_dims = getattr(model, 'out_dims', (2, 2, 2, 2))
 
     for batch in tqdm(dataloader, desc="Validating"):
         rgb = batch["rgb"].to(config.device)
@@ -147,10 +150,7 @@ def validate(model, dataloader, criterion, config):
 
         raw_out, _, _ = model(rgb, elevation, qpos, excavator_id)
         action_gt_rad = action_gt.squeeze(1)
-        if use_sincos:
-            target = _delta_to_sincos(action_gt_rad)
-        else:
-            target = action_gt_rad
+        target = _rad_to_output(action_gt_rad, out_dims)
         loss = criterion(raw_out, target)
 
         total_loss += loss.item()
@@ -247,9 +247,6 @@ def main():
         hidden_dim=config.hidden_dim, n_heads=config.n_heads,
         n_layers=config.n_layers, ff_dim=config.ff_dim,
         dropout=config.dropout, pretrained=config.pretrained,
-        use_sincos_output=config.use_sincos_output,
-        qpos_mode=config.qpos_mode,
-        qpos_drop_prob=config.qpos_drop_prob,
     ).to(config.device)
 
     params = count_parameters(model)
