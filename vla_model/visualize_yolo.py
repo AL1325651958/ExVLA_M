@@ -214,7 +214,7 @@ def main():
 
     use_sincos_output = False
     for prefix in ["action_heads.0.0.6.weight",  # V6: per-joint head last layer
-                   "action_heads.0.3.weight",    # V5: shared head last layer
+                   "action_heads.0.6.weight",    # V5: shared head output layer (seq 0..6)
                    "action_head.3.weight",       # V3: single head last layer
                    "delta_head.3.weight",        # V2
                    "qpos_mods.0.2.weight",       # V5 qpos
