@@ -287,28 +287,34 @@ class ExcavatorVLAYolo(nn.Module):
         if excavator_id is not None:
             tokens = tokens + self.excv_embed(excavator_id).unsqueeze(1)
 
-        # ── 4 region masks (sigmoid, independent per-position) ──
+        # ── 4 joint-specific region masks (sigmoid, independent per-position) ──
         raw_scores = self.mask_head(tokens)                      # [B, N, 4]
         masks_flat = torch.sigmoid(raw_scores).permute(0, 2, 1)  # [B, 4, N]
         masks_spatial = masks_flat.view(B, self.num_regions, T, G, G)
 
-        # ── Soft union gate: 1 − ∏(1−Mₖ) + continuous floor ──
-        # Prod is safe here: sigmoid outputs are in [0,1], so (1-p) ∈ [0,1].
+        # ── Global gate for shared encoder: soft union + continuous floor ──
         gate = 1.0 - (1.0 - masks_flat).prod(dim=1)              # [B, N]
-        gate = 0.02 + 0.98 * gate                                 # continuous floor
+        gate = 0.02 + 0.98 * gate                                 # no dead zones
         gated_tokens = tokens * gate.unsqueeze(-1)
 
-        # ── Block-causal mask: same timestep tokens see each other ──
+        # ── Block-causal mask ──
         token_time = torch.arange(T * G * G, device=tokens.device) // (G * G)
         causal_mask = (token_time.unsqueeze(1) < token_time.unsqueeze(0)).float() * (-1e9)
 
         memory = self.encoder(gated_tokens, mask=causal_mask)    # [B, N, D]
 
-        # ── Structured decoder: 4 joint queries → 4 per-joint heads ──
-        queries = self.joint_queries.expand(B, -1, -1)           # [B, 4, D]
-        decoded = self.decoder(queries, memory)                   # [B, 4, D]
+        # ── Joint-aware Spatial Action Mask decoder ──
+        # Each joint query j cross-attends ONLY to memory ⊙ mask_j.
+        # Mask_j → gated features → Joint Query j → Action Head j → Joint j
+        decoded_list = []
+        for j in range(self.num_joints):
+            mem_j = memory * masks_flat[:, j, :].unsqueeze(-1)    # [B, N, D] — joint-j's view
+            q_j = self.joint_queries[:, j:j+1, :].expand(B, -1, -1)  # [B, 1, D]
+            out_j = self.decoder(q_j, mem_j)                      # [B, 1, D]
+            decoded_list.append(out_j)
+        decoded = torch.cat(decoded_list, dim=1)                  # [B, 4, D]
 
-        # Per-excavator per-joint heads — no pooling
+        # Per-excavator per-joint action heads
         action = torch.zeros(B, self.out_dim, device=decoded.device, dtype=decoded.dtype)
         for eid in range(self.num_excavators):
             mask_e = (excavator_id == eid)
