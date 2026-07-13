@@ -137,6 +137,22 @@ class V10TrainingTests(unittest.TestCase):
 
 
 class MaskViewTests(unittest.TestCase):
+    def test_visualizer_forward_never_passes_qpos(self):
+        """Visualization inference must use the pure-visual compatibility path."""
+        from vla_model.visualize_yolo import run_visual_inference
+
+        class RecordingModel:
+            def __call__(self, rgb, elevation, qpos, excavator_id):
+                self.qpos = qpos
+                return "outputs"
+
+        model = RecordingModel()
+        result = run_visual_inference(
+            model, torch.zeros(1), torch.zeros(1), torch.zeros(1, dtype=torch.long)
+        )
+        self.assertEqual(result, "outputs")
+        self.assertIsNone(model.qpos)
+
     def test_detect_model_version_prefers_v11_motion_adapter(self):
         """A V11 checkpoint is identified from its residual-motion branch."""
         from vla_model.visualize_yolo import detect_model_version

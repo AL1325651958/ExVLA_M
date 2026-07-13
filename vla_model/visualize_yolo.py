@@ -159,6 +159,11 @@ def detect_model_version(state_keys, checkpoint):
     return "v9"
 
 
+def run_visual_inference(model, rgb_seq, elevation_seq, excavator_id):
+    """Run the deployed visual-only forward path used by the visualizer."""
+    return model(rgb_seq, elevation_seq, None, excavator_id)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Visualize V9, V10, or V11 YOLO-ST-VLA checkpoints")
@@ -307,10 +312,8 @@ def main():
             rgb_seq = torch.from_numpy(_rgb).unsqueeze(0).to(device)
             elev_seq = torch.from_numpy(_elev).unsqueeze(0).to(device)
 
-        qpos_seq = torch.from_numpy(qpos[start:end]).unsqueeze(0).to(device)
-
         with torch.no_grad():
-            outputs = model(rgb_seq, elev_seq, qpos_seq, excv_tensor)
+            outputs = run_visual_inference(model, rgb_seq, elev_seq, excv_tensor)
             raw_out = outputs[0]
             masks_spatial_raw = outputs[2]                                                        # [1,4,T,G,G]
             masks_data = select_mask_view(masks_spatial_raw, args.mask_view)  # [1,4,G,G]
