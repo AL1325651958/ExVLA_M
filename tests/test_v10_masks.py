@@ -76,6 +76,39 @@ class V10MaskTests(unittest.TestCase):
         self.assertTrue(self.v9.temporal_mask_mixer is None)
 
 
+class V11FrameResidualTests(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(1)
+        self.v11 = ExcavatorVLAYolo(
+            seq_len=3, img_size=32, hidden_dim=32, n_heads=4,
+            n_layers=1, ff_dim=64, dropout=0.0, version="v11",
+        ).eval()
+        self.rgb = torch.randn(1, 3, 3, 32, 32)
+        self.elevation = torch.randn(1, 3, 3, 32, 32)
+        self.excv_id = torch.zeros(1, dtype=torch.long)
+
+    def test_v11_inference_is_invariant_to_qpos(self):
+        """V11 remains a pure-visual model when qpos values change."""
+        qpos_a = torch.zeros(1, 3, 4)
+        qpos_b = torch.full((1, 3, 4), -17.0)
+        with torch.no_grad():
+            out_a = self.v11(self.rgb, self.elevation, qpos_a, self.excv_id)
+            out_b = self.v11(self.rgb, self.elevation, qpos_b, self.excv_id)
+        for left, right in zip(out_a, out_b):
+            self.assertTrue(torch.equal(left, right))
+
+    def test_v11_frame_residual_zeros_first_timestep_and_differences_following(self):
+        """Motion input is the adjacent-frame residual, with a zero first frame."""
+        frames = torch.tensor([[[[[1.0]]], [[[4.0]]], [[[10.0]]]]])
+        residual = self.v11.frame_residual(frames)
+        expected = torch.tensor([[[[[0.0]]], [[[3.0]]], [[[6.0]]]]])
+        self.assertTrue(torch.equal(residual, expected))
+
+    def test_v11_has_motion_adapter(self):
+        self.assertEqual(self.v11.version, "v11")
+        self.assertIsNotNone(self.v11.motion_adapter)
+
+
 class V10TrainingTests(unittest.TestCase):
     def test_build_v10_model(self):
         from vla_model.train_yolo_v10 import build_v10_model
