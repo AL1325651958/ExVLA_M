@@ -361,16 +361,18 @@ def main():
         elev = resize_keep_aspect(elev, ELEV_W, ELEV_H)
 
         if not args.no_masks:
-            # Render 4 mask panels
             masks_i = all_masks[i]  # [4, G, G]
             mask_panels = []
 
-            # Mask overlays on ELEVATION (shows terrain-focus relationship)
-            elev_display = cv2.resize(elevations[i], (mask_w, mask_h))
+            # Each mask panel shows top-half (RGB+mask) + bottom-half (Elev+mask)
+            rgb_small = cv2.resize(mains[i], (mask_w, mask_h // 2))
+            elev_small = cv2.resize(elevations[i], (mask_w, mask_h // 2))
             for k in range(4):
-                panel = render_masks(elev_display, masks_i[k], k, G)
-                cv2.putText(panel, REGION_NAMES[k], (5, 18),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+                top = render_masks(rgb_small, masks_i[k], k, G)
+                bot = render_masks(elev_small, masks_i[k], k, G)
+                panel = np.concatenate([top, bot], axis=0)
+                cv2.putText(panel, f"{REGION_NAMES[k]} (RGB/Elev)", (5, 14),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
                 mask_panels.append(panel)
 
             top_row = np.concatenate([main_rgb] + mask_panels[:2], axis=1)
