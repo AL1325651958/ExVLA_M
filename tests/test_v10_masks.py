@@ -76,6 +76,58 @@ class V10MaskTests(unittest.TestCase):
         self.assertTrue(self.v9.temporal_mask_mixer is None)
 
 
+class V11FrameResidualTests(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(1)
+        self.v11 = ExcavatorVLAYolo(
+            seq_len=3, img_size=32, hidden_dim=32, n_heads=4,
+            n_layers=1, ff_dim=64, dropout=0.0, version="v11",
+        ).eval()
+        self.rgb = torch.randn(1, 3, 3, 32, 32)
+        self.elevation = torch.randn(1, 3, 3, 32, 32)
+        self.excv_id = torch.zeros(1, dtype=torch.long)
+
+    def test_v11_inference_is_invariant_to_qpos(self):
+        """V11 remains a pure-visual model when qpos values change."""
+        qpos_a = torch.zeros(1, 3, 4)
+        qpos_b = torch.full((1, 3, 4), -17.0)
+        with torch.no_grad():
+            out_a = self.v11(self.rgb, self.elevation, qpos_a, self.excv_id)
+            out_b = self.v11(self.rgb, self.elevation, qpos_b, self.excv_id)
+        for left, right in zip(out_a, out_b):
+            self.assertTrue(torch.equal(left, right))
+
+    def test_v11_frame_residual_zeros_first_timestep_and_differences_following(self):
+        """Motion input is the adjacent-frame residual, with a zero first frame."""
+        frames = torch.tensor([[[[[1.0]]], [[[4.0]]], [[[10.0]]]]])
+        residual = self.v11.frame_residual(frames)
+        expected = torch.tensor([[[[[0.0]]], [[[3.0]]], [[[6.0]]]]])
+        self.assertTrue(torch.equal(residual, expected))
+
+    def test_v11_has_motion_adapter(self):
+        self.assertEqual(self.v11.version, "v11")
+        self.assertIsNotNone(self.v11.motion_adapter)
+
+    def test_v11_motion_adapter_uses_strided_convolution(self):
+        """Motion features must be spatially encoded before grid pooling."""
+        strides = [module.stride for module in self.v11.motion_adapter
+                   if isinstance(module, torch.nn.Conv2d)]
+        self.assertTrue(any(stride != (1, 1) for stride in strides))
+
+    def test_v11_motion_gate_is_conditioned_on_visual_grid(self):
+        """The same motion evidence is fused differently for different visual tokens."""
+        with torch.no_grad():
+            self.v11.motion_gate[1].weight.zero_()
+            self.v11.motion_gate[1].weight[0, 0] = 1.0
+            self.v11.motion_gate[1].bias.zero_()
+        motion = torch.ones(1, 1, 1, 1, 32)
+        dark_grid = torch.zeros_like(motion)
+        bright_grid = torch.arange(32, dtype=torch.float32).view(1, 1, 1, 1, 32)
+        dark_fused = self.v11.fuse_motion(dark_grid, motion)
+        bright_fused = self.v11.fuse_motion(bright_grid, motion)
+        self.assertFalse(torch.equal(dark_fused, bright_fused))
+
+
 class V10TrainingTests(unittest.TestCase):
     def test_build_v10_model(self):
         from vla_model.train_yolo_v10 import build_v10_model
@@ -85,6 +137,40 @@ class V10TrainingTests(unittest.TestCase):
 
 
 class MaskViewTests(unittest.TestCase):
+    def test_visualizer_forward_never_passes_qpos(self):
+        """Visualization inference must use the pure-visual compatibility path."""
+        from vla_model.visualize_yolo import run_visual_inference
+
+        class RecordingModel:
+            def __call__(self, rgb, elevation, qpos, excavator_id):
+                self.qpos = qpos
+                return "outputs"
+
+        model = RecordingModel()
+        result = run_visual_inference(
+            model, torch.zeros(1), torch.zeros(1), torch.zeros(1, dtype=torch.long)
+        )
+        self.assertEqual(result, "outputs")
+        self.assertIsNone(model.qpos)
+
+    def test_detect_model_version_prefers_v11_motion_adapter(self):
+        """A V11 checkpoint is identified from its residual-motion branch."""
+        from vla_model.visualize_yolo import detect_model_version
+        state_keys = {
+            "motion_adapter.0.weight",
+            "temporal_mask_mixer.layers.0.self_attn.in_proj_weight",
+        }
+        self.assertEqual(detect_model_version(state_keys, {}), "v11")
+
+    def test_detect_model_version_keeps_v9_and_v10_compatible(self):
+        """Legacy V9/V10 checkpoint signatures remain unchanged."""
+        from vla_model.visualize_yolo import detect_model_version
+        self.assertEqual(detect_model_version(set(), {}), "v9")
+        self.assertEqual(
+            detect_model_version({"temporal_mask_mixer.layers.0.self_attn.in_proj_weight"}, {}),
+            "v10",
+        )
+
     def test_last_mask_view_selects_last_raw_frame(self):
         from vla_model.visualize_yolo import select_mask_view
         masks = torch.arange(1 * 4 * 2 * 3 * 3, dtype=torch.float32).view(1, 4, 2, 3, 3)

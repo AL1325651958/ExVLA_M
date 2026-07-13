@@ -342,3 +342,22 @@ Mask → Feature → Joint → Action 闭环约束：每个 mask_j 是关节 j �
 
 **训练命令**: `python vla_model/train_yolo_v10.py ...`
 **参数量**: 43.3M
+
+---
+
+## V11 — Pure-Visual Frame Residuals
+
+- Adds a lightweight `motion_adapter` that encodes adjacent RGB/elevation frame
+  residuals and fuses this visual motion evidence before the temporal mask
+  mixer. Inference remains pure visual and keeps the three-output API.
+- Clip augmentation uses one brightness/contrast sample across every frame and
+  both modalities. Horizontal flip augmentation is disabled so excavator
+  handedness and joint semantics are preserved.
+- `train_yolo_v11.py` uses batch-based scheduler stepping, early stopping, and
+  grouped validation diagnostics. V11 checkpoints store `model_version="v11"`.
+- `visualize_yolo.py` detects `motion_adapter` checkpoint keys, loads V11 with
+  `version="v11"`, and defaults to `--mask_view last`. V9 checkpoints still
+  default to `avg`; V10 behavior is unchanged.
+
+V12 dense optical flow and its training-only state-transition auxiliary are
+documented as a future design and are not implemented in V11.

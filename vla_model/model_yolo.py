@@ -256,8 +256,8 @@ class ExcavatorVLAYolo(nn.Module):
         self.grid_size = grid_size
         self.grid_proj = nn.Linear(total_grid_dim, hidden_dim)
 
-        # ── V10 temporal mask mixer (across-frame at each grid location) ──
-        if version == "v10":
+        # ── V10+ temporal mask mixer (across-frame at each grid location) ──
+        if version in ("v10", "v11"):
             self.temporal_mask_mixer = TemporalMaskMixer(
                 hidden_dim, nhead=max(4, n_heads // 2), num_layers=1,
                 ff_dim=hidden_dim * 2, dropout=dropout,
@@ -266,6 +266,24 @@ class ExcavatorVLAYolo(nn.Module):
         else:
             self.temporal_mask_mixer = None
             self.pose_aux_head = None
+
+        # ── V11 pure-visual motion observation branch ──
+        # Adjacent RGB/elevation frame residuals are encoded independently of
+        # qpos, then softly fused into visual tokens before temporal mixing.
+        if version == "v11":
+            self.motion_adapter = nn.Sequential(
+                nn.Conv2d(6, 32, 3, stride=2, padding=1, bias=False),
+                nn.BatchNorm2d(32), nn.SiLU(),
+                nn.Conv2d(32, hidden_dim, 3, stride=2, padding=1),
+            )
+            self.motion_proj = nn.Linear(hidden_dim, hidden_dim)
+            self.motion_gate = nn.Sequential(
+                nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim), nn.Sigmoid(),
+            )
+        else:
+            self.motion_adapter = None
+            self.motion_proj = None
+            self.motion_gate = None
 
         # ── Joint-conditioned mask heads ──
         # Each joint has a learnable embedding; mask_j sees tokens + joint_embed[j].
@@ -334,6 +352,33 @@ class ExcavatorVLAYolo(nn.Module):
                 nn.init.xavier_uniform_(module.weight, gain=0.1)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
+        if self.motion_adapter is not None:
+            for module in self.motion_adapter:
+                if isinstance(module, nn.Conv2d):
+                    nn.init.xavier_uniform_(module.weight, gain=0.1)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+            nn.init.xavier_uniform_(self.motion_proj.weight, gain=0.1)
+            nn.init.zeros_(self.motion_proj.bias)
+            nn.init.xavier_uniform_(self.motion_gate[1].weight, gain=0.1)
+            nn.init.zeros_(self.motion_gate[1].bias)
+
+    @staticmethod
+    def frame_residual(frames):
+        """Return adjacent-frame visual residuals with a zero first timestep.
+
+        ``frames`` has shape [B, T, C, H, W].  This is an observation-only
+        operation used by V11; it never consumes joint state or actions.
+        """
+        if frames.ndim != 5:
+            raise ValueError("frames must have shape [B, T, C, H, W]")
+        residual = torch.zeros_like(frames)
+        residual[:, 1:] = frames[:, 1:] - frames[:, :-1]
+        return residual
+
+    def fuse_motion(self, visual_grid, motion):
+        """Fuse motion evidence with a gate derived from visual grid tokens."""
+        return visual_grid + self.motion_gate(visual_grid) * motion
 
     def decode_action(self, raw):
         """raw [B, 8] → [B, 4] rad, projected onto unit circle first."""
@@ -366,7 +411,17 @@ class ExcavatorVLAYolo(nn.Module):
         grid = torch.cat([grid_rgb, grid_elev], dim=-1)
         grid = self.grid_proj(grid).view(B, T, G, G, D)
 
-        # ── V10 temporal mask mixing (cross-frame at each grid location) ──
+        # ── V11 residual motion fusion (pure visual; before temporal mixer) ──
+        if self.motion_adapter is not None:
+            rgb_delta = self.frame_residual(rgb)
+            elev_delta = self.frame_residual(elevation)
+            motion_input = torch.cat([rgb_delta, elev_delta], dim=2).reshape(B * T, 6, H, W)
+            motion = self.motion_adapter(motion_input)
+            motion = F.adaptive_avg_pool2d(motion, (G, G)).permute(0, 2, 3, 1)
+            motion = self.motion_proj(motion).view(B, T, G, G, D)
+            grid = self.fuse_motion(grid, motion)
+
+        # ── V10+ temporal mask mixing (cross-frame at each grid location) ──
         if self.temporal_mask_mixer is not None:
             grid = self.temporal_mask_mixer(grid)
 
