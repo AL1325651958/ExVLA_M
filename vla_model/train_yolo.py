@@ -81,7 +81,7 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch):
             pred_loss = criterion(raw_out, target)
 
             # 2. Sparsity: penalise mask activations → few positions activated per region
-            sparsity_loss = 0.01 * masks_spatial.mean()
+            sparsity_loss = 0.05 * masks_spatial.mean()
 
             # 3. Diversity: minimize overlap between region spatial patterns
             K = masks_spatial.size(1)

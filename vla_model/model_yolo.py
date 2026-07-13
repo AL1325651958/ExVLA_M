@@ -231,6 +231,22 @@ class ExcavatorVLAYolo(nn.Module):
                         if module.bias is not None:
                             nn.init.zeros_(module.bias)
         nn.init.normal_(self.excv_embed.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.joint_embed, mean=0.0, std=0.5)
+        # Mask heads: small init, last bias near zero for initial soft activation
+        for head in self.mask_heads:
+            for module in head:
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight, gain=0.1)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+            # Last linear bias: -1 → sigmoid(-1) ≈ 0.27 → moderate gating
+            nn.init.constant_(head[-1].bias, -1.0)
+        # Elevation adapter: small init
+        for module in self.elev_adapter:
+            if isinstance(module, nn.Conv2d):
+                nn.init.xavier_uniform_(module.weight, gain=0.1)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
     def decode_action(self, raw):
         """raw [B, 7] = [sB,cB, aA, sK,cK, sS,cS] → [B, 4] rad"""
