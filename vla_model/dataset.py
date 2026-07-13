@@ -172,38 +172,10 @@ class ExcavatorDataset(Dataset):
             "excavator_id": excv_id,           # int: 0=75, 1=306, 2=490
         }
 
-    def _sample_augmentation(self, enabled: bool) -> dict | None:
-        """Sample one visual augmentation shared by every image in a clip.
-
-        Sharing parameters preserves temporal motion cues across RGB and
-        elevation observations.  Horizontal flips are deliberately excluded:
-        left/right orientation carries excavator kinematic information.
-        """
-        if not enabled:
-            return None
-        use_color = np.random.random() < 0.5
-        return {
-            "alpha": 1.0 + np.random.uniform(-0.1, 0.1) if use_color else 1.0,
-            "beta": np.random.uniform(-10, 10) if use_color else 0.0,
-        }
-
-    def _preprocess_image(
-        self, img_bgr: np.ndarray, augment: bool = False, augmentation: dict | None = None,
-    ) -> np.ndarray:
+    def _preprocess_image(self, img_bgr: np.ndarray) -> np.ndarray:
         """Resize, BGR→RGB, normalize. Returns [3, H, W] float32."""
         img = cv2.resize(img_bgr, (self.img_size, self.img_size))
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-        # Direct callers retain the legacy ``augment=True`` behavior.  Sequence
-        # callers pass one pre-sampled dictionary so all frames stay coherent.
-        if augmentation is None and augment:
-            augmentation = self._sample_augmentation(enabled=True)
-        if augmentation is not None:
-            alpha = augmentation["alpha"]
-            beta = augmentation["beta"]
-            if alpha != 1.0 or beta != 0.0:
-                img = (alpha * img.astype(np.float32) + beta).clip(0, 255).astype(np.uint8)
-
         img = img.astype(np.float32) / 255.0
         img = (img - IMAGENET_MEAN) / IMAGENET_STD
         return img.transpose(2, 0, 1)  # CHW
@@ -223,11 +195,10 @@ class ExcavatorDataset(Dataset):
         rgb_seq = np.zeros((T, 3, self.img_size, self.img_size), dtype=np.float32)
         elev_seq = np.zeros((T, 3, self.img_size, self.img_size), dtype=np.float32)
 
-        augmentation = self._sample_augmentation(enabled=(self.split == "train"))
         for t in range(T):
             i = start + t
-            rgb_seq[t] = self._preprocess_image(ep["mains_raw"][i], augmentation=augmentation)
-            elev_seq[t] = self._preprocess_image(ep["elevations_raw"][i], augmentation=augmentation)
+            rgb_seq[t] = self._preprocess_image(ep["mains_raw"][i])
+            elev_seq[t] = self._preprocess_image(ep["elevations_raw"][i])
 
         qpos_seq = ep["qpos"][start:end]         # [T, 4]
         # Target: K future absolute qpos values (action_chunk steps)
