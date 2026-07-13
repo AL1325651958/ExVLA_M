@@ -108,6 +108,25 @@ class V11FrameResidualTests(unittest.TestCase):
         self.assertEqual(self.v11.version, "v11")
         self.assertIsNotNone(self.v11.motion_adapter)
 
+    def test_v11_motion_adapter_uses_strided_convolution(self):
+        """Motion features must be spatially encoded before grid pooling."""
+        strides = [module.stride for module in self.v11.motion_adapter
+                   if isinstance(module, torch.nn.Conv2d)]
+        self.assertTrue(any(stride != (1, 1) for stride in strides))
+
+    def test_v11_motion_gate_is_conditioned_on_visual_grid(self):
+        """The same motion evidence is fused differently for different visual tokens."""
+        with torch.no_grad():
+            self.v11.motion_gate[1].weight.zero_()
+            self.v11.motion_gate[1].weight[0, 0] = 1.0
+            self.v11.motion_gate[1].bias.zero_()
+        motion = torch.ones(1, 1, 1, 1, 32)
+        dark_grid = torch.zeros_like(motion)
+        bright_grid = torch.arange(32, dtype=torch.float32).view(1, 1, 1, 1, 32)
+        dark_fused = self.v11.fuse_motion(dark_grid, motion)
+        bright_fused = self.v11.fuse_motion(bright_grid, motion)
+        self.assertFalse(torch.equal(dark_fused, bright_fused))
+
 
 class V10TrainingTests(unittest.TestCase):
     def test_build_v10_model(self):

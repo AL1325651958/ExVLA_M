@@ -272,9 +272,9 @@ class ExcavatorVLAYolo(nn.Module):
         # qpos, then softly fused into visual tokens before temporal mixing.
         if version == "v11":
             self.motion_adapter = nn.Sequential(
-                nn.Conv2d(6, 32, 3, padding=1, bias=False),
+                nn.Conv2d(6, 32, 3, stride=2, padding=1, bias=False),
                 nn.BatchNorm2d(32), nn.SiLU(),
-                nn.Conv2d(32, hidden_dim, 1),
+                nn.Conv2d(32, hidden_dim, 3, stride=2, padding=1),
             )
             self.motion_proj = nn.Linear(hidden_dim, hidden_dim)
             self.motion_gate = nn.Sequential(
@@ -376,6 +376,10 @@ class ExcavatorVLAYolo(nn.Module):
         residual[:, 1:] = frames[:, 1:] - frames[:, :-1]
         return residual
 
+    def fuse_motion(self, visual_grid, motion):
+        """Fuse motion evidence with a gate derived from visual grid tokens."""
+        return visual_grid + self.motion_gate(visual_grid) * motion
+
     def decode_action(self, raw):
         """raw [B, 8] → [B, 4] rad, projected onto unit circle first."""
         raw_4d = raw.view(-1, self.num_joints, 2)
@@ -415,7 +419,7 @@ class ExcavatorVLAYolo(nn.Module):
             motion = self.motion_adapter(motion_input)
             motion = F.adaptive_avg_pool2d(motion, (G, G)).permute(0, 2, 3, 1)
             motion = self.motion_proj(motion).view(B, T, G, G, D)
-            grid = grid + self.motion_gate(motion) * motion
+            grid = self.fuse_motion(grid, motion)
 
         # ── V10+ temporal mask mixing (cross-frame at each grid location) ──
         if self.temporal_mask_mixer is not None:
