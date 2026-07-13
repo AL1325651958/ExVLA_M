@@ -209,6 +209,15 @@ class ExcavatorSim:
 
         self._build_model()
 
+    @property
+    def elevation_extent(self) -> float:
+        """Physical width of the square elevation map in metres.
+
+        Kept as a named alias for callers that describe the extent as an
+        elevation-map property; ``extent`` remains available for compatibility.
+        """
+        return self.extent
+
     def _build_model(self):
         """(Re)build MuJoCo model with fresh terrain."""
         self._mounds = self._make_mounds()
