@@ -9,7 +9,7 @@ class Config:
     seq_len: int = 8
     action_chunk: int = 1          # single step (YOLO model default)
     img_size: int = 224            # can override with --img_size
-    train_split: float = 0.75  # 3:1 train/val per excavator
+    train_split: float = 0.857  # 6:1 train/val per excavator
     sample_ratio: float = 0.2
 
     # Model
