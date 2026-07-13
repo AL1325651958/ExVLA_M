@@ -200,6 +200,7 @@ def main():
         n_layers=n_layers, ff_dim=ff_dim,
         dropout=0.0, pretrained=False,
     ).to(device)
+    model.load_state_dict(state_dict, strict=False)
     model.eval()
     print(f"  Model loaded. Grid={G}×{G}")
 
