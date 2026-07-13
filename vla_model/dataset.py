@@ -175,8 +175,9 @@ class ExcavatorDataset(Dataset):
     def _sample_augmentation(self, enabled: bool) -> dict | None:
         """Sample one visual augmentation shared by every image in a clip.
 
-        Sharing parameters preserves temporal motion cues and applies the same
-        geometric transform to RGB and elevation observations.
+        Sharing parameters preserves temporal motion cues across RGB and
+        elevation observations.  Horizontal flips are deliberately excluded:
+        left/right orientation carries excavator kinematic information.
         """
         if not enabled:
             return None
@@ -184,7 +185,6 @@ class ExcavatorDataset(Dataset):
         return {
             "alpha": 1.0 + np.random.uniform(-0.1, 0.1) if use_color else 1.0,
             "beta": np.random.uniform(-10, 10) if use_color else 0.0,
-            "flip": bool(np.random.random() < 0.3),
         }
 
     def _preprocess_image(
@@ -203,8 +203,6 @@ class ExcavatorDataset(Dataset):
             beta = augmentation["beta"]
             if alpha != 1.0 or beta != 0.0:
                 img = (alpha * img.astype(np.float32) + beta).clip(0, 255).astype(np.uint8)
-            if augmentation["flip"]:
-                img = img[:, ::-1].copy()
 
         img = img.astype(np.float32) / 255.0
         img = (img - IMAGENET_MEAN) / IMAGENET_STD

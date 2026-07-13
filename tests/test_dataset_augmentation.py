@@ -29,7 +29,7 @@ class ClipAugmentationTests(unittest.TestCase):
 
     def test_clip_reuses_one_augmentation_for_every_timestep_and_modality(self):
         dataset = self._dataset_with_one_clip()
-        sampled = {"alpha": 1.1, "beta": 3.0, "flip": True}
+        sampled = {"alpha": 1.1, "beta": 3.0}
         calls = []
         dataset._sample_augmentation = lambda enabled: sampled
 
@@ -43,11 +43,10 @@ class ClipAugmentationTests(unittest.TestCase):
         self.assertEqual(len(calls), 6)  # 3 RGB + 3 elevation frames
         self.assertTrue(all(params is sampled for params in calls))
 
-    def test_augmentation_parameters_encode_shared_geometry(self):
+    def test_augmentation_parameters_do_not_include_horizontal_flip(self):
         dataset = self._dataset_with_one_clip()
         params = dataset._sample_augmentation(enabled=True)
-        self.assertIn("flip", params)
-        self.assertIsInstance(params["flip"], bool)
+        self.assertEqual(set(params), {"alpha", "beta"})
 
 
 if __name__ == "__main__":
