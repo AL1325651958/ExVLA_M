@@ -340,10 +340,10 @@ def main():
             masks_i = all_masks[i]  # [4, G, G]
             mask_panels = []
 
-            raw_display = cv2.resize(mains[i], (mask_w, mask_h))
+            # Mask overlays on ELEVATION (shows terrain-focus relationship)
+            elev_display = cv2.resize(elevations[i], (mask_w, mask_h))
             for k in range(4):
-                panel = render_masks(raw_display, masks_i[k], k, G)
-                # Add region label
+                panel = render_masks(elev_display, masks_i[k], k, G)
                 cv2.putText(panel, REGION_NAMES[k], (5, 18),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
                 mask_panels.append(panel)
