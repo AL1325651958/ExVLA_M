@@ -30,7 +30,7 @@ class ExcavatorDataset(Dataset):
         action_chunk: int = 1,
         img_size: int = 224,
         split: str = "train",
-        train_split: float = 0.9,
+        train_split: float = 0.75,
         sample_ratio: float = 1.0,
         force_excv_id: int = None,  # override all excavator_ids (single-machine training)
     ):
