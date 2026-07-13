@@ -134,6 +134,60 @@ class SpatioTemporalPosEmbed(nn.Module):
         return features + pos_s + pos_t
 
 
+class MaskBiasedCrossAttn(nn.Module):
+    """Cross-attention where mask_j controls BOTH attention logits AND value.
+    A_ij = softmax_j(Q_i·K_j/√d + λ·log(M_j+ε))
+    out_i = Σ_j A_ij · (V_j · M_j)
+    """
+    def __init__(self, d_model, nhead, dropout=0.1, lambda_mask=3.0):
+        super().__init__()
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        self.scale = self.head_dim ** -0.5
+        self.lambda_mask = lambda_mask
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, query, memory, mask_j):
+        B, N, D = memory.shape
+        Q = self.q_proj(query).view(B, 1, self.nhead, self.head_dim).permute(0, 2, 1, 3)
+        K = self.k_proj(memory).view(B, N, self.nhead, self.head_dim).permute(0, 2, 1, 3)
+        V = self.v_proj(memory).view(B, N, self.nhead, self.head_dim).permute(0, 2, 1, 3)
+
+        logits = Q @ K.transpose(-2, -1) * self.scale
+        log_m = (mask_j + 1e-6).log().unsqueeze(1).unsqueeze(2)
+        logits = logits + self.lambda_mask * log_m
+        attn = logits.softmax(dim=-1)
+        attn = self.dropout(attn)
+        V_gated = V * mask_j.unsqueeze(1).unsqueeze(-1)
+        out = (attn @ V_gated).permute(0, 2, 1, 3).reshape(B, 1, D)
+        return self.out_proj(out)
+
+
+class MaskBiasedDecoderLayer(nn.Module):
+    """Decoder layer: self-attn → mask-biased cross-attn → FFN (norm_first)."""
+    def __init__(self, d_model, nhead, ff_dim, dropout=0.1, lambda_mask=3.0):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.cross_attn = MaskBiasedCrossAttn(d_model, nhead, dropout, lambda_mask)
+        self.ff1 = nn.Linear(d_model, ff_dim)
+        self.ff2 = nn.Linear(ff_dim, d_model)
+        self.n1 = nn.LayerNorm(d_model)
+        self.n2 = nn.LayerNorm(d_model)
+        self.n3 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.act = nn.GELU()
+
+    def forward(self, tgt, memory, mask_j):
+        tgt = tgt + self.dropout(self.self_attn(self.n1(tgt), self.n1(tgt), self.n1(tgt), need_weights=False)[0])
+        tgt = tgt + self.cross_attn(self.n2(tgt), memory, mask_j)
+        tgt = tgt + self.dropout(self.ff2(self.dropout(self.act(self.ff1(self.n3(tgt))))))
+        return tgt
+
+
 class ExcavatorVLAYolo(nn.Module):
     def __init__(
         self, seq_len=8, img_size=224, hidden_dim=512,
@@ -154,16 +208,17 @@ class ExcavatorVLAYolo(nn.Module):
         grid_dim = 256
 
         # ── Vision encoders ──
-        self.neck = FPNPAN(p3_c=128, p4_c=256, p5_c=512, out_c=neck_out)
         self.rgb_backbone = CSPDarknet(3)
+        self.rgb_neck = FPNPAN(p3_c=128, p4_c=256, p5_c=512, out_c=neck_out)
         self.rgb_head = SpatialGridHead(neck_out, grid_dim)
 
-        # Elevation adapter: map elevation domain → natural-image-like distribution
+        # Elevation modality adapter: lightweight stem converts domain
         self.elev_adapter = nn.Sequential(
             nn.Conv2d(3, 16, 3, padding=1), nn.BatchNorm2d(16), nn.SiLU(),
             nn.Conv2d(16, 3, 3, padding=1),
         )
         self.elev_backbone = CSPDarknet(3)
+        self.elev_neck = FPNPAN(p3_c=128, p4_c=256, p5_c=512, out_c=neck_out)
         self.elev_head = SpatialGridHead(neck_out, grid_dim)
 
         # ── Grid projection ──
@@ -176,13 +231,11 @@ class ExcavatorVLAYolo(nn.Module):
         # Each joint has a learnable embedding; mask_j sees tokens + joint_embed[j].
         # This guarantees mask_0 → Boom, mask_1 → Arm, mask_2 → Bucket, mask_3 → Swing.
         self.joint_embed = nn.Parameter(torch.randn(self.num_joints, hidden_dim) * 0.02)
-        self.mask_heads = nn.ModuleList([
-            nn.Sequential(
-                nn.LayerNorm(hidden_dim),
-                nn.Linear(hidden_dim, hidden_dim // 2), nn.GELU(),
-                nn.Linear(hidden_dim // 2, 1),
-            ) for _ in range(self.num_joints)
-        ])
+        self.mask_generator = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim // 2), nn.GELU(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
 
         self.num_excavators = num_excavators
         self.excv_embed = nn.Embedding(num_excavators, hidden_dim)
@@ -195,11 +248,10 @@ class ExcavatorVLAYolo(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=hidden_dim, nhead=n_heads, dim_feedforward=ff_dim,
-            dropout=dropout, activation='gelu', batch_first=True, norm_first=True,
-        )
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=max(2, n_layers // 2))
+        self.decoder_layers = nn.ModuleList([
+            MaskBiasedDecoderLayer(hidden_dim, n_heads, ff_dim, dropout, lambda_mask=3.0)
+            for _ in range(max(2, n_layers // 2))
+        ])
 
         self.joint_queries = nn.Parameter(torch.randn(1, self.num_joints, hidden_dim) * 0.02)
 
@@ -220,9 +272,6 @@ class ExcavatorVLAYolo(nn.Module):
         for p in self.encoder.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p, gain=0.5)
-        for p in self.decoder.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p, gain=0.5)
         for excv_heads in self.action_heads:
             for head in excv_heads:
                 for module in head:
@@ -231,16 +280,14 @@ class ExcavatorVLAYolo(nn.Module):
                         if module.bias is not None:
                             nn.init.zeros_(module.bias)
         nn.init.normal_(self.excv_embed.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.joint_embed, mean=0.0, std=0.5)
-        # Mask heads: small init, last bias near zero for initial soft activation
-        for head in self.mask_heads:
-            for module in head:
-                if isinstance(module, nn.Linear):
-                    nn.init.xavier_uniform_(module.weight, gain=0.1)
-                    if module.bias is not None:
-                        nn.init.zeros_(module.bias)
-            # Last linear bias: -1 → sigmoid(-1) ≈ 0.27 → moderate gating
-            nn.init.constant_(head[-1].bias, -1.0)
+        nn.init.normal_(self.joint_embed, mean=0.0, std=0.02)
+        # Shared mask generator: last bias = -1 → sigmoid(-1) ≈ 0.27
+        for module in self.mask_generator:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight, gain=0.1)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        nn.init.constant_(self.mask_generator[-1].bias, -1.0)
         # Elevation adapter: small init
         for module in self.elev_adapter:
             if isinstance(module, nn.Conv2d):
@@ -249,10 +296,11 @@ class ExcavatorVLAYolo(nn.Module):
                     nn.init.zeros_(module.bias)
 
     def decode_action(self, raw):
-        """raw [B, 8] = [sB,cB, sA,cA, sK,cK, sS,cS] → [B, 4] rad"""
+        """raw [B, 8] → [B, 4] rad, projected onto unit circle first."""
         raw_4d = raw.view(-1, self.num_joints, 2)
-        sin, cos = raw_4d[..., 0], raw_4d[..., 1]
-        return torch.atan2(sin, cos)
+        norm = raw_4d.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        raw_4d = raw_4d / norm
+        return torch.atan2(raw_4d[..., 0], raw_4d[..., 1])
 
     def forward(self, rgb, elevation, qpos=None, excavator_id=None):
         B, T = rgb.shape[:2]
@@ -260,17 +308,17 @@ class ExcavatorVLAYolo(nn.Module):
         D = self.hidden_dim
         H, W = rgb.shape[3], rgb.shape[4]
 
-        # ── RGB branch ──
+        # ── RGB branch (independent neck) ──
         rgb_flat = rgb.reshape(B * T, 3, H, W)
         p3_r, p4_r, p5_r = self.rgb_backbone(rgb_flat)
-        n3_r, n4_r, n5_r = self.neck(p3_r, p4_r, p5_r)
+        n3_r, n4_r, n5_r = self.rgb_neck(p3_r, p4_r, p5_r)
         grid_rgb = self.rgb_head(n3_r, n4_r, n5_r, G)
 
-        # ── Elevation branch (with adapter) ──
+        # ── Elevation branch (adapter + independent neck) ──
         elev_flat = elevation.reshape(B * T, 3, H, W)
         elev_adapted = self.elev_adapter(elev_flat)
         p3_e, p4_e, p5_e = self.elev_backbone(elev_adapted)
-        n3_e, n4_e, n5_e = self.neck(p3_e, p4_e, p5_e)
+        n3_e, n4_e, n5_e = self.elev_neck(p3_e, p4_e, p5_e)
         grid_elev = self.elev_head(n3_e, n4_e, n5_e, G)
 
         grid = torch.cat([grid_rgb, grid_elev], dim=-1)
@@ -286,8 +334,8 @@ class ExcavatorVLAYolo(nn.Module):
         # Each mask is explicitly tied to one joint through the embedding.
         masks_list = []
         for j in range(self.num_joints):
-            cond = tokens + self.joint_embed[j]                     # [B, N, D]
-            m_j = torch.sigmoid(self.mask_heads[j](cond)).squeeze(-1)  # [B, N]
+            cond = tokens + self.joint_embed[j]
+            m_j = torch.sigmoid(self.mask_generator(cond)).squeeze(-1)
             masks_list.append(m_j)
         masks_flat = torch.stack(masks_list, dim=1)                 # [B, 4, N]
         masks_spatial = masks_flat.view(B, self.num_joints, T, G, G)
@@ -297,19 +345,20 @@ class ExcavatorVLAYolo(nn.Module):
         gate = 0.02 + 0.98 * gate
         gated_tokens = tokens * gate.unsqueeze(-1)
 
-        # ── Block-causal encoder ──
-        token_time = torch.arange(T * G * G, device=tokens.device) // (G * G)
-        causal_mask = (token_time.unsqueeze(1) < token_time.unsqueeze(0)).float() * (-1e9)
-        memory = self.encoder(gated_tokens, mask=causal_mask)
+        # ── Bidirectional history encoder ──
+        # Window of 8 past frames are all observed; no causal mask needed.
+        memory = self.encoder(gated_tokens)
 
-        # ── Joint-aware Spatial Action Mask decoder ──
+        # ── Mask-biased joint cross-attention decoder ──
+        # Each joint query decodes through its own mask_j:
+        #   attn_logits += λ·log(mask_j + ε), value *= mask_j
         decoded_list = []
         for j in range(self.num_joints):
-            mem_j = memory * masks_flat[:, j, :].unsqueeze(-1)
-            q_j = self.joint_queries[:, j:j+1, :].expand(B, -1, -1)
-            out_j = self.decoder(q_j, mem_j)
-            decoded_list.append(out_j)
-        decoded = torch.cat(decoded_list, dim=1)                    # [B, 4, D]
+            tgt = self.joint_queries[:, j:j+1, :].expand(B, -1, -1)
+            for layer in self.decoder_layers:
+                tgt = layer(tgt, memory, masks_flat[:, j, :])
+            decoded_list.append(tgt)
+        decoded = torch.cat(decoded_list, dim=1)
 
         # ── Per-excavator per-joint action heads ──
         action = torch.zeros(B, self.out_dim, device=decoded.device, dtype=decoded.dtype)

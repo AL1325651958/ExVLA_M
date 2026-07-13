@@ -71,25 +71,38 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch):
             action_gt_rad = action_gt.squeeze(1)              # [B, 4]
             target = _rad_to_output(action_gt_rad, out_dims)  # [B, 7] mixed
 
-            # 1. Prediction loss
+            # 1. Prediction loss (sin/cos space)
             pred_loss = criterion(raw_out, target)
 
-            # 2. Sparsity: penalise mask activations → few positions activated per region
-            sparsity_loss = 0.05 * masks_spatial.mean()
+            # 2. Unit-circle constraint: (s² + c² − 1)² for each joint pair
+            raw_4d = raw_out.view(raw_out.size(0), 4, 2)
+            circle_err = (raw_4d.pow(2).sum(dim=-1) - 1.0).pow(2).mean()
+            circle_loss = 0.1 * circle_err
 
-            # 3. Diversity: minimize overlap between region spatial patterns
+            # 3. Target area: keep mean activation in [ρ_min, ρ_max]
+            rho_min, rho_max = 0.05, 0.30
+            area_j = masks_spatial.mean(dim=(-2, -1))               # [B, K, T]
+            area_mean = area_j.mean()
+            area_below = torch.relu(rho_min - area_mean).pow(2)
+            area_above = torch.relu(area_mean - rho_max).pow(2)
+            area_loss = 1.0 * (area_below + area_above)
+
+            # 4. Cosine-similarity overlap with margin (allows partial sharing)
             K = masks_spatial.size(1)
             mf = masks_spatial.reshape(masks_spatial.size(0), K, -1)  # [B, K, T*G*G]
-            overlap = torch.bmm(mf, mf.transpose(1, 2)) / mf.size(-1)  # [B,K,K] normed
-            eye = torch.eye(K, device=masks_spatial.device).unsqueeze(0)
-            off_diag = (overlap * (1 - eye)).pow(2)
-            diversity_loss = 0.5 * off_diag.sum(dim=(-2, -1)).mean()
+            norms = mf.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            mf_n = mf / norms
+            cos_sim = torch.bmm(mf_n, mf_n.transpose(1, 2))          # [B, K, K]
+            eye = torch.eye(K, device=cos_sim.device).unsqueeze(0)
+            off_diag = cos_sim * (1 - eye)
+            margin = 0.3
+            diversity_loss = 0.5 * torch.relu(off_diag - margin).pow(2).sum(dim=(-2, -1)).mean()
 
-            # 4. Temporal smoothness: adjacent-frame masks should change slowly
+            # 5. Temporal smoothness: very light
             temp_diff = (masks_spatial[:, :, 1:] - masks_spatial[:, :, :-1]).abs().mean()
-            temp_loss = 0.02 * temp_diff
+            temp_loss = 0.005 * temp_diff
 
-            loss = pred_loss + sparsity_loss + diversity_loss + temp_loss
+            loss = pred_loss + circle_loss + area_loss + diversity_loss + temp_loss
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
