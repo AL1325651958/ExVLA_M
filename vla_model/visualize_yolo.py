@@ -141,8 +141,27 @@ def select_mask_view(masks_spatial, mask_view):
     raise ValueError(f"Unknown mask view: {mask_view}")
 
 
+def detect_model_version(state_keys, checkpoint):
+    """Return the visualizer architecture version for a checkpoint.
+
+    V11 is identified before V10 because it contains V10's temporal mixer as
+    well as its own ``motion_adapter`` residual branch.  Older checkpoints
+    intentionally retain the V9 fallback used by the existing remapping path.
+    """
+    checkpoint_version = checkpoint.get("model_version")
+    if (checkpoint_version == "v11" or
+            any(key.startswith("motion_adapter.") for key in state_keys)):
+        return "v11"
+    if (checkpoint_version == "v10" or
+            any("temporal_mask_mixer" in key or "pose_aux_head" in key
+                for key in state_keys)):
+        return "v10"
+    return "v9"
+
+
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Visualize V9, V10, or V11 YOLO-ST-VLA checkpoints")
     parser.add_argument("--checkpoint", type=str, default="output/YOLO_ST-VLA/yolo_checkpoint_best.pt")
     parser.add_argument("--data_path", type=str,
                         default="data/excavator-motion/data/75/xcmg_data_2025-04-11-17-46-49.hdf5")
@@ -154,7 +173,7 @@ def main():
     parser.add_argument("--no_masks", action="store_true", help="Skip mask overlay")
     parser.add_argument("--mask_view", type=str, default=None,
                         choices=["last", "avg"],
-                        help="V10 default: last (raw), V9 default: avg")
+                        help="V10/V11 default: last (raw); V9 default: avg")
     args = parser.parse_args()
 
     device = args.device if torch.cuda.is_available() else "cpu"
@@ -171,13 +190,16 @@ def main():
     is_v3 = any("action_head" in k and "action_heads" not in k for k in sd_keys)
     is_v5 = any("action_heads" in k for k in sd_keys) and not any("joint_embed" in k for k in sd_keys)
     is_v8 = any("joint_embed" in k for k in sd_keys)
-    is_v10 = any("temporal_mask_mixer" in k or "pose_aux_head" in k for k in sd_keys) or \
-             ("model_version" in ckpt and ckpt.get("model_version") == "v10")
-    v = "V10" if is_v10 else "V2" if is_v2 else "V3/V4" if is_v3 else "V5-V7" if not is_v8 else "V8/V9"
+    model_version = detect_model_version(sd_keys, ckpt)
+    is_v11 = model_version == "v11"
+    is_v10 = model_version == "v10"
+    is_temporal_version = model_version in ("v10", "v11")
+    v = ("V11" if is_v11 else "V10" if is_v10 else "V2" if is_v2 else
+         "V3/V4" if is_v3 else "V5-V7" if not is_v8 else "V8/V9")
     print(f"  Detected: {v}")
-    # V10 default: raw last-frame masks; V9 default: temporal average
+    # V10/V11 default: raw last-frame masks; V9 default: temporal average.
     if args.mask_view is None:
-        args.mask_view = "last" if is_v10 else "avg"
+        args.mask_view = "last" if is_temporal_version else "avg"
 
     # ── Remap old keys ──
     remapped = {}
@@ -219,7 +241,7 @@ def main():
         hidden_dim=hidden_dim, n_heads=8,
         n_layers=n_layers, ff_dim=ff_dim,
         dropout=0.0, pretrained=False,
-        version="v10" if is_v10 else "v9",
+        version=model_version if is_temporal_version else "v9",
     ).to(device)
     model.load_state_dict(state_dict, strict=False)
     model.eval()

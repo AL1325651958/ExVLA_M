@@ -137,6 +137,24 @@ class V10TrainingTests(unittest.TestCase):
 
 
 class MaskViewTests(unittest.TestCase):
+    def test_detect_model_version_prefers_v11_motion_adapter(self):
+        """A V11 checkpoint is identified from its residual-motion branch."""
+        from vla_model.visualize_yolo import detect_model_version
+        state_keys = {
+            "motion_adapter.0.weight",
+            "temporal_mask_mixer.layers.0.self_attn.in_proj_weight",
+        }
+        self.assertEqual(detect_model_version(state_keys, {}), "v11")
+
+    def test_detect_model_version_keeps_v9_and_v10_compatible(self):
+        """Legacy V9/V10 checkpoint signatures remain unchanged."""
+        from vla_model.visualize_yolo import detect_model_version
+        self.assertEqual(detect_model_version(set(), {}), "v9")
+        self.assertEqual(
+            detect_model_version({"temporal_mask_mixer.layers.0.self_attn.in_proj_weight"}, {}),
+            "v10",
+        )
+
     def test_last_mask_view_selects_last_raw_frame(self):
         from vla_model.visualize_yolo import select_mask_view
         masks = torch.arange(1 * 4 * 2 * 3 * 3, dtype=torch.float32).view(1, 4, 2, 3, 3)

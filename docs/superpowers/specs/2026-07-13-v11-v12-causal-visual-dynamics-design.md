@@ -22,9 +22,16 @@ are both batch-based, adds early stopping on validation loss, and logs metrics
 by joint, excavator type, and episode. It continues to return the V9/V10
 three-tensor inference API.
 
+Clip augmentation is temporally coherent: a brightness/contrast sample is
+shared by RGB and elevation frames throughout one sequence. Horizontal flipping
+is deliberately disabled because it would alter excavator handedness and joint
+semantics. `visualize_yolo.py` detects V11 from the `motion_adapter` checkpoint
+keys, builds the V11 model, and defaults to the raw last-frame masks. V9/V10
+checkpoints remain supported.
+
 ## V12: optical-flow visual state estimation
 
-V12 replaces or augments frame residuals with precomputed, cached dense optical
+V12 is a future design only; it is not implemented by V11. It replaces or augments frame residuals with precomputed, cached dense optical
 flow. Flow is calculated offline from adjacent RGB and elevation frames, then
 read as a visual observation at training and inference. It encodes apparent
 pixel displacement, not a control signal.
