@@ -242,4 +242,7 @@ class ExcavatorDataset(Dataset):
             "qpos": torch.from_numpy(qpos_seq.copy()),
             "action": torch.from_numpy(targets.copy()),     # [K, 4]
             "excavator_id": torch.tensor(excv_id, dtype=torch.long),
+            # Local episode index is stable for this dataset split and collates
+            # as a tensor without changing the existing batch fields.
+            "episode_id": torch.tensor(fidx, dtype=torch.long),
         }
