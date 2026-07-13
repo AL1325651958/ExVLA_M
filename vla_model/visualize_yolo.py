@@ -129,6 +129,18 @@ def render_curves(timeline, targets, predictions, current_idx, frame_range=200):
     return buf
 
 
+def select_mask_view(masks_spatial, mask_view):
+    """Select mask view from temporal mask tensor.
+    masks_spatial: [B, K, T, G, G]
+    mask_view: 'avg' (V9 default) or 'last' (V10 default, raw last frame)
+    """
+    if mask_view == "last":
+        return masks_spatial[:, :, -1]
+    if mask_view == "avg":
+        return masks_spatial.mean(dim=2)
+    raise ValueError(f"Unknown mask view: {mask_view}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, default="output/YOLO_ST-VLA/yolo_checkpoint_best.pt")
@@ -140,6 +152,9 @@ def main():
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--no_masks", action="store_true", help="Skip mask overlay")
+    parser.add_argument("--mask_view", type=str, default=None,
+                        choices=["last", "avg"],
+                        help="V10 default: last (raw), V9 default: avg")
     args = parser.parse_args()
 
     device = args.device if torch.cuda.is_available() else "cpu"
@@ -156,8 +171,13 @@ def main():
     is_v3 = any("action_head" in k and "action_heads" not in k for k in sd_keys)
     is_v5 = any("action_heads" in k for k in sd_keys) and not any("joint_embed" in k for k in sd_keys)
     is_v8 = any("joint_embed" in k for k in sd_keys)
-    v = "V2" if is_v2 else "V3/V4" if is_v3 else "V5-V7" if not is_v8 else "V8"
+    is_v10 = any("temporal_mask_mixer" in k or "pose_aux_head" in k for k in sd_keys) or \
+             ("model_version" in ckpt and ckpt.get("model_version") == "v10")
+    v = "V10" if is_v10 else "V2" if is_v2 else "V3/V4" if is_v3 else "V5-V7" if not is_v8 else "V8/V9"
     print(f"  Detected: {v}")
+    # V10 default: raw last-frame masks; V9 default: temporal average
+    if args.mask_view is None:
+        args.mask_view = "last" if is_v10 else "avg"
 
     # ── Remap old keys ──
     remapped = {}
@@ -199,6 +219,7 @@ def main():
         hidden_dim=hidden_dim, n_heads=8,
         n_layers=n_layers, ff_dim=ff_dim,
         dropout=0.0, pretrained=False,
+        version="v10" if is_v10 else "v9",
     ).to(device)
     model.load_state_dict(state_dict, strict=False)
     model.eval()
@@ -268,9 +289,9 @@ def main():
 
         with torch.no_grad():
             outputs = model(rgb_seq, elev_seq, qpos_seq, excv_tensor)
-            # V2/V3: (action, masks) — 2 outputs; V4/V5: (action, avg, spatial) — 3 outputs
             raw_out = outputs[0]
-            masks_data = outputs[1]  # [1, 4, G, G] avg mask
+            masks_spatial_raw = outputs[2]                                                        # [1,4,T,G,G]
+            masks_data = select_mask_view(masks_spatial_raw, args.mask_view)  # [1,4,G,G]
 
         tgt_idx = start + T - 1
         # V2: decode_delta, V3+: decode_action

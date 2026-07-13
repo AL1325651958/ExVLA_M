@@ -188,17 +188,44 @@ class MaskBiasedDecoderLayer(nn.Module):
         return tgt
 
 
+class TemporalMaskMixer(nn.Module):
+    """Cross-frame temporal mixing at each spatial grid location.
+
+    Reshapes [B, T, G, G, D] → [B*G*G, T, D], applies a Transformer encoder
+    across the time axis at each location, then restores the original shape.
+
+    This gives every spatial position a dedicated temporal context before
+    mask generation — enabling masks that evolve with motion across frames.
+    """
+    def __init__(self, d_model, nhead=4, num_layers=1, ff_dim=None, dropout=0.1):
+        super().__init__()
+        ff_dim = ff_dim or d_model * 4
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=ff_dim,
+            dropout=dropout, activation='gelu', batch_first=True, norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+    def forward(self, grid):
+        B, T, G, Gg, D = grid.shape
+        x = grid.permute(0, 2, 3, 1, 4).reshape(B * G * Gg, T, D)
+        x = self.encoder(x)
+        x = x.reshape(B, G, Gg, T, D).permute(0, 3, 1, 2, 4)
+        return x
+
+
 class ExcavatorVLAYolo(nn.Module):
     def __init__(
         self, seq_len=8, img_size=224, hidden_dim=512,
         n_heads=8, n_layers=4, ff_dim=2048, dropout=0.1,
-        pretrained=True, num_excavators=4,
+        pretrained=True, num_excavators=4, version="v9",
     ):
         super().__init__()
         self.seq_len = seq_len
         self.img_size = img_size
         self.hidden_dim = hidden_dim
         self.num_joints = 4
+        self.version = version
 
         # Mixed output: all sin/cos — stable bounded representation
         self.out_dims = [2, 2, 2, 2]       # per-joint sin/cos
@@ -206,6 +233,8 @@ class ExcavatorVLAYolo(nn.Module):
 
         neck_out = 256
         grid_dim = 256
+        grid_size = img_size // 16
+        self.grid_size = grid_size
 
         # ── Vision encoders ──
         self.rgb_backbone = CSPDarknet(3)
@@ -226,6 +255,17 @@ class ExcavatorVLAYolo(nn.Module):
         total_grid_dim = 3 * grid_dim * 2
         self.grid_size = grid_size
         self.grid_proj = nn.Linear(total_grid_dim, hidden_dim)
+
+        # ── V10 temporal mask mixer (across-frame at each grid location) ──
+        if version == "v10":
+            self.temporal_mask_mixer = TemporalMaskMixer(
+                hidden_dim, nhead=max(4, n_heads // 2), num_layers=1,
+                ff_dim=hidden_dim * 2, dropout=dropout,
+            )
+            self.pose_aux_head = nn.Linear(hidden_dim, 4)
+        else:
+            self.temporal_mask_mixer = None
+            self.pose_aux_head = None
 
         # ── Joint-conditioned mask heads ──
         # Each joint has a learnable embedding; mask_j sees tokens + joint_embed[j].
@@ -302,7 +342,9 @@ class ExcavatorVLAYolo(nn.Module):
         raw_4d = raw_4d / norm
         return torch.atan2(raw_4d[..., 0], raw_4d[..., 1])
 
-    def forward(self, rgb, elevation, qpos=None, excavator_id=None):
+    def forward(self, rgb, elevation, qpos=None, excavator_id=None, return_aux=False):
+        # qpos is deliberately unused: inference remains vision-only.
+        # return_aux=True (V10 training only) additionally returns pose_aux [B,4].
         B, T = rgb.shape[:2]
         G = self.grid_size
         D = self.hidden_dim
@@ -323,6 +365,10 @@ class ExcavatorVLAYolo(nn.Module):
 
         grid = torch.cat([grid_rgb, grid_elev], dim=-1)
         grid = self.grid_proj(grid).view(B, T, G, G, D)
+
+        # ── V10 temporal mask mixing (cross-frame at each grid location) ──
+        if self.temporal_mask_mixer is not None:
+            grid = self.temporal_mask_mixer(grid)
 
         grid = self.pos_embed(grid)
         tokens = grid.reshape(B, T * G * G, D)
@@ -372,7 +418,12 @@ class ExcavatorVLAYolo(nn.Module):
                 action[mask_e] = torch.cat(acts_e, dim=-1).float()
 
         avg_masks = masks_spatial.mean(dim=2)                       # [B, 4, G, G]
-        return action, avg_masks, masks_spatial                     # [B,7], [B,4,G,G], [B,4,T,G,G]
+        outputs = (action, avg_masks, masks_spatial)
+        if return_aux and self.pose_aux_head is not None:
+            # Pose auxiliary: predict current qpos from last-frame spatial tokens
+            pose_aux = self.pose_aux_head(memory[:, -G * G:].mean(dim=1))
+            return (*outputs, pose_aux)
+        return outputs
 
 
 def count_parameters(model):
