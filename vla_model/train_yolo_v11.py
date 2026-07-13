@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from vla_model.config import Config
 from vla_model.dataset import ExcavatorDataset
+from vla_model.metrics import grouped_regression_metrics
 from vla_model.model_yolo import ExcavatorVLAYolo, count_parameters
 from vla_model.train_yolo_v10 import _compute_r2, _rad_to_output
 
@@ -132,6 +133,7 @@ def validate(model, dataloader, criterion, config):
     total_loss, total_mae = 0.0, np.zeros(4)
     ss_res, sum_y, sum_y2 = np.zeros(4), np.zeros(4), np.zeros(4)
     n_total = n_batches = 0
+    predictions, targets, excavator_ids, episode_ids = [], [], [], []
     for batch in tqdm(dataloader, desc="Validating"):
         rgb = batch["rgb"].to(config.device)
         elevation = batch["elevation"].to(config.device)
@@ -147,11 +149,25 @@ def validate(model, dataloader, criterion, config):
         ss_res += ((pred_np - label_np) ** 2).sum(axis=0)
         sum_y += label_np.sum(axis=0)
         sum_y2 += (label_np ** 2).sum(axis=0)
+        predictions.append(pred_np)
+        targets.append(label_np)
+        excavator_ids.append(excavator_id.detach().cpu().numpy())
+        # New datasets provide local episode provenance.  The fallback keeps
+        # validation usable for custom legacy datasets.
+        episode = batch.get("episode_id")
+        if episode is None:
+            episode = torch.full_like(excavator_id, -1)
+        episode_ids.append(episode.detach().cpu().numpy())
         n_total += len(label_np)
         n_batches += 1
     r2, r2_mean = _compute_r2(ss_res, sum_y, sum_y2, n_total)
+    grouped = grouped_regression_metrics(
+        np.concatenate(predictions), np.concatenate(targets),
+        np.concatenate(excavator_ids), np.concatenate(episode_ids),
+    )
     return {"loss": total_loss / n_batches, "mae": (total_mae / n_batches).tolist(),
-            "mae_mean": float(total_mae.mean() / n_batches), "r2": r2.tolist(), "r2_mean": r2_mean}
+            "mae_mean": float(total_mae.mean() / n_batches), "r2": r2.tolist(), "r2_mean": r2_mean,
+            **grouped}
 
 
 def save_checkpoint(model, optimizer, scaler, epoch, metrics, config, is_best=False):
@@ -227,6 +243,15 @@ def main():
             history[key].append((train_metrics if key.startswith("train") else val_metrics)[metrics_key])
         print(f"Epoch {epoch + 1}/{config.epochs} LR={scheduler.get_last_lr()[0]:.2e} "
               f"train={train_metrics['loss']:.6f} val={val_metrics['loss']:.6f} time={time.time() - started:.0f}s")
+        if "overall" in val_metrics:
+            print(f"  Validation groups overall: MAE={val_metrics['overall']['mae_mean']:.4f}, "
+                  f"R2={val_metrics['overall']['r2_mean']:.4f}")
+            for excavator_id, metrics in val_metrics["by_excavator"].items():
+                print(f"    Excavator {excavator_id}: n={metrics['n_samples']}, "
+                      f"MAE={metrics['mae_mean']:.4f}, R2={metrics['r2_mean']:.4f}")
+            for episode_key, metrics in val_metrics["by_episode"].items():
+                print(f"    Episode {episode_key}: n={metrics['n_samples']}, "
+                      f"MAE={metrics['mae_mean']:.4f}, R2={metrics['r2_mean']:.4f}")
         if val_metrics["loss"] < best_loss:
             best_loss, stale_epochs = val_metrics["loss"], 0
             save_checkpoint(model, optimizer, scaler, epoch, val_metrics, config, is_best=True)

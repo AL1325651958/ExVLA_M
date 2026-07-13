@@ -65,9 +65,12 @@ class V11TrainingEntrypointTests(unittest.TestCase):
         model = RecordingModel()
         batch = {"rgb": torch.zeros(1, 1, 3, 4, 4), "elevation": torch.zeros(1, 1, 3, 4, 4),
                  "qpos": torch.full((1, 1, 4), 7.0), "excavator_id": torch.zeros(1, dtype=torch.long),
-                 "action": torch.zeros(1, 1, 4)}
-        validate(model, [batch], torch.nn.MSELoss(), type("C", (), {"device": "cpu"})())
+                 "episode_id": torch.tensor([7]), "action": torch.zeros(1, 1, 4)}
+        metrics = validate(model, [batch], torch.nn.MSELoss(), type("C", (), {"device": "cpu"})())
         self.assertEqual(model.qpos_arguments, [None])
+        self.assertEqual(metrics["overall"]["n_samples"], 1)
+        self.assertEqual(metrics["by_excavator"][0]["n_samples"], 1)
+        self.assertEqual(metrics["by_episode"]["0:7"]["episode_id"], 7)
 
 
 if __name__ == "__main__":
