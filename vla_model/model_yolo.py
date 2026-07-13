@@ -146,9 +146,9 @@ class ExcavatorVLAYolo(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_joints = 4
 
-        # Mixed output: Boom(sin/cos 2), Arm(scalar 1), Bucket(sin/cos 2), Swing(sin/cos 2)
-        self.out_dims = [2, 1, 2, 2]       # per-joint output dims
-        self.out_dim = sum(self.out_dims)  # 7
+        # Mixed output: all sin/cos — stable bounded representation
+        self.out_dims = [2, 2, 2, 2]       # per-joint sin/cos
+        self.out_dim = sum(self.out_dims)  # 8
 
         neck_out = 256
         grid_dim = 256
@@ -249,17 +249,10 @@ class ExcavatorVLAYolo(nn.Module):
                     nn.init.zeros_(module.bias)
 
     def decode_action(self, raw):
-        """raw [B, 7] = [sB,cB, aA, sK,cK, sS,cS] → [B, 4] rad"""
-        out = []
-        cursor = 0
-        for j, dim in enumerate(self.out_dims):
-            chunk = raw[:, cursor:cursor + dim]
-            cursor += dim
-            if dim == 2:    # sin/cos
-                out.append(torch.atan2(chunk[:, 0:1], chunk[:, 1:2]))
-            else:           # raw scalar (Arm)
-                out.append(chunk)
-        return torch.cat(out, dim=-1)
+        """raw [B, 8] = [sB,cB, sA,cA, sK,cK, sS,cS] → [B, 4] rad"""
+        raw_4d = raw.view(-1, self.num_joints, 2)
+        sin, cos = raw_4d[..., 0], raw_4d[..., 1]
+        return torch.atan2(sin, cos)
 
     def forward(self, rgb, elevation, qpos=None, excavator_id=None):
         B, T = rgb.shape[:2]

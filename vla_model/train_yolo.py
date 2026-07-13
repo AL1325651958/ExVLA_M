@@ -39,17 +39,11 @@ def _compute_r2(ss_res, sum_y, sum_y2, n):
     return r2, float(r2.mean())
 
 
-def _rad_to_output(rad: torch.Tensor, out_dims=(2, 1, 2, 2)) -> torch.Tensor:
-    """Convert [B, 4] rad to mixed output: Boom(s/c), Arm(scalar), Bucket(s/c), Swing(s/c).
-    Returns [B, 7]."""
-    out = []
-    for j, dim in enumerate(out_dims):
-        if dim == 2:
-            out.append(torch.sin(rad[:, j:j+1]))
-            out.append(torch.cos(rad[:, j:j+1]))
-        else:
-            out.append(rad[:, j:j+1])
-    return torch.cat(out, dim=-1)
+def _rad_to_output(rad: torch.Tensor, out_dims=(2, 2, 2, 2)) -> torch.Tensor:
+    """Convert [B, 4] rad to [B, 8] sin/cos pairs (interleaved: s0,c0, s1,c1, ...)."""
+    sin = torch.sin(rad)
+    cos = torch.cos(rad)
+    return torch.stack([sin, cos], dim=-1).reshape(rad.size(0), -1)
 
 
 def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch):
@@ -61,7 +55,7 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch):
     sum_y2 = np.zeros(4)
     n_total = 0
     n_batches = 0
-    out_dims = getattr(model, 'out_dims', (2, 2, 2, 2))  # fallback for old checkpoints
+    out_dims = getattr(model, 'out_dims', (2, 2, 2, 2))
     pbar = tqdm(dataloader, desc=f"Train Epoch {epoch+1}")
     for step, batch in enumerate(pbar):
         rgb = batch["rgb"].to(config.device)
