@@ -89,12 +89,11 @@ class SingleModalityBranch(nn.Module):
         )
 
         # Joint-conditioned mask generator (shared MLP, conditioned by joint_embed)
-        self.joint_embed = nn.Parameter(torch.randn(self.num_joints, hidden_dim) * 0.5)
-        self.mask_generator = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim // 2), nn.GELU(),
-            nn.Linear(hidden_dim // 2, 1),
-        )
+        self.joint_embed = nn.Parameter(torch.randn(self.num_joints, hidden_dim) * 2.0)
+        # Mask generator WITHOUT LayerNorm — joint_embed must survive
+        # M_j = sigmoid( MLP( tokens + joint_embed[j] ) )
+        self.mask_linear1 = nn.Linear(hidden_dim, hidden_dim // 2)
+        self.mask_linear2 = nn.Linear(hidden_dim // 2, 1)
 
         # Position + excavator embedding
         self.pos_embed = SpatioTemporalPosEmbed(8, grid_size, hidden_dim)
@@ -121,13 +120,11 @@ class SingleModalityBranch(nn.Module):
         for p in self.encoder.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p, gain=0.5)
-        nn.init.normal_(self.joint_embed, mean=0.0, std=0.5)
-        for module in self.mask_generator:
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight, gain=0.1)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-        nn.init.constant_(self.mask_generator[-1].bias, -0.5)
+        nn.init.normal_(self.joint_embed, mean=0.0, std=2.0)
+        nn.init.xavier_uniform_(self.mask_linear1.weight, gain=0.5)
+        nn.init.zeros_(self.mask_linear1.bias)
+        nn.init.xavier_uniform_(self.mask_linear2.weight, gain=0.5)
+        nn.init.constant_(self.mask_linear2.bias, -1.0)
 
     def forward(self, video, excavator_id=None):
         """video: [B, T, 3, H, W] → joint_features [B, 4, D], masks [B, 4, T, G, G]"""
@@ -137,9 +134,8 @@ class SingleModalityBranch(nn.Module):
 
         # Frame-difference features (V12.2)
         x = video.reshape(B * T, 3, H, W)
-        # Compute frame residuals: [f0, f1, f2, ...] -> [0, f1-f0, f2-f1, ...]
         frame_diff = torch.zeros_like(x)
-        frame_diff[B:] = x[B:] - x[:-B]  # frame_diff[t] = x[t] - x[t-B]
+        frame_diff[B:] = x[B:] - x[:-B]
         motion = self.motion_encoder(frame_diff).view(B, T, G, G, D)
 
         # Vision backbone
@@ -150,35 +146,37 @@ class SingleModalityBranch(nn.Module):
         grid = self.grid_head(n3, n4, n5, G)                     # [B*T, G, G, 3*256]
 
         grid = self.grid_proj(grid).view(B, T, G, G, D)
-
-        # Add motion features before temporal mixing
         grid = grid + motion * 0.1
 
-        # Temporal mixing
-        grid = self.temporal_mixer(grid)
-
-        # Position + excavator encoding
+        # Position + excavator encoding (before mask — keeps spatial speciCity)
         grid = self.pos_embed(grid)
         tokens = grid.reshape(B, T * G * G, D)
         if excavator_id is not None:
             tokens = tokens + self.excv_embed(excavator_id).unsqueeze(1)
 
-        # Joint-conditioned masks
+        # ── Mask generation BEFORE temporal mixer ──
+        # Masks see per-frame, position-specific features — not temporally blended.
         masks_list = []
         for j in range(self.num_joints):
             cond = tokens + self.joint_embed[j]
-            m_j = torch.sigmoid(self.mask_generator(cond)).squeeze(-1)  # [B, N]
+            h = F.gelu(self.mask_linear1(cond))
+            m_j = torch.sigmoid(self.mask_linear2(h)).squeeze(-1)  # [B, N]
             masks_list.append(m_j)
         masks_flat = torch.stack(masks_list, dim=1)               # [B, 4, N]
         masks_spatial = masks_flat.view(B, self.num_joints, T, G, G)
 
-        # Soft union gate for encoder
+        # Soft union gate
         gate = 1.0 - (1.0 - masks_flat).prod(dim=1)
         gate = 0.02 + 0.98 * gate
         gated_tokens = tokens * gate.unsqueeze(-1)
 
+        # Temporal mixing (after gate — only processes masked regions)
+        gated_grid = gated_tokens.view(B, T, G, G, D)
+        gated_grid = self.temporal_mixer(gated_grid)
+        tokens_mixed = gated_grid.reshape(B, T * G * G, D)
+
         # Encoder
-        memory = self.encoder(gated_tokens)                        # [B, N, D]
+        memory = self.encoder(tokens_mixed)                        # [B, N, D]
 
         # Mask-biased joint decoder
         decoded_list = []
