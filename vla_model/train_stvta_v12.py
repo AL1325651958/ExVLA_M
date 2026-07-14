@@ -58,35 +58,22 @@ def _stvta_losses(model, raw_out, masks_spatial, pose_aux, action_gt, qpos, crit
     action_gt_rad = action_gt.squeeze(1)
     target = _rad_to_output(action_gt_rad)
     pred_loss = criterion(raw_out, target)
-
-    # Unit-circle
     raw_4d = raw_out.view(raw_out.size(0), 4, 2)
     circle_loss = 0.1 * (raw_4d.pow(2).sum(dim=-1) - 1.0).pow(2).mean()
-
-    # Area constraint (per-modality)
     area_mean = masks_spatial.mean(dim=(-2, -1)).mean()
     area_loss = (torch.relu(0.05 - area_mean).pow(2) +
                  torch.relu(area_mean - 0.30).pow(2))
-
-    # Cosine overlap (per-modality, per-joint)
-    B, M, K, T, G, Gg = masks_spatial.shape
-    masks_flat = masks_spatial.reshape(B, M * K, T * G * Gg)
-    mask_norm = masks_flat / masks_flat.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-    n_regions = M * K
-    cosine = torch.bmm(mask_norm, mask_norm.transpose(1, 2))
-    eye = torch.eye(n_regions, device=cosine.device).unsqueeze(0)
-    off_diag = cosine * (1 - eye)
-    diversity_loss = 0.5 * torch.relu(off_diag - 0.3).pow(2).sum(dim=(-2, -1)).mean()
-
-    # Temporal smoothness
-    temporal_loss = 0.005 * (masks_spatial[:, :, :, 1:] -
-                              masks_spatial[:, :, :, :-1]).abs().mean()
-
-    # Training-only pose auxiliary
+    # V12.2: diversity_loss disabled, temporal_loss reduced
+    diversity_loss = 0.0
+    temporal_loss = 0.0005 * (masks_spatial[:, :, :, 1:] -
+                               masks_spatial[:, :, :, :-1]).abs().mean()
     pose_aux_loss = criterion(pose_aux, qpos[:, -1])
-
-    return (pred_loss + circle_loss + area_loss + diversity_loss + temporal_loss +
-            aux_weight * pose_aux_loss), action_gt_rad
+    mask_spatial_std = masks_spatial.std(dim=(-2, -1)).mean()
+    mask_temporal_std = (masks_spatial[:, :, :, 1:] - masks_spatial[:, :, :, :-1]).abs().mean()
+    return (pred_loss + circle_loss + area_loss + temporal_loss +
+            aux_weight * pose_aux_loss), action_gt_rad, {
+                "mask_spatial_std": mask_spatial_std.item(),
+                "mask_temporal_std": mask_temporal_std.item()}
 
 
 def train_epoch(model, dataloader, optimizer, scheduler, scaler, criterion, config, epoch):
