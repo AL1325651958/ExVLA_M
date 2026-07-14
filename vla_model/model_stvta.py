@@ -89,7 +89,7 @@ class SingleModalityBranch(nn.Module):
         )
 
         # Joint-conditioned mask generator (shared MLP, conditioned by joint_embed)
-        self.joint_embed = nn.Parameter(torch.randn(self.num_joints, hidden_dim) * 0.02)
+        self.joint_embed = nn.Parameter(torch.randn(self.num_joints, hidden_dim) * 0.5)
         self.mask_generator = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim // 2), nn.GELU(),
@@ -121,13 +121,13 @@ class SingleModalityBranch(nn.Module):
         for p in self.encoder.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p, gain=0.5)
-        nn.init.normal_(self.joint_embed, mean=0.0, std=0.02)
+        nn.init.normal_(self.joint_embed, mean=0.0, std=0.5)
         for module in self.mask_generator:
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight, gain=0.1)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
-        nn.init.constant_(self.mask_generator[-1].bias, -1.0)
+        nn.init.constant_(self.mask_generator[-1].bias, -0.5)
 
     def forward(self, video, excavator_id=None):
         """video: [B, T, 3, H, W] → joint_features [B, 4, D], masks [B, 4, T, G, G]"""
