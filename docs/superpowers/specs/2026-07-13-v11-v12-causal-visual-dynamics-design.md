@@ -29,18 +29,14 @@ semantics. `visualize_yolo.py` detects V11 from the `motion_adapter` checkpoint
 keys, builds the V11 model, and defaults to the raw last-frame masks. V9/V10
 checkpoints remain supported.
 
-## V12: optical-flow visual state estimation
+## Post-V12 candidates: optical flow and latent transition objectives
 
-V12 is a future design only; it is not implemented by V11. It replaces or augments frame residuals with precomputed, cached dense optical
-flow. Flow is calculated offline from adjacent RGB and elevation frames, then
-read as a visual observation at training and inference. It encodes apparent
-pixel displacement, not a control signal.
-
-V12 adds a training-only latent state-transition auxiliary objective. A visual
-latent is supervised to estimate the current joint state, while a small
-transition head is supervised to map that training-only state to the next joint
-state. Neither qpos nor the transition head is required by the deployed visual
-forward path.
+The originally proposed optical-flow V12 is deferred. The approved V12 is now
+the dual-modality RGB/elevation joint-mask design in
+`2026-07-14-stvta-v12-dual-modality-masks-design.md`. Dense optical flow and a
+training-only latent state-transition objective remain possible later
+experiments. If used, flow must encode observed pixel displacement only; it
+must not be treated as a cause of joints or a control signal.
 
 ## Evaluation
 
