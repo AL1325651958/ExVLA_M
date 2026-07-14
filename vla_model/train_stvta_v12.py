@@ -114,7 +114,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, scaler, criterion, conf
         sums["count"] += len(label_np)
         sums["batches"] += 1
         if step % config.log_interval == 0:
-            pbar.set_postfix(loss=f"{loss.item():.5f}", mae=f"{mae.mean():.4f}")
+            pbar.set_postfix(loss=f"{loss.item():.5f}", mae=f"{mae.mean():.4f}", s_std=f"{mask_stats['mask_spatial_std']:.4f}", t_std=f"{mask_stats['mask_temporal_std']:.4f}")
     r2, r2_mean = _compute_r2(sums["ss_res"], sums["sum_y"], sums["sum_y2"], sums["count"])
     return {"loss": sums["loss"] / sums["batches"],
             "mae": (sums["mae"] / sums["batches"]).tolist(),
