@@ -141,6 +141,7 @@ def validate(model, dataloader, criterion, config):
     total_loss, total_mae = 0.0, np.zeros(4)
     ss_res, sum_y, sum_y2 = np.zeros(4), np.zeros(4), np.zeros(4)
     n_total = n_batches = 0
+    all_preds, all_labels, all_excv = [], [], []
     for batch in tqdm(dataloader, desc="Validating"):
         rgb = batch["rgb"].to(config.device)
         elevation = batch["elevation"].to(config.device)
@@ -158,11 +159,29 @@ def validate(model, dataloader, criterion, config):
         sum_y2 += (label_np ** 2).sum(axis=0)
         n_total += len(label_np)
         n_batches += 1
+        all_preds.append(pred_np); all_labels.append(label_np)
+        all_excv.append(excavator_id.cpu().numpy())
+    all_preds = np.concatenate(all_preds)
+    all_labels = np.concatenate(all_labels)
+    all_excv = np.concatenate(all_excv)
     r2, r2_mean = _compute_r2(ss_res, sum_y, sum_y2, n_total)
+
+    # Per-excavator grouped metrics
+    grouped = {}
+    for eid in sorted(set(all_excv)):
+        mask = all_excv == eid
+        pred_e, label_e = all_preds[mask], all_labels[mask]
+        mae_e = np.abs(pred_e - label_e).mean(axis=0)
+        ss_res_e = ((pred_e - label_e) ** 2).sum(axis=0)
+        sum_y_e = label_e.sum(axis=0)
+        sum_y2_e = (label_e ** 2).sum(axis=0)
+        r2_e, r2_mean_e = _compute_r2(ss_res_e, sum_y_e, sum_y2_e, len(label_e))
+        grouped[eid] = {"n": len(label_e), "mae": mae_e.tolist(), "mae_mean": float(mae_e.mean()),
+                        "r2": r2_e.tolist(), "r2_mean": r2_mean_e}
     return {"loss": total_loss / n_batches,
             "mae": (total_mae / n_batches).tolist(),
             "mae_mean": float(total_mae.mean() / n_batches),
-            "r2": r2.tolist(), "r2_mean": r2_mean}
+            "r2": r2.tolist(), "r2_mean": r2_mean}, grouped
 
 
 def save_checkpoint(model, optimizer, scaler, epoch, metrics, config, is_best=False):
@@ -268,8 +287,9 @@ def main():
         train_m = train_epoch(model, train_loader, optimizer, scheduler, scaler, criterion, config, epoch)
         val_m = {"loss": float("nan"), "mae": [0,0,0,0], "mae_mean": float("nan"),
                  "r2": [0,0,0,0], "r2_mean": float("nan")}
+        val_grouped = {}
         if val_loader is not None and len(val_loader) > 0:
-            val_m = validate(model, val_loader, criterion, config)
+            val_m, val_grouped = validate(model, val_loader, criterion, config)
         for k, v in [("train_loss", train_m["loss"]), ("val_loss", val_m["loss"]),
                      ("train_mae", train_m["mae_mean"]), ("val_mae", val_m["mae_mean"]),
                      ("train_r2", train_m["r2_mean"]), ("val_r2", val_m["r2_mean"])]:
@@ -280,6 +300,10 @@ def main():
               f"T MAE={train_m['mae_mean']:.4f} V MAE={val_m['mae_mean']:.4f} | "
               f"T R²={train_m['r2_mean']:.4f} V R²={val_m['r2_mean']:.4f} | {elapsed:.0f}s")
         print(f"  Per-joint MAE T: {[f'{x:.4f}' for x in train_m['mae']]} | V: {[f'{x:.4f}' for x in val_m['mae']]}")
+        print(f"  Per-joint R²  T: {[f'{x:.4f}' for x in train_m['r2']]} | V: {[f'{x:.4f}' for x in val_m['r2']]}")
+        for eid in sorted(val_grouped.keys()):
+            g = val_grouped[eid]
+            print(f"  Excavator {eid}: n={g['n']}, MAE={g['mae_mean']:.4f}, R²={g['r2_mean']:.4f}")
         if val_m["loss"] < best_loss:
             best_loss = val_m["loss"]
             save_checkpoint(model, optimizer, scaler, epoch, val_m, config, is_best=True)
