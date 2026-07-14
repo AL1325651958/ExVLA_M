@@ -106,7 +106,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, scaler, criterion, conf
             raw_out, _, masks_spatial, pose_aux = model(
                 rgb, elevation, excavator_id=excavator_id, return_aux=True,
             )
-            loss, action_gt_rad = _stvta_losses(
+            loss, action_gt_rad, mask_stats = _stvta_losses(
                 model, raw_out, masks_spatial, pose_aux, action_gt, qpos, criterion, aux_weight,
             )
         scaler.scale(loss).backward()

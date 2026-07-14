@@ -26,6 +26,35 @@ from vla_model.model_yolo import (
 
 # ── V12: Single-branch encoder (backbone → neck → grid → temporal → masks → decoder) ──
 
+
+class MotionEncoder(nn.Module):
+    """Encode frame-difference video into grid-compatible features.
+    Input: [B, T, 3, H, W] frame residuals (first frame zeroed).
+    Output: [B, T, G, G, D] motion features that add to the visual grid.
+    """
+    def __init__(self, hidden_dim=512, grid_size=14):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.grid_size = grid_size
+        self.encoder = nn.Sequential(
+            nn.Conv2d(3, 32, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32), nn.SiLU(),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(64), nn.SiLU(),
+            nn.Conv2d(64, hidden_dim, 3, stride=2, padding=1),
+        )
+        # Adaptive pooling to grid size
+        self.pool = nn.AdaptiveAvgPool2d((grid_size, grid_size))
+
+    def forward(self, frame_diff):
+        """frame_diff: [B*T, 3, H, W] -> motion: [B, T, G, G, D]"""
+        BT = frame_diff.shape[0]
+        x = self.encoder(frame_diff)            # [B*T, D, H/8, W/8]
+        x = self.pool(x)                        # [B*T, D, G, G]
+        x = x.permute(0, 2, 3, 1)              # [B*T, G, G, D]
+        return x
+
+
 class SingleModalityBranch(nn.Module):
     """One complete branch for RGB or Elevation.
 
@@ -40,6 +69,9 @@ class SingleModalityBranch(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_joints = 4
         self.input_adapter = input_adapter
+
+        # Motion encoder for frame-difference features
+        self.motion_encoder = MotionEncoder(hidden_dim, grid_size)
 
         # Backbone + neck
         self.backbone = CSPDarknet(3)
@@ -103,8 +135,14 @@ class SingleModalityBranch(nn.Module):
         G = H // 16   # grid size (224/16=14)
         D = self.hidden_dim
 
-        # Vision backbone
+        # Frame-difference features (V12.2)
         x = video.reshape(B * T, 3, H, W)
+        # Compute frame residuals: [f0, f1, f2, ...] -> [0, f1-f0, f2-f1, ...]
+        frame_diff = torch.zeros_like(x)
+        frame_diff[B:] = x[B:] - x[:-B]  # frame_diff[t] = x[t] - x[t-B]
+        motion = self.motion_encoder(frame_diff).view(B, T, G, G, D)
+
+        # Vision backbone
         if self.input_adapter is not None:
             x = self.input_adapter(x)
         p3, p4, p5 = self.backbone(x)
@@ -112,6 +150,9 @@ class SingleModalityBranch(nn.Module):
         grid = self.grid_head(n3, n4, n5, G)                     # [B*T, G, G, 3*256]
 
         grid = self.grid_proj(grid).view(B, T, G, G, D)
+
+        # Add motion features before temporal mixing
+        grid = grid + motion * 0.1
 
         # Temporal mixing
         grid = self.temporal_mixer(grid)
@@ -257,12 +298,7 @@ class ExcavatorSTVTA(nn.Module):
         G = H // 16
         training = self.training
 
-        # ── Modality dropout (training only): randomly suppress one branch ──
-        if training and torch.rand(1).item() < 0.1:
-            if torch.rand(1).item() < 0.5:
-                rgb = torch.zeros_like(rgb)
-            else:
-                elevation = torch.zeros_like(elevation)
+        # Modality dropout disabled in V12.2 — establish clean dual-modal baseline
 
         # ── RGB branch ──
         rgb_features, rgb_masks = self.rgb_branch(rgb, excavator_id)
@@ -273,6 +309,13 @@ class ExcavatorSTVTA(nn.Module):
         # ── Stack masks: [B, 2=RGB/Elev, 4, T, G, G] ──
         masks_spatial = torch.stack([rgb_masks, elev_masks], dim=1)
         avg_masks = masks_spatial.mean(dim=3)                     # [B, 2, 4, G, G]
+
+        # ── Mask statistics (for monitoring mask diversity) ──
+        # Spatial std per mask: how concentrated is each mask spatially?
+        mask_spatial_std = masks_spatial.std(dim=(-2, -1)).mean()  # scalar
+        # Temporal std per mask: how much do masks change across frames?
+        mask_temporal_std = (masks_spatial[:, :, :, 1:] -
+                             masks_spatial[:, :, :, :-1]).abs().mean()  # scalar
 
         # ── Per-joint fusion ──
         fused_list = []
@@ -305,7 +348,11 @@ class ExcavatorSTVTA(nn.Module):
             pose_aux = self.pose_aux_head(torch.cat([rgb_pool, elev_pool], dim=-1))
             outputs = (*outputs, pose_aux)
         if return_diagnostics:
-            outputs = (*outputs, fusion_alpha)
+            mask_stats = {"spatial_std": mask_spatial_std.item(),
+                          "temporal_std": mask_temporal_std.item()}
+            outputs = (*outputs, fusion_alpha, mask_stats)
+            return outputs
+        outputs = (*outputs, fusion_alpha)
         return outputs
 
 
