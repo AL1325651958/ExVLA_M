@@ -103,7 +103,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, scaler, criterion, conf
         action_gt = batch["action"].to(config.device)
         optimizer.zero_grad()
         with autocast(enabled=config.device == "cuda"):
-            raw_out, _, masks_spatial, pose_aux = model(
+            raw_out, _, masks_spatial, _, pose_aux = model(
                 rgb, elevation, excavator_id=excavator_id, return_aux=True,
             )
             loss, action_gt_rad, mask_stats = _stvta_losses(
@@ -147,7 +147,7 @@ def validate(model, dataloader, criterion, config):
         elevation = batch["elevation"].to(config.device)
         excavator_id = batch["excavator_id"].to(config.device)
         action_gt_rad = batch["action"].to(config.device).squeeze(1)
-        raw_out, _, _ = model(rgb, elevation, excavator_id=excavator_id)
+        raw_out, _, _, _ = model(rgb, elevation, excavator_id=excavator_id)
         target = _rad_to_output(action_gt_rad)
         total_loss += criterion(raw_out, target).item()
         pred = model.decode_action(raw_out)
