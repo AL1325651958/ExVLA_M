@@ -160,7 +160,7 @@ def main():
         elev_s = torch.from_numpy(elev_pp[start:end]).unsqueeze(0).to(device)
         with torch.no_grad():
             out = model(rgb_s, elev_s, excavator_id=excv_t, return_diagnostics=True)
-            action = out[0]; masks_spatial = out[2]; alpha = out[-1]
+            action = out[0]; masks_spatial = out[2]; alpha = out[3]  # out[4] is mask_stats dict
         tgt_idx = start + T - 1
         predictions[tgt_idx] = model.decode_action(action)[0].cpu().numpy()
         all_masks[tgt_idx] = masks_spatial.mean(dim=3)[0].cpu().numpy()
