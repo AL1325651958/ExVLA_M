@@ -246,6 +246,18 @@ class ExcavatorSTVTA(nn.Module):
             ) for _ in range(self.num_joints)
         ])
 
+        # V13: Joint Relation Transformer — 4 joints as graph nodes
+        # Kinematic chain: Swing ←→ Boom ←→ Arm ←→ Bucket
+        # 2-layer Transformer lets joints exchange information before action heads
+        joint_rel_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, nhead=4, dim_feedforward=hidden_dim * 2,
+            dropout=dropout, activation='gelu', batch_first=True, norm_first=True,
+        )
+        self.joint_relation = nn.TransformerEncoder(joint_rel_layer, num_layers=2)
+
+        # V13: Joint velocity auxiliary head (predicts Δqpos between frames)
+        self.vel_aux_head = nn.Linear(hidden_dim, 1)
+
         # ── Per-excavator per-joint action heads ──
         self.action_heads = nn.ModuleList([
             nn.ModuleList([
@@ -271,6 +283,11 @@ class ExcavatorSTVTA(nn.Module):
                         if module.bias is not None:
                             nn.init.zeros_(module.bias)
         nn.init.normal_(self.excv_embed.weight, mean=0.0, std=0.02)
+        for p in self.joint_relation.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p, gain=0.5)
+        nn.init.xavier_uniform_(self.vel_aux_head.weight, gain=0.1)
+        nn.init.zeros_(self.vel_aux_head.bias)
 
 
     def decode_action(self, raw):
@@ -327,6 +344,10 @@ class ExcavatorSTVTA(nn.Module):
         fused = torch.stack(fused_list, dim=1)                    # [B, 4, D]
         fusion_alpha = torch.cat(alpha_list, dim=-1)              # [B, 4]
 
+        # V13: Joint Relation Transformer — cross-joint information exchange
+        # Swing ←→ Boom ←→ Arm ←→ Bucket along the kinematic chain
+        fused = self.joint_relation(fused)                         # [B, 4, D]
+
         # ── Per-excavator per-joint action heads ──
         action = torch.zeros(B, self.out_dim, device=fused.device, dtype=fused.dtype)
         for eid in range(self.num_excavators):
@@ -344,7 +365,9 @@ class ExcavatorSTVTA(nn.Module):
             rgb_pool = rgb_features.mean(dim=1)  # D
             elev_pool = elev_features.mean(dim=1)
             pose_aux = self.pose_aux_head(torch.cat([rgb_pool, elev_pool], dim=-1))
-            outputs = (*outputs, pose_aux)
+            # V13: joint velocity auxiliary — predict Δq for each joint from its feature
+            vel_aux = self.vel_aux_head(fused).squeeze(-1)       # [B, 4]
+            outputs = (*outputs, pose_aux, vel_aux)
         if return_diagnostics:
             mask_stats = {"spatial_std": mask_spatial_std.item(),
                           "temporal_std": mask_temporal_std.item()}
