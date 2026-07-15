@@ -61,12 +61,11 @@ def _stvta_losses(model, raw_out, masks_spatial, pose_aux, action_gt, qpos, crit
     raw_4d = raw_out.view(raw_out.size(0), 4, 2)
     circle_loss = 0.1 * (raw_4d.pow(2).sum(dim=-1) - 1.0).pow(2).mean()
     area_mean = masks_spatial.mean(dim=(-2, -1)).mean()
-    area_loss = (torch.relu(0.05 - area_mean).pow(2) +
-                 torch.relu(area_mean - 0.30).pow(2))
-    # V12.2: diversity_loss disabled, temporal_loss reduced
-    diversity_loss = 0.0
-    temporal_loss = 0.0005 * (masks_spatial[:, :, :, 1:] -
-                               masks_spatial[:, :, :, :-1]).abs().mean()
+    # V14: relaxed area constraint — wider range for motion-conditioned masks
+    area_loss = (torch.relu(0.02 - area_mean).pow(2) +
+                 torch.relu(area_mean - 0.50).pow(2)) * 0.5
+    # V14: diversity and temporal SMOOTHNESS fully disabled
+    temporal_loss = 0.0
     pose_aux_loss = criterion(pose_aux, qpos[:, -1])
     mask_spatial_std = masks_spatial.std(dim=(-2, -1)).mean()
     mask_temporal_std = (masks_spatial[:, :, :, 1:] - masks_spatial[:, :, :, :-1]).abs().mean()
@@ -213,7 +212,7 @@ def main():
 
     config.device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {config.device}")
-    print(f"V12 modality dropout: 10%")
+    print(f"V14: motion-conditioned masks + Arm dual-scale, modalities independent")
 
     # ── Datasets ──
     train_ds = ExcavatorDataset(

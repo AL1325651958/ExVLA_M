@@ -148,7 +148,11 @@ class SingleModalityBranch(nn.Module):
         grid = self.grid_proj(grid).view(B, T, G, G, D)
         grid = grid + motion * 0.1
 
-        # Position + excavator encoding (before mask — keeps spatial speciCity)
+        # V14: motion-conditioned mask inputs
+        # Motion features flattened to match token shape
+        motion_tokens = motion.permute(0, 1, 4, 2, 3).reshape(B, T * G * G, D)
+
+        # Position + excavator encoding (before mask — keeps spatial specificity)
         grid = self.pos_embed(grid)
         tokens = grid.reshape(B, T * G * G, D)
         if excavator_id is not None:
@@ -158,7 +162,8 @@ class SingleModalityBranch(nn.Module):
         # Masks see per-frame, position-specific features — not temporally blended.
         masks_list = []
         for j in range(self.num_joints):
-            cond = tokens + self.joint_embed[j]
+            # V14: mask_j conditioned on static visual + motion + joint_embed
+            cond = tokens + 0.5 * motion_tokens + self.joint_embed[j]
             h = F.gelu(self.mask_linear1(cond))
             m_j = torch.sigmoid(self.mask_linear2(h)).squeeze(-1)  # [B, N]
             masks_list.append(m_j)
@@ -245,6 +250,9 @@ class ExcavatorSTVTA(nn.Module):
                 nn.Linear(hidden_dim // 4, 1), nn.Sigmoid(),
             ) for _ in range(self.num_joints)
         ])
+
+        # V14: Arm dual-scale projection (local + global → D)
+        self.arm_dual_proj = nn.Linear(2 * hidden_dim, hidden_dim)
 
         # V13: Joint Relation Transformer — 4 joints as graph nodes
         # Kinematic chain: Swing ←→ Boom ←→ Arm ←→ Bucket
@@ -344,8 +352,15 @@ class ExcavatorSTVTA(nn.Module):
         fused = torch.stack(fused_list, dim=1)                    # [B, 4, D]
         fusion_alpha = torch.cat(alpha_list, dim=-1)              # [B, 4]
 
+        # V14: Dual-scale Arm feature — local elbow area + global kinematic context
+        # Arm_j (index 1) gets enriched with a pooled summary of all 4 joints
+        arm_local = fused[:, 1]                                     # [B, D]
+        arm_global = fused.mean(dim=1)                              # [B, D] — full arm chain info
+        arm_dual = torch.cat([arm_local, arm_global], dim=-1)      # [B, 2D]
+        arm_dual = self.arm_dual_proj(arm_dual)                     # [B, D]
+        fused[:, 1] = arm_dual
+
         # V13: Joint Relation Transformer — cross-joint information exchange
-        # Swing ←→ Boom ←→ Arm ←→ Bucket along the kinematic chain
         fused = self.joint_relation(fused)                         # [B, 4, D]
 
         # ── Per-excavator per-joint action heads ──
