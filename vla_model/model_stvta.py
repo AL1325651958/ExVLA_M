@@ -256,6 +256,9 @@ class ExcavatorSTVTA(nn.Module):
         # V14: Arm dual-scale projection (local + global → D)
         self.arm_dual_proj = nn.Linear(2 * hidden_dim, hidden_dim)
 
+        # V14: Swing global context — rotation needs full-scene layout reference
+        self.swing_global_proj = nn.Linear(2 * hidden_dim, hidden_dim)
+
         # V13: Joint Relation Transformer — 4 joints as graph nodes
         # Kinematic chain: Swing ←→ Boom ←→ Arm ←→ Bucket
         # 2-layer Transformer lets joints exchange information before action heads
@@ -361,6 +364,13 @@ class ExcavatorSTVTA(nn.Module):
         arm_dual = torch.cat([arm_local, arm_global], dim=-1)      # [B, 2D]
         arm_dual = self.arm_dual_proj(arm_dual)                     # [B, D]
         fused[:, 1] = arm_dual
+
+        # V14: Swing global context — swing rotation needs full-scene reference
+        swing_local = fused[:, 3]                                   # [B, D]
+        swing_global = fused.mean(dim=1)                            # [B, D] — global layout
+        swing_dual = torch.cat([swing_local, swing_global], dim=-1) # [B, 2D]
+        swing_dual = self.swing_global_proj(swing_dual)             # [B, D]
+        fused[:, 3] = swing_dual
 
         # V13: Joint Relation Transformer — cross-joint information exchange
         fused = self.joint_relation(fused)                         # [B, 4, D]
