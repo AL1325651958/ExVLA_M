@@ -181,66 +181,6 @@ class ExcavatorDataset(Dataset):
             "excavator_id": excv_id,           # int: 0=75, 1=306, 2=490
         }
 
-    def _sample_night_aug(self):
-        """Sample clip-consistent nighttime augmentation params (RGB only).
-
-        Returns a dict of augmentation params, or None if no aug applied.
-        All frames in the same clip share the same params.
-        """
-        rng = np.random
-        aug = {}
-
-        # Gamma perturbation: 0.3→1.0 simulates varied lighting
-        if rng.random() < 0.6:
-            aug["gamma"] = rng.uniform(0.3, 1.0)
-
-        # Brightness/contrast jitter
-        if rng.random() < 0.5:
-            aug["alpha"] = rng.uniform(0.5, 1.5)       # contrast
-            aug["beta"] = rng.uniform(-40, 40)           # brightness shift
-
-        # Gaussian blur (simulates motion blur / defocus)
-        if rng.random() < 0.3:
-            aug["blur_ksize"] = rng.choice([3, 5])
-            aug["blur_sigma"] = rng.uniform(0.5, 2.0)
-
-        # Gaussian noise (sensor noise in low light)
-        if rng.random() < 0.4:
-            aug["noise_std"] = rng.uniform(2, 15)
-
-        # Simulated low-light: darken + add slight noise
-        if rng.random() < 0.3:
-            aug["lowlight_factor"] = rng.uniform(0.15, 0.5)
-
-        return aug if aug else None
-
-    def _apply_night_aug(self, img_uint8: np.ndarray, aug: dict) -> np.ndarray:
-        """Apply nighttime augmentations to a uint8 BGR image."""
-        img = img_uint8.astype(np.float32)
-
-        if "lowlight_factor" in aug:
-            img = img * aug["lowlight_factor"]
-
-        if "gamma" in aug:
-            img = 255.0 * ((img / 255.0) ** aug["gamma"])
-            img = img.clip(0, 255)
-
-        if "alpha" in aug:
-            img = aug["alpha"] * img + aug["beta"]
-            img = img.clip(0, 255)
-
-        if "blur_ksize" in aug:
-            # Apply only if ksize > 1
-            k = aug["blur_ksize"]
-            img = cv2.GaussianBlur(img, (k, k), aug["blur_sigma"])
-
-        if "noise_std" in aug:
-            noise = np.random.randn(*img.shape).astype(np.float32) * aug["noise_std"]
-            img = img + noise
-            img = img.clip(0, 255)
-
-        return img.astype(np.uint8)
-
     def _preprocess_image(self, img_bgr: np.ndarray) -> np.ndarray:
         img = cv2.resize(img_bgr, (self.img_size, self.img_size))
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -263,15 +203,9 @@ class ExcavatorDataset(Dataset):
         rgb_seq = np.zeros((T, 3, self.img_size, self.img_size), dtype=np.float32)
         elev_seq = np.zeros((T, 3, self.img_size, self.img_size), dtype=np.float32)
 
-        # Night augmentation (RGB only, clip-consistent, training only)
-        night_aug = self._sample_night_aug() if self.split == "train" else None
-
         for t in range(T):
             i = start + t
-            rgb_frame = ep["mains_raw"][i]
-            if night_aug is not None:
-                rgb_frame = self._apply_night_aug(rgb_frame, night_aug)
-            rgb_seq[t] = self._preprocess_image(rgb_frame)
+            rgb_seq[t] = self._preprocess_image(ep["mains_raw"][i])
             elev_seq[t] = self._preprocess_image(ep["elevations_raw"][i])
 
         qpos_seq = ep["qpos"][start:end]         # [T, 4]
