@@ -160,10 +160,12 @@ class SingleModalityBranch(nn.Module):
 
         # ── Mask generation BEFORE temporal mixer ──
         # Masks see per-frame, position-specific features — not temporally blended.
+        # V14: motion weights — swing (index 3) needs more temporal evidence
+        motion_weights = [0.3, 0.3, 0.3, 1.5]  # Boom, Arm, Bucket, Swing
+
         masks_list = []
         for j in range(self.num_joints):
-            # V14: mask_j conditioned on static visual + motion + joint_embed
-            cond = tokens + 0.5 * motion_tokens + self.joint_embed[j]
+            cond = tokens + motion_weights[j] * motion_tokens + self.joint_embed[j]
             h = F.gelu(self.mask_linear1(cond))
             m_j = torch.sigmoid(self.mask_linear2(h)).squeeze(-1)  # [B, N]
             masks_list.append(m_j)
