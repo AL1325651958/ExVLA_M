@@ -110,7 +110,9 @@ def main():
             n_layers = max(n_layers, idx + 1)
     ff_dim = sd.get("rgb_branch.encoder.layers.0.linear1.weight").shape[0]
 
-    print(f"  V12 detected: hidden_dim={hidden_dim}, n_layers={n_layers}, ff_dim={ff_dim}")
+    is_v13 = any("joint_relation" in k or "vel_aux_head" in k for k in sd_keys)
+    version_tag = "V13" if is_v13 else "V12"
+    print(f"  {version_tag} detected: hidden_dim={hidden_dim}, n_layers={n_layers}, ff_dim={ff_dim}")
     G = args.img_size // 16
 
     model = ExcavatorSTVTA(
