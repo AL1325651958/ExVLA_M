@@ -214,6 +214,7 @@ def main():
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--overfit", action="store_true")
+    parser.add_argument("--exclude_306", action="store_true", help="Exclude excavator 306 (nighttime) from training")
     args = parser.parse_args()
 
     config = Config()
@@ -234,13 +235,13 @@ def main():
         data_dir=config.data_dir, seq_len=config.seq_len,
         action_chunk=config.action_chunk, img_size=config.img_size,
         split="train", train_split=config.train_split if not args.overfit else 1.0,
-        sample_ratio=config.sample_ratio,
+        sample_ratio=config.sample_ratio, exclude_excv={1} if getattr(args, "exclude_306", False) else None,
     )
     val_dataset = ExcavatorDataset(
         data_dir=config.data_dir, seq_len=config.seq_len,
         action_chunk=config.action_chunk, img_size=config.img_size,
         split="val", train_split=config.train_split if not args.overfit else 1.0,
-        sample_ratio=config.sample_ratio,
+        sample_ratio=config.sample_ratio, exclude_excv={1} if getattr(args, "exclude_306", False) else None,
     )
 
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size,

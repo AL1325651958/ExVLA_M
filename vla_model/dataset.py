@@ -33,6 +33,7 @@ class ExcavatorDataset(Dataset):
         train_split: float = 0.857,
         sample_ratio: float = 1.0,
         force_excv_id: int = None,  # override all excavator_ids (single-machine training)
+        exclude_excv: set = None,    # set of excavator IDs to exclude (e.g. {1} for 306)
     ):
         self.data_dir = Path(data_dir)
         self.seq_len = seq_len
@@ -42,6 +43,7 @@ class ExcavatorDataset(Dataset):
         self.train_split = train_split
         self.sample_ratio = sample_ratio
         self.force_excv_id = force_excv_id
+        self.exclude_excv = exclude_excv
 
         # Find all H5/HDF5 files
         self.file_list = sorted(
@@ -58,6 +60,13 @@ class ExcavatorDataset(Dataset):
         # This ensures every excavator type appears in both train and val.
         import random
         rng = random.Random(42)
+
+        # Exclude specific excavator IDs (e.g. 306=1) on request
+        exclude_excv = getattr(self, 'exclude_excv', None)
+        if exclude_excv is not None:
+            self.file_list = [fp for fp in self.file_list
+                              if self._parse_excavator_id(fp) not in exclude_excv]
+            print(f"[{split}] Excluded excavators {exclude_excv}, {len(self.file_list)} episodes remain")
 
         groups = {}  # excv_id -> list of (global_idx, filepath)
         for fidx, fpath in enumerate(self.file_list):
