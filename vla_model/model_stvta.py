@@ -177,23 +177,19 @@ class SingleModalityBranch(nn.Module):
         gate = 0.02 + 0.98 * gate
         gated_tokens = tokens * gate.unsqueeze(-1)
 
-        # Temporal mixing (after gate — only processes masked regions)
-        gated_grid = gated_tokens.view(B, T, G, G, D)
-        gated_grid = self.temporal_mixer(gated_grid)
-        tokens_mixed = gated_grid.reshape(B, T * G * G, D)
+        # Masks still computed and visible, but do NOT gate decoder input.
+        # Encoder processes full tokens (no information bottleneck).
+        tokens_grid = tokens.reshape(B, T, G, G, D)
+        tokens_grid = self.temporal_mixer(tokens_grid)
+        tokens_mixed = tokens_grid.reshape(B, T * G * G, D)
+        memory = self.encoder(tokens_mixed)
 
-        # Encoder (single pass on gated tokens)
-        memory = self.encoder(tokens_mixed)                        # [B, N, D]
-
-        # Mask-biased joint decoder
-        # Swing (index 3): uses ones-like mask → reads full unmasked memory
-        # Other joints: reads mask_j-gated memory
+        # All joints see the same unmasked memory (mask-gated path removed).
         decoded_list = []
         for j in range(self.num_joints):
             tgt = self.joint_queries[:, j:j+1, :].expand(B, -1, -1)
-            m_j = torch.ones_like(masks_flat[:, j, :]) if j == 3 else masks_flat[:, j, :]
             for layer in self.decoder_layers:
-                tgt = layer(tgt, memory, m_j)
+                tgt = layer(tgt, memory, torch.ones_like(masks_flat[:, j, :]))
             decoded_list.append(tgt)
         decoded = torch.cat(decoded_list, dim=1)                   # [B, 4, D]
 
