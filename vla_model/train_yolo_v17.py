@@ -139,6 +139,7 @@ def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, conf
 
             # 4. Cosine-similarity overlap with margin
             # V17: [B, 2, 4, T, G, G] → flatten to [B, 8, T*G*G] for all-mask diversity
+            # Use .mean() not .sum() — scale-invariant to number of masks (8 → 56 pairs).
             B_s = masks_spatial.size(0)
             mf = masks_spatial.reshape(B_s, 8, -1)
             norms = mf.norm(dim=-1, keepdim=True).clamp_min(1e-6)
@@ -147,7 +148,7 @@ def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, conf
             eye = torch.eye(8, device=cos_sim.device).unsqueeze(0)
             off_diag = cos_sim * (1 - eye)
             margin = 0.3
-            diversity_loss = 0.5 * torch.relu(off_diag - margin).pow(2).sum(dim=(-2, -1)).mean()
+            diversity_loss = 0.5 * torch.relu(off_diag - margin).pow(2).mean()
 
             # 5. Temporal smoothness — slice TIME dim (dim=3), NOT joint dim (dim=2)
             temp_diff = (masks_spatial[:, :, :, 1:] - masks_spatial[:, :, :, :-1]).abs().mean()
