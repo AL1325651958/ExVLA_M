@@ -177,19 +177,21 @@ class SingleModalityBranch(nn.Module):
         gate = 0.02 + 0.98 * gate
         gated_tokens = tokens * gate.unsqueeze(-1)
 
-        # Masks still computed and visible, but do NOT gate decoder input.
-        # Encoder processes full tokens (no information bottleneck).
+        # Encoder on FULL tokens (no information bottleneck — masks exist
+        # for decoder gating, not for starving the encoder).
         tokens_grid = tokens.reshape(B, T, G, G, D)
         tokens_grid = self.temporal_mixer(tokens_grid)
         tokens_mixed = tokens_grid.reshape(B, T * G * G, D)
         memory = self.encoder(tokens_mixed)
 
-        # All joints see the same unmasked memory (mask-gated path removed).
+        # Mask-gated joint decoder: Boom/Arm/Bucket use mask_j,
+        # Swing uses ones (global rotation needs full-scene reference).
         decoded_list = []
         for j in range(self.num_joints):
             tgt = self.joint_queries[:, j:j+1, :].expand(B, -1, -1)
+            m_j = torch.ones_like(masks_flat[:, j, :]) if j == 3 else masks_flat[:, j, :]
             for layer in self.decoder_layers:
-                tgt = layer(tgt, memory, torch.ones_like(masks_flat[:, j, :]))
+                tgt = layer(tgt, memory, m_j)
             decoded_list.append(tgt)
         decoded = torch.cat(decoded_list, dim=1)                   # [B, 4, D]
 
