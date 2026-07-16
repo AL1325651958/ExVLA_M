@@ -354,12 +354,15 @@ def main():
             top_section = np.concatenate([main_rgb, elev], axis=1)
         elif is_v16:
             # V16: 8 dual-modality mask panels
+            # Each joint column: 2 stacked cells (RGB on top, Elev on bottom)
+            # Cell height = MAIN_H // 2 so combined panel height = MAIN_H, matching the row
+            cell_h = MAIN_H // 2  # 135
             mask_panels = []
             for j in range(4):
                 rgb_small = cv2.resize(cv2.cvtColor(mains[i], cv2.COLOR_BGR2RGB),
-                                       (MASK_W, MASK_H // 2))
+                                       (MASK_W, cell_h))
                 elev_small = cv2.resize(cv2.cvtColor(elevations[i], cv2.COLOR_BGR2RGB),
-                                        (MASK_W, MASK_H // 2))
+                                        (MASK_W, cell_h))
                 # RGB mask (top half)
                 top = render_mask(rgb_small, all_masks[i, 0, j], j)
                 cv2.putText(top, f"RGB {JOINT_NAMES[j]}", (3, 10),
