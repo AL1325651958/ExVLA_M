@@ -396,13 +396,19 @@ def main():
                 skipped += 1
         model.load_state_dict(filtered_state, strict=False)
         print(f"  [resume] loaded {len(filtered_state)} keys, skipped {skipped} (size mismatch or missing)")
-        if "optimizer_state_dict" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        if "scaler_state_dict" in ckpt:
-            scaler.load_state_dict(ckpt["scaler_state_dict"])
+        try:
+            if "optimizer_state_dict" in ckpt:
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            if "scaler_state_dict" in ckpt:
+                scaler.load_state_dict(ckpt["scaler_state_dict"])
+        except (ValueError, KeyError) as e:
+            print(f"  [resume] optimizer/scaler state incompatible ({e}), using fresh optimizer")
         if "scheduler_state_dict" in ckpt:
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-            print(f"  [resume] scheduler LR restored to {scheduler.get_last_lr()[0]:.2e}")
+            try:
+                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+                print(f"  [resume] scheduler LR restored to {scheduler.get_last_lr()[0]:.2e}")
+            except (ValueError, KeyError):
+                print(f"  [resume] scheduler state incompatible, using fresh scheduler")
         start_epoch = ckpt.get("epoch", 0)
         best_loss = ckpt.get("metrics", {}).get("loss", float("inf"))
         print(f"Resumed from {args.resume} at epoch {start_epoch}")
