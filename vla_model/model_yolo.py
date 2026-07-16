@@ -136,15 +136,21 @@ class SpatioTemporalPosEmbed(nn.Module):
 
 class MaskBiasedCrossAttn(nn.Module):
     """Cross-attention where mask_j controls BOTH attention logits AND value.
-    A_ij = softmax_j(Q_i·K_j/√d + λ·log(M_j+ε))
-    out_i = Σ_j A_ij · (V_j · M_j)
+
+    A_ij = softmax_j(Q_i·K_j/√d + λ_log·log(M_j+ε))
+    out_i = Σ_j A_ij · (V_j · (1 + λ_v · M_j))
+
+    Residual value gating: mask≈0 keeps base signal; mask≈1 boosts by factor (1+λ_v).
+    No information is zeroed out — masks only enhance relevant regions.
     """
-    def __init__(self, d_model, nhead, dropout=0.1, lambda_mask=3.0):
+    def __init__(self, d_model, nhead, dropout=0.1, lambda_mask=3.0, lambda_value=1.5, residual=True):
         super().__init__()
         self.nhead = nhead
         self.head_dim = d_model // nhead
         self.scale = self.head_dim ** -0.5
         self.lambda_mask = lambda_mask
+        self.lambda_value = lambda_value
+        self.residual = residual
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
@@ -162,17 +168,21 @@ class MaskBiasedCrossAttn(nn.Module):
         logits = logits + self.lambda_mask * log_m
         attn = logits.softmax(dim=-1)
         attn = self.dropout(attn)
-        V_gated = V * mask_j.unsqueeze(1).unsqueeze(-1)
+        m = mask_j.unsqueeze(1).unsqueeze(-1)                      # [B,1,1,N]
+        if self.residual:
+            V_gated = V * (1.0 + self.lambda_value * m)             # residual boost, no zeroing
+        else:
+            V_gated = V * m
         out = (attn @ V_gated).permute(0, 2, 1, 3).reshape(B, 1, D)
         return self.out_proj(out)
 
 
 class MaskBiasedDecoderLayer(nn.Module):
     """Decoder layer: self-attn → mask-biased cross-attn → FFN (norm_first)."""
-    def __init__(self, d_model, nhead, ff_dim, dropout=0.1, lambda_mask=3.0):
+    def __init__(self, d_model, nhead, ff_dim, dropout=0.1, lambda_mask=3.0, lambda_value=1.5, residual=True):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
-        self.cross_attn = MaskBiasedCrossAttn(d_model, nhead, dropout, lambda_mask)
+        self.cross_attn = MaskBiasedCrossAttn(d_model, nhead, dropout, lambda_mask, lambda_value, residual)
         self.ff1 = nn.Linear(d_model, ff_dim)
         self.ff2 = nn.Linear(ff_dim, d_model)
         self.n1 = nn.LayerNorm(d_model)

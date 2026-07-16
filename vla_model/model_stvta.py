@@ -107,7 +107,8 @@ class SingleModalityBranch(nn.Module):
 
         # Decoder layers (mask-biased cross-attention)
         self.decoder_layers = nn.ModuleList([
-            MaskBiasedDecoderLayer(hidden_dim, n_heads, ff_dim, dropout, lambda_mask=3.0)
+            MaskBiasedDecoderLayer(hidden_dim, n_heads, ff_dim, dropout,
+                                   lambda_mask=2.0, lambda_value=1.5, residual=True)
             for _ in range(max(2, n_layers // 2))
         ])
 
