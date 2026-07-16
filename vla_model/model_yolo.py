@@ -264,7 +264,13 @@ class ExcavatorVLAYolo(nn.Module):
         grid_size = img_size // 16
         total_grid_dim = 3 * grid_dim * 2
         self.grid_size = grid_size
-        self.grid_proj = nn.Linear(total_grid_dim, hidden_dim)
+        self.grid_proj = nn.Linear(2 * hidden_dim, hidden_dim)  # V16: cat of 2×D → D
+
+        # V16: separate per-modality projections + cross-modal attention
+        self.rgb_proj = nn.Linear(grid_dim * 3, hidden_dim)       # 768 → 512
+        self.elev_proj = nn.Linear(grid_dim * 3, hidden_dim)      # 768 → 512
+        self.cross_rgb_from_elev = nn.MultiheadAttention(hidden_dim, 4, dropout=dropout, batch_first=True)
+        self.cross_elev_from_rgb = nn.MultiheadAttention(hidden_dim, 4, dropout=dropout, batch_first=True)
 
         # ── V10+ temporal mask mixer (across-frame at each grid location) ──
         if version in ("v10", "v11"):
@@ -418,7 +424,23 @@ class ExcavatorVLAYolo(nn.Module):
         n3_e, n4_e, n5_e = self.elev_neck(p3_e, p4_e, p5_e)
         grid_elev = self.elev_head(n3_e, n4_e, n5_e, G)
 
-        grid = torch.cat([grid_rgb, grid_elev], dim=-1)
+        # V16: project each modality separately, then cross-modal attention
+        grid_rgb_flat = grid_rgb.view(B * T, G * G, -1)             # [BT, G², 768]
+        grid_elev_flat = grid_elev.view(B * T, G * G, -1)           # [BT, G², 768]
+        rgb_D = self.rgb_proj(grid_rgb_flat).view(B, T, G, G, D)   # [B, T, G, G, 512]
+        elev_D = self.elev_proj(grid_elev_flat).view(B, T, G, G, D)
+
+        # Cross-modal: RGB tokens attend to Elevation tokens and vice versa
+        # Done as token-level exchange at each spatial position
+        rgb_tokens = rgb_D.reshape(B, T * G * G, D)
+        elev_tokens = elev_D.reshape(B, T * G * G, D)
+        rgb_enhanced = self.cross_rgb_from_elev(rgb_tokens, elev_tokens, elev_tokens)[0]
+        elev_enhanced = self.cross_elev_from_rgb(elev_tokens, rgb_tokens, rgb_tokens)[0]
+        rgb_D = rgb_enhanced.reshape(B, T, G, G, D)
+        elev_D = elev_enhanced.reshape(B, T, G, G, D)
+
+        # Fuse: RGB + Elev channels concatenated, then projected back to D
+        grid = torch.cat([rgb_D, elev_D], dim=-1)
         grid = self.grid_proj(grid).view(B, T, G, G, D)
 
         # ── V11 residual motion fusion (pure visual; before temporal mixer) ──
