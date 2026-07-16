@@ -118,13 +118,23 @@ def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, conf
             circle_err = (raw_4d.pow(2).sum(dim=-1) - 1.0).pow(2).mean()
             circle_loss = 0.1 * circle_err
 
-            # 3. Target area
-            rho_min, rho_max = 0.05, 0.30
-            area_j = masks_spatial.mean(dim=(-2, -1))
-            area_mean = area_j.mean()
-            area_below = torch.relu(rho_min - area_mean).pow(2)
-            area_above = torch.relu(area_mean - rho_max).pow(2)
-            area_loss = 1.0 * (area_below + area_above)
+            # 3. Per-joint target area
+            # V16: masks_spatial = [B, 2, 4, T, G, G] (modality × joint × time × spatial)
+            # Compute per-joint union mask (RGB ∪ Elev), then area per joint per sample.
+            # Boom/Arm/Bucket: [0.05, 0.30]  —  local features
+            # Swing:           [0.10, 0.70]  —  rotation needs global context
+            union_masks = 1.0 - (1.0 - masks_spatial[:, 0]) * (1.0 - masks_spatial[:, 1])  # [B, 4, T, G, G]
+            area_per_joint = union_masks.mean(dim=(-2, -1))                                  # [B, 4, T] → mean over T
+            area_per_joint = area_per_joint.mean(dim=-1)                                       # [B, 4]
+            # Boom/Arm/Bucket (indices 0,1,2)
+            area_planar = area_per_joint[:, :3]
+            area_loss_planar = (torch.relu(0.05 - area_planar).pow(2) +
+                                torch.relu(area_planar - 0.30).pow(2)).mean()
+            # Swing (index 3) — wider range, lower weight
+            area_swing = area_per_joint[:, 3]
+            area_loss_swing = (torch.relu(0.10 - area_swing).pow(2) +
+                               torch.relu(area_swing - 0.70).pow(2)).mean()
+            area_loss = 1.0 * area_loss_planar + 0.2 * area_loss_swing
 
             # 4. Cosine-similarity overlap with margin
             # V16: [B, 2, 4, T, G, G] → flatten to [B, 8, T*G*G] for all-mask diversity
