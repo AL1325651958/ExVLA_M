@@ -65,7 +65,7 @@ def build_v10_model(seq_len=8, img_size=224, hidden_dim=512, n_heads=8,
 
 # ── V10-specific training ──
 
-def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch):
+def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, config, epoch):
     model.train()
     total_loss = 0.0
     total_mae = np.zeros(4)
@@ -137,6 +137,7 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch):
         torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
         scaler.step(optimizer)
         scaler.update()
+        scheduler.step()       # per-batch LR scheduling
 
         total_loss += loss.item()
         action_pred_rad = model.decode_action(raw_out.detach())
@@ -345,9 +346,8 @@ def main():
 
     for epoch in range(start_epoch, config.epochs):
         t0 = time.time()
-        train_metrics = train_epoch(model, train_loader, optimizer, scaler,
+        train_metrics = train_epoch(model, train_loader, optimizer, scaler, scheduler,
                                      criterion, config, epoch)
-        scheduler.step()
 
         if ema_model is not None:
             with torch.no_grad():
