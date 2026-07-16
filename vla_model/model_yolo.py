@@ -304,12 +304,9 @@ class ExcavatorVLAYolo(nn.Module):
         # ── Joint-conditioned mask heads ──
         # Each joint has a learnable embedding; mask_j sees tokens + joint_embed[j].
         # This guarantees mask_0 → Boom, mask_1 → Arm, mask_2 → Bucket, mask_3 → Swing.
-        self.joint_embed = nn.Parameter(torch.randn(self.num_joints, hidden_dim) * 0.02)
-        self.mask_generator = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim // 2), nn.GELU(),
-            nn.Linear(hidden_dim // 2, 1),
-        )
+        self.joint_embed = nn.Parameter(torch.randn(self.num_joints, hidden_dim) * 0.5)
+        self.mask_linear1 = nn.Linear(hidden_dim, hidden_dim // 2)
+        self.mask_linear2 = nn.Linear(hidden_dim // 2, 1)
 
         self.num_excavators = num_excavators
         self.excv_embed = nn.Embedding(num_excavators, hidden_dim)
@@ -354,14 +351,11 @@ class ExcavatorVLAYolo(nn.Module):
                         if module.bias is not None:
                             nn.init.zeros_(module.bias)
         nn.init.normal_(self.excv_embed.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.joint_embed, mean=0.0, std=0.02)
-        # Shared mask generator: last bias = -1 → sigmoid(-1) ≈ 0.27
-        for module in self.mask_generator:
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight, gain=0.1)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-        nn.init.constant_(self.mask_generator[-1].bias, -1.0)
+        nn.init.normal_(self.joint_embed, mean=0.0, std=0.5)
+        nn.init.xavier_uniform_(self.mask_linear1.weight, gain=1.0)
+        nn.init.zeros_(self.mask_linear1.bias)
+        nn.init.xavier_uniform_(self.mask_linear2.weight, gain=0.5)
+        nn.init.constant_(self.mask_linear2.bias, -1.0)
         # Elevation adapter: small init
         for module in self.elev_adapter:
             if isinstance(module, nn.Conv2d):
@@ -439,6 +433,27 @@ class ExcavatorVLAYolo(nn.Module):
         rgb_D = rgb_enhanced.reshape(B, T, G, G, D)
         elev_D = elev_enhanced.reshape(B, T, G, G, D)
 
+        # ── V16: Independent masks from each modality before fusion ──
+        # RGB masks
+        rgb_t = rgb_D.reshape(B, T * G * G, D)
+        rgb_masks_list = []
+        for j in range(self.num_joints):
+            h = F.gelu(self.mask_linear1(rgb_t + self.joint_embed[j]))
+            m = torch.sigmoid(self.mask_linear2(h)).squeeze(-1)
+            rgb_masks_list.append(m.view(B, T, G, G))
+        rgb_masks = torch.stack(rgb_masks_list, dim=1)               # [B, 4, T, G, G]
+
+        # Elevation masks
+        elev_t = elev_D.reshape(B, T * G * G, D)
+        elev_masks_list = []
+        for j in range(self.num_joints):
+            h = F.gelu(self.mask_linear1(elev_t + self.joint_embed[j]))
+            m = torch.sigmoid(self.mask_linear2(h)).squeeze(-1)
+            elev_masks_list.append(m.view(B, T, G, G))
+        elev_masks = torch.stack(elev_masks_list, dim=1)             # [B, 4, T, G, G]
+
+        masks_spatial = torch.stack([rgb_masks, elev_masks], dim=1)  # [B, 2, 4, T, G, G]
+
         # Fuse: RGB + Elev channels concatenated, then projected back to D
         grid = torch.cat([rgb_D, elev_D], dim=-1)
         grid = self.grid_proj(grid).view(B, T, G, G, D)
@@ -462,19 +477,11 @@ class ExcavatorVLAYolo(nn.Module):
         if excavator_id is not None:
             tokens = tokens + self.excv_embed(excavator_id).unsqueeze(1)
 
-        # ── Joint-conditioned masks ──
-        # mask_j = sigmoid(mask_heads[j](tokens + joint_embed[j]))
-        # Each mask is explicitly tied to one joint through the embedding.
-        masks_list = []
-        for j in range(self.num_joints):
-            cond = tokens + self.joint_embed[j]
-            m_j = torch.sigmoid(self.mask_generator(cond)).squeeze(-1)
-            masks_list.append(m_j)
-        masks_flat = torch.stack(masks_list, dim=1)                 # [B, 4, N]
-        masks_spatial = masks_flat.view(B, self.num_joints, T, G, G)
-
-        # ── Soft union gate for shared encoder ──
-        gate = 1.0 - (1.0 - masks_flat).prod(dim=1)                # [B, N]
+        # ── Soft union gate from all 8 modality-specific masks ──
+        # V16: masks already computed from rgb_D / elev_D before fusion.
+        # Union over all (2 modalities × 4 joints) for encoder gating.
+        masks_all = masks_spatial.reshape(B, 2 * self.num_joints, T * G * G)
+        gate = 1.0 - (1.0 - masks_all).prod(dim=1)                 # [B, N]
         gate = 0.02 + 0.98 * gate
         gated_tokens = tokens * gate.unsqueeze(-1)
 
@@ -483,13 +490,14 @@ class ExcavatorVLAYolo(nn.Module):
         memory = self.encoder(gated_tokens)
 
         # ── Mask-biased joint cross-attention decoder ──
-        # Each joint query decodes through its own mask_j:
-        #   attn_logits += λ·log(mask_j + ε), value *= mask_j
+        # Each joint query sees union of its RGB + Elev masks
         decoded_list = []
         for j in range(self.num_joints):
+            m_j = 1.0 - (1.0 - masks_spatial[:, 0, j]) * (1.0 - masks_spatial[:, 1, j])
+            m_j = m_j.reshape(B, T * G * G)                                # [B, N]
             tgt = self.joint_queries[:, j:j+1, :].expand(B, -1, -1)
             for layer in self.decoder_layers:
-                tgt = layer(tgt, memory, masks_flat[:, j, :])
+                tgt = layer(tgt, memory, m_j)
             decoded_list.append(tgt)
         decoded = torch.cat(decoded_list, dim=1)
 
@@ -504,7 +512,7 @@ class ExcavatorVLAYolo(nn.Module):
                     acts_e.append(a_j)
                 action[mask_e] = torch.cat(acts_e, dim=-1).float()
 
-        avg_masks = masks_spatial.mean(dim=2)                       # [B, 4, G, G]
+        avg_masks = masks_spatial.mean(dim=3)                       # [B, 2, 4, G, G]
         outputs = (action, avg_masks, masks_spatial)
         if return_aux and self.pose_aux_head is not None:
             # Pose auxiliary: predict current qpos from last-frame spatial tokens
