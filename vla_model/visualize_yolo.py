@@ -155,8 +155,7 @@ def detect_version(state_keys):
     # V16: has cross-modal attention or separate modality projections
     has_v16 = any("rgb_proj" in k or "cross_rgb_from_elev" in k for k in state_keys)
     if has_v16:
-        # V16 still has temporal_mask_mixer (version="v10" in training)
-        return "V16", True, "v10"
+        return "V16", True, "v16"
     has_v11 = any(k.startswith("motion_adapter.") for k in state_keys)
     if has_v11:
         return "V11", False, "v11"
