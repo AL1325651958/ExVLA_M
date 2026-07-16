@@ -39,8 +39,10 @@ Config.v10_pose_aux_weight = 0.05
 # ── Shared utilities (same as train_yolo.py) ──
 
 def _circular_error(pred_rad, gt_rad):
-    """Wrap-aware element-wise difference in [-π, π]."""
+    """Wrap-aware element-wise difference in [-π, π] (torch or numpy)."""
     delta = pred_rad - gt_rad
+    if isinstance(delta, torch.Tensor):
+        return torch.atan2(torch.sin(delta), torch.cos(delta))
     return np.arctan2(np.sin(delta), np.cos(delta))
 
 

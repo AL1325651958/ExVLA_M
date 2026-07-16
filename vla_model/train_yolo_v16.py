@@ -37,8 +37,10 @@ from vla_model.dataset import ExcavatorDataset
 # ── Shared utilities ──
 
 def _circular_error(pred_rad, gt_rad):
-    """Wrap-aware element-wise difference in [-π, π]."""
+    """Wrap-aware element-wise difference in [-π, π] (torch or numpy)."""
     delta = pred_rad - gt_rad
+    if isinstance(delta, torch.Tensor):
+        return torch.atan2(torch.sin(delta), torch.cos(delta))
     return np.arctan2(np.sin(delta), np.cos(delta))
 
 
@@ -100,7 +102,7 @@ def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, conf
 
         optimizer.zero_grad()
 
-        with autocast():
+        with torch.amp.autocast(config.device):
             # V16: 3-output path (no pose_aux)
             raw_out, masks_avg, masks_spatial = model(
                 rgb, elevation, qpos, excavator_id
@@ -329,7 +331,7 @@ def main():
     cosine = CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
     scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps])
 
-    scaler   = GradScaler()
+    scaler   = torch.amp.GradScaler(config.device)
     criterion = nn.MSELoss()
 
     # ── EMA ──
