@@ -68,9 +68,10 @@ def _rad_to_output(rad: torch.Tensor, out_dims=(2, 2, 2, 2)) -> torch.Tensor:
 
 
 def build_v17_model(seq_len=8, img_size=224, hidden_dim=512, n_heads=8,
-                     n_layers=4, ff_dim=2048, dropout=0.1, pretrained=True,
+                     n_layers=3, ff_dim=2048, dropout=0.25, pretrained=True,
                      num_excavators=4):
-    """Construct a V17 model: 4 independent mask heads + graded per-joint decoder."""
+    """Construct a V17 model: 4 independent mask heads + graded per-joint decoder.
+    Defaults: n_layers=3 (lighter), dropout=0.25 (anti-overfit)."""
     return ExcavatorVLAYolo(
         seq_len=seq_len, img_size=img_size, hidden_dim=hidden_dim,
         n_heads=n_heads, n_layers=n_layers, ff_dim=ff_dim,
@@ -154,7 +155,12 @@ def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, conf
             temp_diff = (masks_spatial[:, :, :, 1:] - masks_spatial[:, :, :, :-1]).abs().mean()
             temp_loss = 0.005 * temp_diff
 
-            loss = pred_loss + circle_loss + area_loss + diversity_loss + temp_loss
+            # ── Mask regularization decay ──
+            # Full strength (< epoch 40): enforce mask structure during early learning.
+            # Decays to 0.1× after epoch 40: let masks freely adapt to the task.
+            reg_scale = 1.0 if epoch < 40 else max(0.1, 1.0 - 0.9 * (epoch - 39) / max(1, config.epochs - 40))
+
+            loss = pred_loss + circle_loss + reg_scale * (area_loss + diversity_loss + temp_loss)
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -298,6 +304,7 @@ def main():
     print(f"Device: {config.device}")
     print(f"V17: 4 independent mask heads + graded per-joint decoder gating")
     print(f"     Boom(λ_m=1.5/λ_v=0.8) Arm(λ_m=2.0/λ_v=1.0) Bucket(λ_m=2.5/λ_v=1.0) Swing(λ_m=0/λ_v=0.5)")
+    print(f"     Anti-overfit: n_layers=3  dropout=0.25  weight_decay=1e-3  mask_reg_decay(40→0.1x)")
     print(f"Config: {json.dumps({k: str(v) for k, v in config.__dict__.items() if not k.startswith('_')}, indent=2)}")
 
     # ── Datasets ──
@@ -322,6 +329,9 @@ def main():
                               shuffle=False, num_workers=0, pin_memory=True) if len(val_dataset) > 0 else None
 
     # ── V17 Model ──
+    # Anti-overfitting defaults: lighter encoder + stronger dropout
+    config.n_layers = 3
+    config.dropout   = 0.25
     model = build_v17_model(
         seq_len=config.seq_len, img_size=config.img_size,
         hidden_dim=config.hidden_dim, n_heads=config.n_heads,
@@ -337,6 +347,7 @@ def main():
           f"{config.seq_len * G ** 2 + model.num_joints}")
 
     # ── Optimiser + scheduler ──
+    config.weight_decay = 1e-3  # stronger than default 3e-4 (anti-overfit)
     optimizer = AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     total_steps = len(train_loader) * config.epochs
     warmup_steps = int(total_steps * config.warmup_ratio)
