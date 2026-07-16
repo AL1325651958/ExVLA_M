@@ -490,11 +490,16 @@ class ExcavatorVLAYolo(nn.Module):
         memory = self.encoder(gated_tokens)
 
         # ── Mask-biased joint cross-attention decoder ──
-        # Each joint query sees union of its RGB + Elev masks
+        # Each joint query sees union of its RGB + Elev masks.
+        # EXCEPTION: Swing (j=3) uses ones-like mask — rotation detection needs
+        # global scene context; mask-gating destroys the global signal.
         decoded_list = []
         for j in range(self.num_joints):
-            m_j = 1.0 - (1.0 - masks_spatial[:, 0, j]) * (1.0 - masks_spatial[:, 1, j])
-            m_j = m_j.reshape(B, T * G * G)                                # [B, N]
+            if j == 3:  # Swing: unmasked memory for global rotation context
+                m_j = torch.ones(B, T * G * G, device=memory.device, dtype=memory.dtype)
+            else:
+                m_j = 1.0 - (1.0 - masks_spatial[:, 0, j]) * (1.0 - masks_spatial[:, 1, j])
+                m_j = m_j.reshape(B, T * G * G)                            # [B, N]
             tgt = self.joint_queries[:, j:j+1, :].expand(B, -1, -1)
             for layer in self.decoder_layers:
                 tgt = layer(tgt, memory, m_j)
