@@ -182,23 +182,18 @@ class SingleModalityBranch(nn.Module):
         gated_grid = self.temporal_mixer(gated_grid)
         tokens_mixed = gated_grid.reshape(B, T * G * G, D)
 
-        # Encoder
+        # Encoder (single pass on gated tokens)
         memory = self.encoder(tokens_mixed)                        # [B, N, D]
 
-        # Also keep raw encoder output (before gate) for joints needing global view
-        raw_tokens = tokens.reshape(B, T, G, G, D)
-        raw_tokens = self.temporal_mixer(raw_tokens)
-        raw_tokens = raw_tokens.reshape(B, T * G * G, D)
-        raw_memory = self.encoder(raw_tokens)                      # [B, N, D] — un-gated
-
         # Mask-biased joint decoder
+        # Swing (index 3): uses ones-like mask → reads full unmasked memory
+        # Other joints: reads mask_j-gated memory
         decoded_list = []
         for j in range(self.num_joints):
             tgt = self.joint_queries[:, j:j+1, :].expand(B, -1, -1)
-            # Swing (index 3): use raw (unmasked) memory for global rotation context
-            mem_use = raw_memory if j == 3 else memory
+            m_j = torch.ones_like(masks_flat[:, j, :]) if j == 3 else masks_flat[:, j, :]
             for layer in self.decoder_layers:
-                tgt = layer(tgt, mem_use, masks_flat[:, j, :] if j != 3 else torch.ones_like(masks_flat[:, j, :]))
+                tgt = layer(tgt, memory, m_j)
             decoded_list.append(tgt)
         decoded = torch.cat(decoded_list, dim=1)                   # [B, 4, D]
 
