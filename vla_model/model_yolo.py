@@ -279,7 +279,7 @@ class ExcavatorVLAYolo(nn.Module):
         self.cross_elev_from_rgb = nn.MultiheadAttention(hidden_dim, 4, dropout=dropout, batch_first=True)
 
         # ── V10+ temporal mask mixer (across-frame at each grid location) ──
-        if version in ("v10", "v11"):
+        if version in ("v10", "v11", "v17.1"):
             self.temporal_mask_mixer = TemporalMaskMixer(
                 hidden_dim, nhead=max(4, n_heads // 2), num_layers=1,
                 ff_dim=hidden_dim * 2, dropout=dropout,

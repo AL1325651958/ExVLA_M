@@ -152,8 +152,11 @@ def select_mask_view(masks_spatial, mask_view, is_v16):
 
 def detect_version(state_keys):
     """Return (version_tag, is_v16, model_version_arg)."""
-    # V17: has joint_logit_bias buffer (4 independent mask heads + per-joint decoder params)
+    # V17.1: V17 features + restored V10 TemporalMaskMixer/pose_aux
     has_v17 = any("joint_logit_bias" in k for k in state_keys)
+    has_temporal = any("temporal_mask_mixer" in k or "pose_aux_head" in k for k in state_keys)
+    if has_v17 and has_temporal:
+        return "V17.1", True, "v17.1"
     if has_v17:
         return "V17", True, "v17"
     # V16: has cross-modal attention or separate modality projections
