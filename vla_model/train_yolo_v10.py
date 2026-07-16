@@ -38,10 +38,25 @@ Config.v10_pose_aux_weight = 0.05
 
 # ── Shared utilities (same as train_yolo.py) ──
 
-def _compute_r2(ss_res, sum_y, sum_y2, n):
-    ss_tot = sum_y2 - (sum_y ** 2) / n
-    ss_tot = np.maximum(ss_tot, 1e-10)
-    r2 = 1 - ss_res / ss_tot
+def _circular_error(pred_rad, gt_rad):
+    """Wrap-aware element-wise difference in [-π, π]."""
+    delta = pred_rad - gt_rad
+    return np.arctan2(np.sin(delta), np.cos(delta))
+
+
+def _compute_r2_circular(ss_res, sum_y, sum_y2, n, swing_labels):
+    """R² per joint [4]. Swing (index 3) uses circular (wrap-aware) statistics."""
+    r2 = np.zeros(4)
+    for j in range(3):
+        ss_tot = sum_y2[j] - (sum_y[j] ** 2) / n
+        ss_tot = np.maximum(ss_tot, 1e-10)
+        r2[j] = 1 - ss_res[j] / ss_tot
+    # Swing: circular variance — same approach as Boom/Arm/Bucket but wrap-aware
+    s = np.asarray(swing_labels)
+    sin_m, cos_m = np.sin(s).mean(), np.cos(s).mean()
+    var_circ = 1.0 - np.sqrt(sin_m ** 2 + cos_m ** 2)
+    var_circ = np.maximum(var_circ, 1e-10)
+    r2[3] = 1 - ss_res[3] / (var_circ * n)
     return r2, float(r2.mean())
 
 
@@ -74,6 +89,7 @@ def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, conf
     sum_y2 = np.zeros(4)
     n_total = 0
     n_batches = 0
+    swing_labels = []  # collect Swing labels for circular R²
     out_dims = getattr(model, 'out_dims', (2, 2, 2, 2))
     aux_weight = getattr(config, 'v10_pose_aux_weight', 0.05)
 
@@ -141,21 +157,28 @@ def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, conf
 
         total_loss += loss.item()
         action_pred_rad = model.decode_action(raw_out.detach())
-        mae = (action_pred_rad - action_gt_rad).abs().mean(dim=0).cpu().numpy()
+        # Per-joint MAE: Boom/Arm/Bucket use linear error; Swing uses circular (wrap-aware)
+        mae_linear = (action_pred_rad - action_gt_rad).abs()
+        mae_linear[..., 3] = _circular_error(action_pred_rad[..., 3], action_gt_rad[..., 3]).abs()
+        mae = mae_linear.mean(dim=0).cpu().numpy()
         total_mae += mae
 
         pred_cpu = action_pred_rad.cpu().numpy()
         label_cpu = action_gt_rad.cpu().numpy()
-        ss_res += ((pred_cpu - label_cpu) ** 2).sum(axis=0)
+        # Squared residuals: Swing uses circular (wrap-aware) error
+        ss_res_batch = (pred_cpu - label_cpu) ** 2
+        ss_res_batch[:, 3] = _circular_error(pred_cpu[:, 3], label_cpu[:, 3]) ** 2
+        ss_res += ss_res_batch.sum(axis=0)
         sum_y  += label_cpu.sum(axis=0)
         sum_y2 += (label_cpu ** 2).sum(axis=0)
         n_total += len(label_cpu)
         n_batches += 1
+        swing_labels.extend(label_cpu[:, 3].tolist())
 
         if step % config.log_interval == 0:
             pbar.set_postfix({"loss": f"{loss.item():.6f}", "mae": f"{mae.mean():.4f}"})
 
-    r2_per, r2_mean = _compute_r2(ss_res, sum_y, sum_y2, n_total)
+    r2_per, r2_mean = _compute_r2_circular(ss_res, sum_y, sum_y2, n_total, swing_labels)
     return {
         "loss": total_loss / n_batches,
         "mae": (total_mae / n_batches).tolist(),
@@ -176,6 +199,7 @@ def validate(model, dataloader, criterion, config):
     sum_y2 = np.zeros(4)
     n_total = 0
     n_batches = 0
+    swing_labels = []  # collect Swing labels for circular R²
     out_dims = getattr(model, 'out_dims', (2, 2, 2, 2))
 
     for batch in tqdm(dataloader, desc="Validating"):
@@ -192,18 +216,24 @@ def validate(model, dataloader, criterion, config):
 
         total_loss += loss.item()
         action_pred_rad = model.decode_action(raw_out)
-        mae = (action_pred_rad - action_gt_rad).abs().mean(dim=0).cpu().numpy()
+        # Per-joint MAE: Swing uses circular (wrap-aware) error
+        mae_linear = (action_pred_rad - action_gt_rad).abs()
+        mae_linear[..., 3] = _circular_error(action_pred_rad[..., 3], action_gt_rad[..., 3]).abs()
+        mae = mae_linear.mean(dim=0).cpu().numpy()
         total_mae += mae
 
         pred_cpu = action_pred_rad.cpu().numpy()
         label_cpu = action_gt_rad.cpu().numpy()
-        ss_res += ((pred_cpu - label_cpu) ** 2).sum(axis=0)
+        ss_res_batch = (pred_cpu - label_cpu) ** 2
+        ss_res_batch[:, 3] = _circular_error(pred_cpu[:, 3], label_cpu[:, 3]) ** 2
+        ss_res += ss_res_batch.sum(axis=0)
         sum_y  += label_cpu.sum(axis=0)
         sum_y2 += (label_cpu ** 2).sum(axis=0)
         n_total += len(label_cpu)
         n_batches += 1
+        swing_labels.extend(label_cpu[:, 3].tolist())
 
-    r2_per, r2_mean = _compute_r2(ss_res, sum_y, sum_y2, n_total)
+    r2_per, r2_mean = _compute_r2_circular(ss_res, sum_y, sum_y2, n_total, swing_labels)
     return {
         "loss": total_loss / n_batches,
         "mae": (total_mae / n_batches).tolist(),
