@@ -176,7 +176,7 @@ def validate(model, dataloader, criterion, config):
             "r2": r2.tolist(), "r2_mean": r2_mean}, grouped
 
 
-def save_checkpoint(model, optimizer, scaler, epoch, metrics, config, is_best=False):
+def save_checkpoint(model, optimizer, scaler, scheduler, epoch, metrics, config, is_best=False):
     os.makedirs(config.output_dir, exist_ok=True)
     suffix = "best" if is_best else f"epoch_{epoch+1}"
     path = os.path.join(config.output_dir, f"stvta_v13_checkpoint_{suffix}.pt")
@@ -184,6 +184,7 @@ def save_checkpoint(model, optimizer, scaler, epoch, metrics, config, is_best=Fa
         "epoch": epoch + 1, "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scaler_state_dict": scaler.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
         "metrics": metrics, "model_version": "v12",
     }, path)
     print(f"Checkpoint saved: {path}")
@@ -269,6 +270,9 @@ def main():
         print(f"  [resume] {len(filtered)} keys loaded, {skipped} skipped")
         if "optimizer_state_dict" in ckpt: optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if "scaler_state_dict" in ckpt: scaler.load_state_dict(ckpt["scaler_state_dict"])
+        if "scheduler_state_dict" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            print(f"  [resume] scheduler LR restored to {scheduler.get_last_lr()[0]:.2e}")
         start_epoch = ckpt.get("epoch", 0)
         best_loss = ckpt.get("metrics", {}).get("loss", float("inf"))
 
@@ -299,10 +303,10 @@ def main():
             print(f"  Excavator {eid}: n={g['n']}, MAE={g['mae_mean']:.4f}, R²={g['r2_mean']:.4f}")
         if val_m["loss"] < best_loss:
             best_loss = val_m["loss"]
-            save_checkpoint(model, optimizer, scaler, epoch, val_m, config, is_best=True)
+            save_checkpoint(model, optimizer, scaler, scheduler, epoch, val_m, config, is_best=True)
         if (epoch + 1) % config.save_interval == 0:
-            save_checkpoint(model, optimizer, scaler, epoch, val_m, config)
-    save_checkpoint(model, optimizer, scaler, config.epochs - 1, val_m, config)
+            save_checkpoint(model, optimizer, scaler, scheduler, epoch, val_m, config)
+    save_checkpoint(model, optimizer, scaler, scheduler, config.epochs - 1, val_m, config)
     with open(os.path.join(config.output_dir, "stvta_v13_history.json"), "w") as f:
         json.dump(history, f, indent=2)
 
