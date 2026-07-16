@@ -127,18 +127,19 @@ def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, conf
             area_loss = 1.0 * (area_below + area_above)
 
             # 4. Cosine-similarity overlap with margin
-            K = masks_spatial.size(1)
-            mf = masks_spatial.reshape(masks_spatial.size(0), K, -1)
+            # V16: [B, 2, 4, T, G, G] → flatten to [B, 8, T*G*G] for all-mask diversity
+            B_s = masks_spatial.size(0)
+            mf = masks_spatial.reshape(B_s, 8, -1)
             norms = mf.norm(dim=-1, keepdim=True).clamp_min(1e-6)
             mf_n = mf / norms
             cos_sim = torch.bmm(mf_n, mf_n.transpose(1, 2))
-            eye = torch.eye(K, device=cos_sim.device).unsqueeze(0)
+            eye = torch.eye(8, device=cos_sim.device).unsqueeze(0)
             off_diag = cos_sim * (1 - eye)
             margin = 0.3
             diversity_loss = 0.5 * torch.relu(off_diag - margin).pow(2).sum(dim=(-2, -1)).mean()
 
-            # 5. Temporal smoothness
-            temp_diff = (masks_spatial[:, :, 1:] - masks_spatial[:, :, :-1]).abs().mean()
+            # 5. Temporal smoothness — slice TIME dim (dim=3), NOT joint dim (dim=2)
+            temp_diff = (masks_spatial[:, :, :, 1:] - masks_spatial[:, :, :, :-1]).abs().mean()
             temp_loss = 0.005 * temp_diff
 
             loss = pred_loss + circle_loss + area_loss + diversity_loss + temp_loss
