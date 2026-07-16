@@ -152,6 +152,10 @@ def select_mask_view(masks_spatial, mask_view, is_v16):
 
 def detect_version(state_keys):
     """Return (version_tag, is_v16, model_version_arg)."""
+    # V17: has joint_logit_bias buffer (4 independent mask heads + per-joint decoder params)
+    has_v17 = any("joint_logit_bias" in k for k in state_keys)
+    if has_v17:
+        return "V17", True, "v17"
     # V16: has cross-modal attention or separate modality projections
     has_v16 = any("rgb_proj" in k or "cross_rgb_from_elev" in k for k in state_keys)
     if has_v16:

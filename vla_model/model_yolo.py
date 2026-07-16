@@ -160,7 +160,7 @@ class MaskBiasedCrossAttn(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, query, memory, mask_j, use_logit_bias=True, lambda_value=None):
+    def forward(self, query, memory, mask_j, use_logit_bias=True, lambda_mask=None, lambda_value=None):
         B, N, D = memory.shape
         Q = self.q_proj(query).view(B, 1, self.nhead, self.head_dim).permute(0, 2, 1, 3)
         K = self.k_proj(memory).view(B, N, self.nhead, self.head_dim).permute(0, 2, 1, 3)
@@ -168,8 +168,9 @@ class MaskBiasedCrossAttn(nn.Module):
 
         attn = Q @ K.transpose(-2, -1) * self.scale
         if use_logit_bias:
+            lm = lambda_mask if lambda_mask is not None else self.lambda_mask
             log_m = (mask_j + 1e-6).log().unsqueeze(1).unsqueeze(2)
-            attn = attn + self.lambda_mask * log_m
+            attn = attn + lm * log_m
         attn = attn.softmax(dim=-1)
         attn = self.dropout(attn)
         m = mask_j.unsqueeze(1).unsqueeze(-1)                      # [B,1,1,N]
@@ -196,9 +197,9 @@ class MaskBiasedDecoderLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.act = nn.GELU()
 
-    def forward(self, tgt, memory, mask_j, use_logit_bias=True, lambda_value=None):
+    def forward(self, tgt, memory, mask_j, use_logit_bias=True, lambda_mask=None, lambda_value=None):
         tgt = tgt + self.dropout(self.self_attn(self.n1(tgt), self.n1(tgt), self.n1(tgt), need_weights=False)[0])
-        tgt = tgt + self.cross_attn(self.n2(tgt), memory, mask_j, use_logit_bias=use_logit_bias, lambda_value=lambda_value)
+        tgt = tgt + self.cross_attn(self.n2(tgt), memory, mask_j, use_logit_bias=use_logit_bias, lambda_mask=lambda_mask, lambda_value=lambda_value)
         tgt = tgt + self.dropout(self.ff2(self.dropout(self.act(self.ff1(self.n3(tgt))))))
         return tgt
 
@@ -309,16 +310,34 @@ class ExcavatorVLAYolo(nn.Module):
         # ── Joint-conditioned mask heads ──
         # Each joint has a learnable embedding; mask_j sees tokens + joint_embed[j].
         # This guarantees mask_0 → Boom, mask_1 → Arm, mask_2 → Bucket, mask_3 → Swing.
-        # Swing has an INDEPENDENT mask head — rotation needs different features than
-        # the planar joints (Boom/Arm/Bucket), so sharing weights would drag it toward
-        # local patterns and hurt all four joints.
         self.joint_embed = nn.Parameter(torch.randn(self.num_joints, hidden_dim) * 0.5)
-        # Shared head for Boom / Arm / Bucket (indices 0,1,2)
-        self.mask_linear1 = nn.Linear(hidden_dim, hidden_dim // 2)
-        self.mask_linear2 = nn.Linear(hidden_dim // 2, 1)
-        # Independent head for Swing (index 3)
-        self.swing_mask_linear1 = nn.Linear(hidden_dim, hidden_dim // 2)
-        self.swing_mask_linear2 = nn.Linear(hidden_dim // 2, 1)
+
+        if version == "v17":
+            # V17: 4 independent mask heads — one per joint
+            # Boom(0): semi-soft mask (needs boom + body + partial global)
+            # Arm(1):  local mask (arm linkage region)
+            # Bucket(2): strong local mask (bucket + end-effector zone)
+            # Swing(3): global soft mask (full machine orientation + scene layout)
+            self.mask_linear1 = nn.ModuleList([
+                nn.Linear(hidden_dim, hidden_dim // 2) for _ in range(4)
+            ])
+            self.mask_linear2 = nn.ModuleList([
+                nn.Linear(hidden_dim // 2, 1) for _ in range(4)
+            ])
+            # Per-joint decoder parameters (registered as buffers so they survive .to(device))
+            self.register_buffer('joint_logit_bias',
+                torch.tensor([1.5, 2.0, 2.5, 0.0]))   # λ_mask: Boom<Arm<Bucket; Swing=0
+            self.register_buffer('joint_value_lambda',
+                torch.tensor([0.8, 1.0, 1.0, 0.5]))    # λ_v: Swing weakest, Boom medium
+            # NOTE: Non-V17 paths still use the shared/swing_split mask heads below
+            self.swing_mask_linear1 = None
+            self.swing_mask_linear2 = None
+        else:
+            # V16 and earlier: shared head for Boom/Arm/Bucket + independent Swing head
+            self.mask_linear1 = nn.Linear(hidden_dim, hidden_dim // 2)   # Boom/Arm/Bucket
+            self.mask_linear2 = nn.Linear(hidden_dim // 2, 1)
+            self.swing_mask_linear1 = nn.Linear(hidden_dim, hidden_dim // 2)  # Swing only
+            self.swing_mask_linear2 = nn.Linear(hidden_dim // 2, 1)
 
         self.num_excavators = num_excavators
         self.excv_embed = nn.Embedding(num_excavators, hidden_dim)
@@ -364,15 +383,21 @@ class ExcavatorVLAYolo(nn.Module):
                             nn.init.zeros_(module.bias)
         nn.init.normal_(self.excv_embed.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.joint_embed, mean=0.0, std=0.5)
-        nn.init.xavier_uniform_(self.mask_linear1.weight, gain=1.0)
-        nn.init.zeros_(self.mask_linear1.bias)
-        nn.init.xavier_uniform_(self.mask_linear2.weight, gain=0.5)
-        nn.init.constant_(self.mask_linear2.bias, -1.0)
-        # Swing independent mask head — same init
-        nn.init.xavier_uniform_(self.swing_mask_linear1.weight, gain=1.0)
-        nn.init.zeros_(self.swing_mask_linear1.bias)
-        nn.init.xavier_uniform_(self.swing_mask_linear2.weight, gain=0.5)
-        nn.init.constant_(self.swing_mask_linear2.bias, -1.0)
+        if self.version == "v17":
+            for j in range(4):
+                nn.init.xavier_uniform_(self.mask_linear1[j].weight, gain=1.0)
+                nn.init.zeros_(self.mask_linear1[j].bias)
+                nn.init.xavier_uniform_(self.mask_linear2[j].weight, gain=0.5)
+                nn.init.constant_(self.mask_linear2[j].bias, -1.0)
+        else:
+            nn.init.xavier_uniform_(self.mask_linear1.weight, gain=1.0)
+            nn.init.zeros_(self.mask_linear1.bias)
+            nn.init.xavier_uniform_(self.mask_linear2.weight, gain=0.5)
+            nn.init.constant_(self.mask_linear2.bias, -1.0)
+            nn.init.xavier_uniform_(self.swing_mask_linear1.weight, gain=1.0)
+            nn.init.zeros_(self.swing_mask_linear1.bias)
+            nn.init.xavier_uniform_(self.swing_mask_linear2.weight, gain=0.5)
+            nn.init.constant_(self.swing_mask_linear2.bias, -1.0)
         # Elevation adapter: small init
         for module in self.elev_adapter:
             if isinstance(module, nn.Conv2d):
@@ -450,33 +475,34 @@ class ExcavatorVLAYolo(nn.Module):
         rgb_D = rgb_enhanced.reshape(B, T, G, G, D)
         elev_D = elev_enhanced.reshape(B, T, G, G, D)
 
-        # ── V16: Independent masks from each modality before fusion ──
-        # Boom/Arm/Bucket (j=0,1,2): shared mask_linear1/2 + joint_embed[j]
-        # Swing (j=3): independent swing_mask_linear1/2 + joint_embed[3]
-        # RGB masks
+        # ── V16/V17: Independent masks from each modality before fusion ──
+        # V17: each joint has its own mask_linear1[j]/mask_linear2[j] (ModuleList)
+        # V16: Boom/Arm/Bucket share mask_linear1/2; Swing uses swing_mask_linear1/2
         rgb_t = rgb_D.reshape(B, T * G * G, D)
-        rgb_masks_list = []
-        for j in range(self.num_joints):
-            if j == 3:
-                h = F.gelu(self.swing_mask_linear1(rgb_t + self.joint_embed[j]))
-                m = torch.sigmoid(self.swing_mask_linear2(h)).squeeze(-1)
-            else:
-                h = F.gelu(self.mask_linear1(rgb_t + self.joint_embed[j]))
-                m = torch.sigmoid(self.mask_linear2(h)).squeeze(-1)
-            rgb_masks_list.append(m.view(B, T, G, G))
-        rgb_masks = torch.stack(rgb_masks_list, dim=1)               # [B, 4, T, G, G]
-
-        # Elevation masks
         elev_t = elev_D.reshape(B, T * G * G, D)
-        elev_masks_list = []
+        rgb_masks_list, elev_masks_list = [], []
         for j in range(self.num_joints):
-            if j == 3:
-                h = F.gelu(self.swing_mask_linear1(elev_t + self.joint_embed[j]))
-                m = torch.sigmoid(self.swing_mask_linear2(h)).squeeze(-1)
+            if self.version == "v17":
+                # Independent mask head per joint
+                h_r = F.gelu(self.mask_linear1[j](rgb_t + self.joint_embed[j]))
+                m_r = torch.sigmoid(self.mask_linear2[j](h_r)).squeeze(-1)
+                h_e = F.gelu(self.mask_linear1[j](elev_t + self.joint_embed[j]))
+                m_e = torch.sigmoid(self.mask_linear2[j](h_e)).squeeze(-1)
+            elif j == 3:
+                # V16 Swing: independent head
+                h_r = F.gelu(self.swing_mask_linear1(rgb_t + self.joint_embed[j]))
+                m_r = torch.sigmoid(self.swing_mask_linear2(h_r)).squeeze(-1)
+                h_e = F.gelu(self.swing_mask_linear1(elev_t + self.joint_embed[j]))
+                m_e = torch.sigmoid(self.swing_mask_linear2(h_e)).squeeze(-1)
             else:
-                h = F.gelu(self.mask_linear1(elev_t + self.joint_embed[j]))
-                m = torch.sigmoid(self.mask_linear2(h)).squeeze(-1)
-            elev_masks_list.append(m.view(B, T, G, G))
+                # V16 Boom/Arm/Bucket: shared head
+                h_r = F.gelu(self.mask_linear1(rgb_t + self.joint_embed[j]))
+                m_r = torch.sigmoid(self.mask_linear2(h_r)).squeeze(-1)
+                h_e = F.gelu(self.mask_linear1(elev_t + self.joint_embed[j]))
+                m_e = torch.sigmoid(self.mask_linear2(h_e)).squeeze(-1)
+            rgb_masks_list.append(m_r.view(B, T, G, G))
+            elev_masks_list.append(m_e.view(B, T, G, G))
+        rgb_masks = torch.stack(rgb_masks_list, dim=1)               # [B, 4, T, G, G]
         elev_masks = torch.stack(elev_masks_list, dim=1)             # [B, 4, T, G, G]
 
         masks_spatial = torch.stack([rgb_masks, elev_masks], dim=1)  # [B, 2, 4, T, G, G]
@@ -511,19 +537,27 @@ class ExcavatorVLAYolo(nn.Module):
         memory = self.encoder(tokens)
 
         # ── Mask-biased joint cross-attention decoder ──
-        # Boom/Arm/Bucket (j=0,1,2): mask logit-bias + residual value gating (λ_v=1.5)
-        # Swing (j=3): NO logit bias, weak residual only (λ_v=0.5) — global context
-        #   is essential for rotation detection; mask provides only a gentle boost.
+        # V17: per-joint graded parameters (Boom: λ_m=1.5/λ_v=0.8, Arm: 2.0/1.0,
+        #   Bucket: 2.5/1.0, Swing: 0.0/0.5). All joints use residual gating only.
+        # V16: Boom/Arm/Bucket use logit bias + residual; Swing uses weak residual only.
         decoded_list = []
         for j in range(self.num_joints):
             # Union of RGB + Elevation masks for this joint
             m_j = 1.0 - (1.0 - masks_spatial[:, 0, j]) * (1.0 - masks_spatial[:, 1, j])
             m_j = m_j.reshape(B, T * G * G)                            # [B, N]
             tgt = self.joint_queries[:, j:j+1, :].expand(B, -1, -1)
-            use_bias = (j != 3)                                        # Swing: no logit bias
-            lv = 0.5 if j == 3 else None                               # Swing: weak residual
-            for layer in self.decoder_layers:
-                tgt = layer(tgt, memory, m_j, use_logit_bias=use_bias, lambda_value=lv)
+            if self.version == "v17":
+                lb = self.joint_logit_bias[j].item()
+                lv = self.joint_value_lambda[j].item()
+                use_bias = (lb > 0.0)
+                for layer in self.decoder_layers:
+                    tgt = layer(tgt, memory, m_j, use_logit_bias=use_bias,
+                                lambda_mask=lb, lambda_value=lv)
+            else:
+                use_bias = (j != 3)                                    # Swing: no logit bias
+                lv = 0.5 if j == 3 else None                           # Swing: weak residual
+                for layer in self.decoder_layers:
+                    tgt = layer(tgt, memory, m_j, use_logit_bias=use_bias, lambda_value=lv)
             decoded_list.append(tgt)
         decoded = torch.cat(decoded_list, dim=1)
 
