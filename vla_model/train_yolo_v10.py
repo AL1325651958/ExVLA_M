@@ -213,7 +213,7 @@ def validate(model, dataloader, criterion, config):
     }
 
 
-def save_checkpoint(model, optimizer, scaler, epoch, metrics, config, is_best=False):
+def save_checkpoint(model, optimizer, scaler, scheduler, epoch, metrics, config, is_best=False):
     os.makedirs(config.output_dir, exist_ok=True)
     suffix = "best" if is_best else f"epoch_{epoch+1}"
     path = os.path.join(config.output_dir, f"yolo_checkpoint_{suffix}.pt")
@@ -222,6 +222,7 @@ def save_checkpoint(model, optimizer, scaler, epoch, metrics, config, is_best=Fa
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scaler_state_dict": scaler.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
         "metrics": metrics,
         "config": config,
         "model_version": "v10",
@@ -336,6 +337,9 @@ def main():
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if "scaler_state_dict" in ckpt:
             scaler.load_state_dict(ckpt["scaler_state_dict"])
+        if "scheduler_state_dict" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            print(f"  [resume] scheduler LR restored to {scheduler.get_last_lr()[0]:.2e}")
         start_epoch = ckpt.get("epoch", 0)
         best_loss = ckpt.get("metrics", {}).get("loss", float("inf"))
         print(f"Resumed from {args.resume} at epoch {start_epoch}")
@@ -385,12 +389,12 @@ def main():
 
         if val_metrics["loss"] < best_loss:
             best_loss = val_metrics["loss"]
-            save_checkpoint(model, optimizer, scaler, epoch, val_metrics, config, is_best=True)
+            save_checkpoint(model, optimizer, scaler, scheduler, epoch, val_metrics, config, is_best=True)
 
         if (epoch + 1) % config.save_interval == 0:
-            save_checkpoint(model, optimizer, scaler, epoch, val_metrics, config)
+            save_checkpoint(model, optimizer, scaler, scheduler, epoch, val_metrics, config)
 
-    save_checkpoint(model, optimizer, scaler, config.epochs - 1, val_metrics, config)
+    save_checkpoint(model, optimizer, scaler, scheduler, config.epochs - 1, val_metrics, config)
     print(f"\nTraining complete.  Best val loss: {best_loss:.6f}")
 
     with open(os.path.join(config.output_dir, "yolo_history.json"), "w") as f:
