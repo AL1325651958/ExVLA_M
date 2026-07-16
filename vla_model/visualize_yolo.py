@@ -1,4 +1,8 @@
-"""Visualize YOLO-ST-VLA: GT vs Pred curves + 4 learned task-region masks overlaid on RGB."""
+"""Visualize YOLO-ST-VLA: GT vs Pred curves + learned masks overlaid on RGB + Elevation.
+
+V9-V11: 4 single-modality masks (per-joint)
+V16:    8 dual-modality masks (RGB×4 + Elevation×4)
+"""
 
 import sys
 import argparse
@@ -22,14 +26,16 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 JOINT_NAMES = ['Boom', 'Arm', 'Bucket', 'Swing']
 JOINT_COLORS = ['#e74c3c', '#2ecc71', '#3498db', '#f39c12']
-REGION_NAMES = ['Mask 1', 'Mask 2', 'Mask 3', 'Mask 4']
+REGION_NAMES = J1, J2, J3, J4 = ['Boom', 'Arm', 'Bucket', 'Swing']
 REGION_COLORS = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 165, 0)]  # BGR
+MODALITY_NAMES = ['RGB', 'Elev']
 
 GT_COLOR = '#333333'
 PRED_COLOR = '#e74c3c'
 
 MAIN_W, MAIN_H = 270, 270
-MASK_W, MASK_H = 270, 270
+MASK_W, MASK_H = 135, 135        # V16: smaller panels to fit 8 masks
+MASK_W_LARGE, MASK_H_LARGE = 270, 270  # V9-V11: larger mask panels
 ELEV_W, ELEV_H = 270, 270
 CURVE_W = 900
 CURVE_H_PER_JOINT = 100
@@ -57,15 +63,14 @@ def resize_keep_aspect(img, target_w, target_h):
                               cv2.BORDER_CONSTANT, value=[255, 255, 255])
 
 
-def render_masks(rgb_bgr, mask, color_idx, G):
-    """Overlay a single region mask on the RGB image.
+def render_mask(bgr, mask, color_idx):
+    """Overlay a single region mask on an image.
     mask: [G, G] numpy, values in [0,1]
     color_idx: 0-3 index into REGION_COLORS
     Returns: BGR image with heatmap overlay.
     """
-    h, w = rgb_bgr.shape[:2]
-    overlay = rgb_bgr.copy().astype(np.float32)
-
+    h, w = bgr.shape[:2]
+    overlay = bgr.copy().astype(np.float32)
     mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_LINEAR)
     mask = np.clip(mask, 0, 1)
     m_min, m_max = mask.min(), mask.max()
@@ -75,7 +80,6 @@ def render_masks(rgb_bgr, mask, color_idx, G):
     alpha = 0.45
     for c in range(3):
         overlay[:, :, c] = overlay[:, :, c] * (1 - alpha * mask) + color[c] * (alpha * mask)
-
     return np.clip(overlay, 0, 255).astype(np.uint8)
 
 
@@ -129,44 +133,42 @@ def render_curves(timeline, targets, predictions, current_idx, frame_range=200):
     return buf
 
 
-def select_mask_view(masks_spatial, mask_view):
+def select_mask_view(masks_spatial, mask_view, is_v16):
     """Select mask view from temporal mask tensor.
-    masks_spatial: [B, K, T, G, G]
-    mask_view: 'avg' (V9 default) or 'last' (V10 default, raw last frame)
+
+    V9-V11: masks_spatial  [B, K, T, G, G]  where K=4
+    V16:    masks_spatial  [B, 2, 4, T, G, G]   (modality × joint × time × spatial)
     """
     if mask_view == "last":
-        return masks_spatial[:, :, -1]
+        if is_v16:
+            return masks_spatial[:, :, :, -1]    # [B, 2, 4, G, G]
+        return masks_spatial[:, :, -1]            # [B, 4, G, G]
     if mask_view == "avg":
-        return masks_spatial.mean(dim=2)
+        if is_v16:
+            return masks_spatial.mean(dim=3)       # [B, 2, 4, G, G]
+        return masks_spatial.mean(dim=2)            # [B, 4, G, G]
     raise ValueError(f"Unknown mask view: {mask_view}")
 
 
-def detect_model_version(state_keys, checkpoint):
-    """Return the visualizer architecture version for a checkpoint.
-
-    V11 is identified before V10 because it contains V10's temporal mixer as
-    well as its own ``motion_adapter`` residual branch.  Older checkpoints
-    intentionally retain the V9 fallback used by the existing remapping path.
-    """
-    checkpoint_version = checkpoint.get("model_version")
-    if (checkpoint_version == "v11" or
-            any(key.startswith("motion_adapter.") for key in state_keys)):
-        return "v11"
-    if (checkpoint_version == "v10" or
-            any("temporal_mask_mixer" in key or "pose_aux_head" in key
-                for key in state_keys)):
-        return "v10"
-    return "v9"
-
-
-def run_visual_inference(model, rgb_seq, elevation_seq, excavator_id):
-    """Run the deployed visual-only forward path used by the visualizer."""
-    return model(rgb_seq, elevation_seq, None, excavator_id)
+def detect_version(state_keys):
+    """Return (version_tag, is_v16, model_version_arg)."""
+    # V16: has cross-modal attention or separate modality projections
+    has_v16 = any("rgb_proj" in k or "cross_rgb_from_elev" in k for k in state_keys)
+    if has_v16:
+        # V16 still has temporal_mask_mixer (version="v10" in training)
+        return "V16", True, "v10"
+    has_v11 = any(k.startswith("motion_adapter.") for k in state_keys)
+    if has_v11:
+        return "V11", False, "v11"
+    has_v10 = any("temporal_mask_mixer" in k or "pose_aux_head" in k for k in state_keys)
+    if has_v10:
+        return "V10", False, "v10"
+    return "V9", False, "v9"
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Visualize V9, V10, or V11 YOLO-ST-VLA checkpoints")
+        description="Visualize V9-V16 YOLO-ST-VLA checkpoints")
     parser.add_argument("--checkpoint", type=str, default="output/YOLO_ST-VLA/yolo_checkpoint_best.pt")
     parser.add_argument("--data_path", type=str,
                         default="data/excavator-motion/data/75/xcmg_data_2025-04-11-17-46-49.hdf5")
@@ -178,7 +180,7 @@ def main():
     parser.add_argument("--no_masks", action="store_true", help="Skip mask overlay")
     parser.add_argument("--mask_view", type=str, default=None,
                         choices=["last", "avg"],
-                        help="V10/V11 default: last (raw); V9 default: avg")
+                        help="V10+/V16 default: last (raw); V9 default: avg")
     args = parser.parse_args()
 
     device = args.device if torch.cuda.is_available() else "cpu"
@@ -191,34 +193,29 @@ def main():
     sd_keys = set(state_dict.keys())
 
     # ── Detect version ──
-    is_v2 = any("delta_head" in k for k in sd_keys)
-    is_v3 = any("action_head" in k and "action_heads" not in k for k in sd_keys)
-    is_v5 = any("action_heads" in k for k in sd_keys) and not any("joint_embed" in k for k in sd_keys)
-    is_v8 = any("joint_embed" in k for k in sd_keys)
-    model_version = detect_model_version(sd_keys, ckpt)
-    is_v11 = model_version == "v11"
-    is_v10 = model_version == "v10"
-    is_temporal_version = model_version in ("v10", "v11")
-    v = ("V11" if is_v11 else "V10" if is_v10 else "V2" if is_v2 else
-         "V3/V4" if is_v3 else "V5-V7" if not is_v8 else "V8/V9")
-    print(f"  Detected: {v}")
-    # V10/V11 default: raw last-frame masks; V9 default: temporal average.
+    version_tag, is_v16, model_version_arg = detect_version(sd_keys)
+    is_temporal_version = model_version_arg in ("v10", "v11")
+
+    # V10+/V16 default: raw last-frame masks; V9 default: temporal average.
     if args.mask_view is None:
-        args.mask_view = "last" if is_temporal_version else "avg"
+        args.mask_view = "last" if (is_temporal_version or is_v16) else "avg"
+
+    print(f"  Detected: {version_tag} | mask_view={args.mask_view}")
 
     # ── Remap old keys ──
     remapped = {}
     for k, val in list(state_dict.items()):
         if "delta_head" in k or ("action_head." in k and "action_heads" not in k):
-            continue  # too old
+            continue
         if "qpos_mod" in k or "qpos_proj" in k:
-            continue  # V8 removed qpos modulation
+            continue
+        is_v5 = any("action_heads" in sk for sk in sd_keys) and not any("joint_embed" in sk for sk in sd_keys)
         if is_v5 and "action_heads." in k:
             parts = k.split(".")
             eid = int(parts[1])
             rest = ".".join(parts[2:])
             if rest.startswith("6.") or rest.startswith("3."):
-                continue  # output layer dim mismatch
+                continue
             for j in range(4):
                 remapped[f"action_heads.{eid}.{j}.{rest}"] = val.clone()
         if "mask_head" in k and "mask_heads" not in k:
@@ -246,7 +243,7 @@ def main():
         hidden_dim=hidden_dim, n_heads=8,
         n_layers=n_layers, ff_dim=ff_dim,
         dropout=0.0, pretrained=False,
-        version=model_version if is_temporal_version else "v9",
+        version=model_version_arg,
     ).to(device)
     model.load_state_dict(state_dict, strict=False)
     model.eval()
@@ -258,7 +255,6 @@ def main():
         mains = f['observations/images/main'][:]
         elevations = f['observations/images/elevation'][:]
         qpos = f['observations/qpos'][:].astype(np.float32)
-        # Target = next frame's absolute joint angle (matching dataset.py)
         targets = np.zeros_like(qpos)
         targets[:-1] = qpos[1:]
         targets[-1] = qpos[-1]
@@ -295,7 +291,10 @@ def main():
     # ── Inference ──
     print("Running inference...")
     predictions = np.full((N, 4), np.nan, dtype=np.float32)
-    all_masks = np.zeros((N, 4, G, G), dtype=np.float32)
+    if is_v16:
+        all_masks = np.zeros((N, 2, 4, G, G), dtype=np.float32)  # [modality, joint]
+    else:
+        all_masks = np.zeros((N, 4, G, G), dtype=np.float32)
     predictions[:T - 1] = targets[:T - 1]
 
     for start in tqdm(range(0, N - T), desc="  Inference"):
@@ -313,19 +312,13 @@ def main():
             elev_seq = torch.from_numpy(_elev).unsqueeze(0).to(device)
 
         with torch.no_grad():
-            outputs = run_visual_inference(model, rgb_seq, elev_seq, excv_tensor)
-            raw_out = outputs[0]
-            masks_spatial_raw = outputs[2]                                                        # [1,4,T,G,G]
-            masks_data = select_mask_view(masks_spatial_raw, args.mask_view)  # [1,4,G,G]
+            action, avg_masks, masks_spatial = model(rgb_seq, elev_seq, None, excv_tensor)
+            masks_data = select_mask_view(masks_spatial, args.mask_view, is_v16)
 
         tgt_idx = start + T - 1
-        # V2: decode_delta, V3+: decode_action
-        if hasattr(model, 'decode_action'):
-            action_pred = model.decode_action(raw_out)[0].cpu().numpy()
-        else:
-            action_pred = model.decode_delta(raw_out)[0].cpu().numpy()
+        action_pred = model.decode_action(action)[0].cpu().numpy()
         predictions[tgt_idx] = action_pred
-        all_masks[tgt_idx] = masks_data[0].cpu().numpy()  # [4, G, G]
+        all_masks[tgt_idx] = masks_data[0].cpu().numpy()
 
     # ── MAE ──
     valid = ~np.isnan(predictions[:, 0])
@@ -337,21 +330,18 @@ def main():
     # ── Render video ──
     print("Rendering video...")
     timeline = np.arange(N, dtype=np.float32)
-    curve_h = CURVE_H_PER_JOINT * 4
-
-    if not args.no_masks:
-        mask_w = MASK_W
-        mask_h = MASK_H
-        img_row_w = MAIN_W + 2 * mask_w
-        top_h = MAIN_H + ELEV_H + PAD
-    else:
-        img_row_w = MAIN_W + ELEV_W
-        mask_w = 0
-        mask_h = 0
-        top_h = MAIN_H
 
     title_h = 30
-    total_w = max(img_row_w, CURVE_W)
+
+    if args.no_masks:
+        total_w = MAIN_W + ELEV_W
+    elif is_v16:
+        # Layout: [MainRGB | ElevImg | J0_RGB J0_Elev | J1_RGB J1_Elev | J2_RGB J2_Elev | J3_RGB J3_Elev]
+        # Each mask panel is MASK_W × MASK_H//2
+        total_w = MAIN_W + ELEV_W + 4 * MASK_W
+    else:
+        total_w = MAIN_W + 2 * MASK_W_LARGE
+
     frames = []
 
     for i in tqdm(range(T - 1, N), desc="  Rendering"):
@@ -360,26 +350,47 @@ def main():
         elev = cv2.cvtColor(elevations[i], cv2.COLOR_BGR2RGB)
         elev = resize_keep_aspect(elev, ELEV_W, ELEV_H)
 
-        if not args.no_masks:
-            masks_i = all_masks[i]  # [4, G, G]
+        if args.no_masks:
+            top_section = np.concatenate([main_rgb, elev], axis=1)
+        elif is_v16:
+            # V16: 8 dual-modality mask panels
             mask_panels = []
+            for j in range(4):
+                rgb_small = cv2.resize(cv2.cvtColor(mains[i], cv2.COLOR_BGR2RGB),
+                                       (MASK_W, MASK_H // 2))
+                elev_small = cv2.resize(cv2.cvtColor(elevations[i], cv2.COLOR_BGR2RGB),
+                                        (MASK_W, MASK_H // 2))
+                # RGB mask (top half)
+                top = render_mask(rgb_small, all_masks[i, 0, j], j)
+                cv2.putText(top, f"RGB {JOINT_NAMES[j]}", (3, 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
+                # Elev mask (bottom half)
+                bot = render_mask(elev_small, all_masks[i, 1, j], j)
+                cv2.putText(bot, f"Elev {JOINT_NAMES[j]}", (3, 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
+                panel = np.concatenate([top, bot], axis=0)
+                mask_panels.append(panel)
 
-            # Each mask panel shows top-half (RGB+mask) + bottom-half (Elev+mask)
+            top_row = np.concatenate([main_rgb] + mask_panels[:2], axis=1)
+            bot_row = np.concatenate([elev] + mask_panels[2:], axis=1)
+            top_section = np.concatenate([top_row, bot_row], axis=0)
+        else:
+            # V9-V11: 4 single-modality mask panels
+            mask_w, mask_h = MASK_W_LARGE, MASK_H_LARGE
+            masks_i = all_masks[i]
+            mask_panels = []
             rgb_small = cv2.resize(mains[i], (mask_w, mask_h // 2))
             elev_small = cv2.resize(elevations[i], (mask_w, mask_h // 2))
             for k in range(4):
-                top = render_masks(rgb_small, masks_i[k], k, G)
-                bot = render_masks(elev_small, masks_i[k], k, G)
+                top = render_mask(rgb_small, masks_i[k], k)
+                bot = render_mask(elev_small, masks_i[k], k)
                 panel = np.concatenate([top, bot], axis=0)
                 cv2.putText(panel, f"{REGION_NAMES[k]} (RGB/Elev)", (5, 14),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
                 mask_panels.append(panel)
-
             top_row = np.concatenate([main_rgb] + mask_panels[:2], axis=1)
             bot_row = np.concatenate([elev, mask_panels[2], mask_panels[3]], axis=1)
             top_section = np.concatenate([top_row, bot_row], axis=0)
-        else:
-            top_section = np.concatenate([main_rgb, elev], axis=1)
 
         top_section_w = top_section.shape[1]
         section_padded = cv2.copyMakeBorder(
@@ -388,9 +399,11 @@ def main():
 
         # Title
         title_img = np.full((title_h, total_w, 3), 255, dtype=np.uint8)
-        cv2.putText(title_img, f"Frame: {i} / {N}  |  MAE: Boom={mae[0]:.4f} Arm={mae[1]:.4f} "
-                    f"Bucket={mae[2]:.4f} Swing={mae[3]:.4f}",
-                    (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (50, 50, 50), 1, cv2.LINE_AA)
+        mode_label = f" | Modality: RGB+Elev" if is_v16 else ""
+        cv2.putText(title_img, f"{version_tag} Frame: {i}/{N}  |  "
+                    f"MAE: Boom={mae[0]:.4f} Arm={mae[1]:.4f} "
+                    f"Bucket={mae[2]:.4f} Swing={mae[3]:.4f}{mode_label}",
+                    (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (50, 50, 50), 1, cv2.LINE_AA)
 
         # Curves
         curve_img = render_curves(timeline, targets, predictions, i, frame_range=200)
