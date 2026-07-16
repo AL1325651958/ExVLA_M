@@ -477,17 +477,11 @@ class ExcavatorVLAYolo(nn.Module):
         if excavator_id is not None:
             tokens = tokens + self.excv_embed(excavator_id).unsqueeze(1)
 
-        # ── Soft union gate from all 8 modality-specific masks ──
-        # V16: masks already computed from rgb_D / elev_D before fusion.
-        # Union over all (2 modalities × 4 joints) for encoder gating.
-        masks_all = masks_spatial.reshape(B, 2 * self.num_joints, T * G * G)
-        gate = 1.0 - (1.0 - masks_all).prod(dim=1)                 # [B, N]
-        gate = 0.02 + 0.98 * gate
-        gated_tokens = tokens * gate.unsqueeze(-1)
-
         # ── Bidirectional history encoder ──
         # Window of 8 past frames are all observed; no causal mask needed.
-        memory = self.encoder(gated_tokens)
+        # NO encoder gating: global context is essential for Swing (rotation detection).
+        # Mask-based filtering is applied only in the per-joint decoder cross-attention.
+        memory = self.encoder(tokens)
 
         # ── Mask-biased joint cross-attention decoder ──
         # Each joint query sees union of its RGB + Elev masks.
