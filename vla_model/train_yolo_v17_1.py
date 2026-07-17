@@ -29,7 +29,12 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from vla_model.config import Config
-from vla_model.model_yolo import ExcavatorVLAYolo, count_parameters
+from vla_model.model_yolo import (
+    ExcavatorVLAYolo,
+    count_parameters,
+    load_compatible_state_dict,
+    upgrade_legacy_v17_1_state_dict as _upgrade_legacy_v17_1_state_dict,
+)
 from vla_model.dataset import ExcavatorDataset
 
 
@@ -50,12 +55,15 @@ def _compute_r2_circular(ss_res, sum_y, sum_y2, n, swing_labels):
         ss_tot = sum_y2[j] - (sum_y[j] ** 2) / n
         ss_tot = np.maximum(ss_tot, 1e-10)
         r2[j] = 1 - ss_res[j] / ss_tot
-    # Swing: circular variance
-    s = np.asarray(swing_labels)
-    sin_m, cos_m = np.sin(s).mean(), np.cos(s).mean()
-    var_circ = 1.0 - np.sqrt(sin_m ** 2 + cos_m ** 2)
-    var_circ = np.maximum(var_circ, 1e-10)
-    r2[3] = 1 - ss_res[3] / (var_circ * n)
+    # Swing: use wrapped squared deviations in both numerator and denominator.
+    # The previous denominator used 1-|mean(exp(i*y))|, which is roughly half
+    # the angular variance for concentrated labels and is not commensurate
+    # with the squared-radian residual accumulated in ``ss_res``.
+    s = np.asarray(swing_labels, dtype=np.float64)
+    mean_angle = np.arctan2(np.sin(s).mean(), np.cos(s).mean())
+    centered = _circular_error(s, mean_angle)
+    ss_tot_swing = np.maximum(np.square(centered).sum(), 1e-10)
+    r2[3] = 1 - ss_res[3] / ss_tot_swing
     return r2, float(r2.mean())
 
 
@@ -63,6 +71,28 @@ def _rad_to_output(rad: torch.Tensor, out_dims=(2, 2, 2, 2)) -> torch.Tensor:
     sin = torch.sin(rad)
     cos = torch.cos(rad)
     return torch.stack([sin, cos], dim=-1).reshape(rad.size(0), -1)
+
+
+def _weighted_sincos_loss(prediction: torch.Tensor, target: torch.Tensor,
+                          swing_weight: float = 2.0) -> torch.Tensor:
+    """MSE over four sin/cos pairs with explicit Swing emphasis."""
+    if prediction.shape != target.shape or prediction.shape[-1] != 8:
+        raise ValueError("prediction and target must both have shape [B, 8]")
+    per_joint = (prediction.view(-1, 4, 2) - target.view(-1, 4, 2)).pow(2)
+    per_joint = per_joint.mean(dim=(0, 2))
+    weights = prediction.new_tensor([1.0, 1.0, 1.0, float(swing_weight)])
+    return (per_joint * weights).sum() / weights.sum()
+
+
+@torch.no_grad()
+def update_ema(ema_model: nn.Module, model: nn.Module, decay: float) -> None:
+    """Update EMA parameters per optimizer step and copy running buffers."""
+    ema_parameters = dict(ema_model.named_parameters())
+    for name, parameter in model.named_parameters():
+        ema_parameters[name].mul_(decay).add_(parameter.detach(), alpha=1.0 - decay)
+    ema_buffers = dict(ema_model.named_buffers())
+    for name, buffer in model.named_buffers():
+        ema_buffers[name].copy_(buffer.detach())
 
 
 def build_v17_1_model(seq_len=8, img_size=224, hidden_dim=512, n_heads=8,
@@ -79,7 +109,8 @@ def build_v17_1_model(seq_len=8, img_size=224, hidden_dim=512, n_heads=8,
 
 # ── V17.1 training ──
 
-def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, config, epoch):
+def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, config, epoch,
+                ema_model=None):
     model.train()
     total_loss = 0.0
     total_mae = np.zeros(4)
@@ -92,7 +123,8 @@ def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, conf
     out_dims = getattr(model, 'out_dims', (2, 2, 2, 2))
 
     pose_aux_weight = getattr(config, 'v17_pose_aux_weight', 0.05)
-    vel_aux_weight   = getattr(config, 'v17_vel_aux_weight', 0.02)
+    vel_aux_weight   = getattr(config, 'v17_vel_aux_weight', 0.10)
+    swing_loss_weight = getattr(config, 'v17_swing_loss_weight', 2.0)
 
     pbar = tqdm(dataloader, desc=f"Train Epoch {epoch+1}")
     for step, batch in enumerate(pbar):
@@ -106,14 +138,16 @@ def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, conf
 
         with torch.amp.autocast(config.device):
             # V17.1: return_aux=True for pose_aux + temporal_mask_mixer
-            raw_out, masks_avg, masks_spatial, pose_aux = model(
+            raw_out, masks_avg, masks_spatial, pose_aux, swing_vel_aux = model(
                 rgb, elevation, qpos, excavator_id, return_aux=True
             )
             action_gt_rad = action_gt.squeeze(1)
             target = _rad_to_output(action_gt_rad, out_dims)
 
             # 1. Prediction loss
-            pred_loss = criterion(raw_out, target)
+            pred_loss = _weighted_sincos_loss(
+                raw_out, target, swing_weight=swing_loss_weight
+            )
 
             # 2. Unit-circle constraint
             raw_4d = raw_out.view(raw_out.size(0), 4, 2)
@@ -147,16 +181,23 @@ def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, conf
             temp_diff = (masks_spatial[:, :, :, 1:] - masks_spatial[:, :, :, :-1]).abs().mean()
             temp_loss = 0.005 * temp_diff
 
-            # 6. V10 pose auxiliary: predict current qpos from last-frame tokens
-            pose_aux_loss = criterion(pose_aux, qpos[:, -1])
+            # 6. Periodic pose auxiliary: current four-joint pose as sin/cos.
+            # qpos is a training label only and is never consumed by forward.
+            pose_aux_target = _rad_to_output(qpos[:, -1], out_dims)
+            pose_aux_loss = criterion(pose_aux, pose_aux_target)
 
             # 7. Swing velocity auxiliary: wrap-aware angular velocity
             # GT Swing velocity between last input qpos and next action frame
             swing_vel_gt = _circular_error(action_gt_rad[:, 3], qpos[:, -1, 3])
-            # Predicted Swing velocity from sin/cos output
-            action_pred_rad = model.decode_action(raw_out)
-            swing_vel_pred = _circular_error(action_pred_rad[:, 3], qpos[:, -1, 3])
-            vel_aux_loss = torch.abs(swing_vel_pred - swing_vel_gt).mean()
+            # Independent velocity head predicts a periodic sin/cos pair.
+            swing_vel_target = torch.stack(
+                [torch.sin(swing_vel_gt), torch.cos(swing_vel_gt)], dim=-1
+            )
+            vel_aux_loss = criterion(swing_vel_aux, swing_vel_target)
+            vel_circle_error = (
+                swing_vel_aux.pow(2).sum(dim=-1) - 1.0
+            ).pow(2).mean()
+            vel_aux_loss = vel_aux_loss + 0.1 * vel_circle_error
 
             # ── Mask regularization decay ──
             reg_scale = 1.0 if epoch < 40 else max(0.1, 1.0 - 0.9 * (epoch - 39) / max(1, config.epochs - 40))
@@ -171,6 +212,8 @@ def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, conf
         torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
         scaler.step(optimizer)
         scaler.update()
+        if ema_model is not None:
+            update_ema(ema_model, model, config.ema_decay)
         scheduler.step()       # per-batch LR scheduling
 
         total_loss += loss.item()
@@ -230,7 +273,10 @@ def validate(model, dataloader, criterion, config):
         raw_out, _, _ = model(rgb, elevation, qpos, excavator_id)
         action_gt_rad = action_gt.squeeze(1)
         target = _rad_to_output(action_gt_rad, out_dims)
-        loss = criterion(raw_out, target)
+        loss = _weighted_sincos_loss(
+            raw_out, target,
+            swing_weight=getattr(config, 'v17_swing_loss_weight', 2.0),
+        )
 
         total_loss += loss.item()
         action_pred_rad = model.decode_action(raw_out)
@@ -261,7 +307,9 @@ def validate(model, dataloader, criterion, config):
     }
 
 
-def save_checkpoint(model, optimizer, scaler, scheduler, epoch, metrics, config, is_best=False, suffix_override=None):
+def save_checkpoint(model, optimizer, scaler, scheduler, epoch, metrics, config,
+                    is_best=False, suffix_override=None, ema_model=None,
+                    best_loss=float("inf"), best_swing_r2=-float("inf")):
     os.makedirs(config.output_dir, exist_ok=True)
     if suffix_override:
         suffix = suffix_override
@@ -270,17 +318,24 @@ def save_checkpoint(model, optimizer, scaler, scheduler, epoch, metrics, config,
     else:
         suffix = f"epoch_{epoch+1}"
     path = os.path.join(config.output_dir, f"yolo_v17_1_checkpoint_{suffix}.pt")
-    torch.save({
+    checkpoint_model = ema_model if ema_model is not None else model
+    payload = {
         "epoch": epoch + 1,
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": checkpoint_model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scaler_state_dict": scaler.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "metrics": metrics,
+        "best_loss": best_loss,
+        "best_swing_r2": best_swing_r2,
         "config": config,
         "model_version": "v17.1",
-    }, path)
+    }
+    if ema_model is not None:
+        payload["raw_model_state_dict"] = model.state_dict()
+    torch.save(payload, path)
     print(f"Checkpoint saved: {path}")
+    return path
 
 
 # ── Main ──
@@ -301,8 +356,10 @@ def main():
                         help="Exclude excavator 306 (nighttime) from training")
     parser.add_argument("--pose_aux_weight", type=float, default=0.05,
                         help="Weight for training-only qpos auxiliary loss")
-    parser.add_argument("--vel_aux_weight", type=float, default=0.02,
+    parser.add_argument("--vel_aux_weight", type=float, default=0.10,
                         help="Weight for Swing velocity auxiliary loss")
+    parser.add_argument("--swing_loss_weight", type=float, default=2.0,
+                        help="Relative weight of Swing in the main sin/cos loss")
     args = parser.parse_args()
 
     config = Config()
@@ -318,7 +375,8 @@ def main():
     print(f"V17.1: V17 independent masks + V10 TemporalMaskMixer + pose_aux + Swing vel_aux")
     print(f"       Boom(λ_m=1.5/λ_v=0.8) Arm(λ_m=2.0/λ_v=1.0) Bucket(λ_m=2.5/λ_v=1.0) Swing(λ_m=0/λ_v=0.5)")
     print(f"       Anti-overfit: n_layers=3  dropout=0.25  wd=1e-3  mask_reg_decay(40→0.1x)")
-    print(f"       pose_aux_weight={args.pose_aux_weight}  vel_aux_weight={args.vel_aux_weight}")
+    print(f"       pose_aux_weight={args.pose_aux_weight}  vel_aux_weight={args.vel_aux_weight}  "
+          f"swing_loss_weight={args.swing_loss_weight}")
     print(f"Config: {json.dumps({k: str(v) for k, v in config.__dict__.items() if not k.startswith('_')}, indent=2)}")
 
     # ── Datasets ──
@@ -363,6 +421,7 @@ def main():
     config.weight_decay = 1e-3
     config.v17_pose_aux_weight = args.pose_aux_weight
     config.v17_vel_aux_weight  = args.vel_aux_weight
+    config.v17_swing_loss_weight = args.swing_loss_weight
     optimizer = AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     total_steps = len(train_loader) * config.epochs
     warmup_steps = int(total_steps * config.warmup_ratio)
@@ -383,19 +442,21 @@ def main():
     # ── Resume ──
     start_epoch = 0
     best_loss = float("inf")
+    best_swing_r2 = -float("inf")
+    resume_ema_state = None
     if args.resume:
         ckpt = torch.load(args.resume, map_location=config.device, weights_only=False)
-        resume_state = ckpt["model_state_dict"]
-        model_state = model.state_dict()
-        filtered_state = {}
-        skipped = 0
-        for k, v in resume_state.items():
-            if k in model_state and model_state[k].shape == v.shape:
-                filtered_state[k] = v
-            else:
-                skipped += 1
-        model.load_state_dict(filtered_state, strict=False)
-        print(f"  [resume] loaded {len(filtered_state)} keys, skipped {skipped} (size mismatch or missing)")
+        resume_ema_state = _upgrade_legacy_v17_1_state_dict(ckpt["model_state_dict"])
+        resume_state = ckpt.get("raw_model_state_dict", ckpt["model_state_dict"])
+        had_legacy_masks = (
+            "mask_linear1.weight" in resume_state
+            and "mask_linear1.0.weight" not in resume_state
+        )
+        resume_state = _upgrade_legacy_v17_1_state_dict(resume_state)
+        if had_legacy_masks:
+            print("  [resume] migrated shared V17.1 masks to four independent heads")
+        loaded, skipped = load_compatible_state_dict(model, resume_state)
+        print(f"  [resume] loaded {loaded} keys, skipped {skipped} (size mismatch or missing)")
         try:
             if "optimizer_state_dict" in ckpt:
                 optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -410,29 +471,34 @@ def main():
             except (ValueError, KeyError):
                 print(f"  [resume] scheduler state incompatible, using fresh scheduler")
         start_epoch = ckpt.get("epoch", 0)
-        best_loss = ckpt.get("metrics", {}).get("loss", float("inf"))
+        metrics = ckpt.get("metrics", {})
+        best_loss = ckpt.get("best_loss", metrics.get("loss", float("inf")))
+        previous_r2 = metrics.get("r2", [0.0, 0.0, 0.0, -float("inf")])
+        best_swing_r2 = ckpt.get("best_swing_r2", previous_r2[3])
         print(f"Resumed from {args.resume} at epoch {start_epoch}")
+
+    # EMA must start from the actually loaded live weights, not the freshly
+    # constructed pre-resume model.
+    if ema_model is not None:
+        ema_model.load_state_dict(model.state_dict())
+        if resume_ema_state is not None:
+            loaded, skipped = load_compatible_state_dict(ema_model, resume_ema_state)
+            print(f"  [resume] restored EMA: loaded {loaded} keys, skipped {skipped}")
 
     # ── Training loop ──
     history = {"train_loss": [], "val_loss": [], "train_mae": [], "val_mae": [],
                "train_r2": [], "val_r2": [], "val_swing_r2": []}
 
-    best_swing_r2 = -float("inf")
-
     for epoch in range(start_epoch, config.epochs):
         t0 = time.time()
         train_metrics = train_epoch(model, train_loader, optimizer, scaler, scheduler,
-                                     criterion, config, epoch)
-
-        if ema_model is not None:
-            with torch.no_grad():
-                for ema_p, p in zip(ema_model.parameters(), model.parameters()):
-                    ema_p.data.mul_(config.ema_decay).add_(p.data, alpha=1 - config.ema_decay)
+                                     criterion, config, epoch, ema_model=ema_model)
 
         val_metrics = {"loss": float("nan"), "mae": [0, 0, 0, 0], "mae_mean": float("nan"),
                        "r2": [0, 0, 0, 0], "r2_mean": float("nan")}
         if val_loader is not None and len(val_loader) > 0:
-            val_metrics = validate(model, val_loader, criterion, config)
+            eval_model = ema_model if ema_model is not None else model
+            val_metrics = validate(eval_model, val_loader, criterion, config)
 
         history["train_loss"].append(train_metrics["loss"])
         history["train_mae"].append(train_metrics["mae_mean"])
@@ -460,19 +526,31 @@ def main():
               f"Train: {[f'{x:.4f}' for x in train_metrics['r2']]} | "
               f"Val:   {[f'{x:.4f}' for x in val_metrics['r2']]}")
 
-        if val_metrics["loss"] < best_loss:
+        improved_loss = val_metrics["loss"] < best_loss
+        improved_swing = val_metrics["r2"][3] > best_swing_r2
+        if improved_loss:
             best_loss = val_metrics["loss"]
-            save_checkpoint(model, optimizer, scaler, scheduler, epoch, val_metrics, config, is_best=True)
-
-        if val_metrics["r2"][3] > best_swing_r2:
+        if improved_swing:
             best_swing_r2 = val_metrics["r2"][3]
+
+        if improved_loss:
             save_checkpoint(model, optimizer, scaler, scheduler, epoch, val_metrics, config,
-                          is_best=False, suffix_override="best_swing")
+                            is_best=True, ema_model=ema_model, best_loss=best_loss,
+                            best_swing_r2=best_swing_r2)
+
+        if improved_swing:
+            save_checkpoint(model, optimizer, scaler, scheduler, epoch, val_metrics, config,
+                            is_best=False, suffix_override="best_swing", ema_model=ema_model,
+                            best_loss=best_loss, best_swing_r2=best_swing_r2)
 
         if (epoch + 1) % config.save_interval == 0:
-            save_checkpoint(model, optimizer, scaler, scheduler, epoch, val_metrics, config)
+            save_checkpoint(model, optimizer, scaler, scheduler, epoch, val_metrics, config,
+                            ema_model=ema_model, best_loss=best_loss,
+                            best_swing_r2=best_swing_r2)
 
-    save_checkpoint(model, optimizer, scaler, scheduler, config.epochs - 1, val_metrics, config)
+    save_checkpoint(model, optimizer, scaler, scheduler, config.epochs - 1, val_metrics, config,
+                    ema_model=ema_model, best_loss=best_loss,
+                    best_swing_r2=best_swing_r2)
     print(f"\nTraining complete.  Best val loss: {best_loss:.6f}  Best Swing R²: {best_swing_r2:.4f}")
 
     with open(os.path.join(config.output_dir, "yolo_v17_1_history.json"), "w") as f:

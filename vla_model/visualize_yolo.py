@@ -17,7 +17,11 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from vla_model.model_yolo import ExcavatorVLAYolo
+from vla_model.model_yolo import (
+    ExcavatorVLAYolo,
+    load_compatible_state_dict,
+    upgrade_legacy_v17_1_state_dict,
+)
 from vla_model.dataset import IMAGENET_MEAN, IMAGENET_STD
 import matplotlib
 matplotlib.use('Agg')
@@ -150,8 +154,10 @@ def select_mask_view(masks_spatial, mask_view, is_v16):
     raise ValueError(f"Unknown mask view: {mask_view}")
 
 
-def detect_version(state_keys):
+def detect_version(state_keys, checkpoint_version=None):
     """Return (version_tag, is_v16, model_version_arg)."""
+    if str(checkpoint_version).lower() == "v17.1":
+        return "V17.1", True, "v17.1"
     # V17.1: V17 features + restored V10 TemporalMaskMixer/pose_aux
     has_v17 = any("joint_logit_bias" in k for k in state_keys)
     has_temporal = any("temporal_mask_mixer" in k or "pose_aux_head" in k for k in state_keys)
@@ -170,6 +176,27 @@ def detect_version(state_keys):
     if has_v10:
         return "V10", False, "v10"
     return "V9", False, "v9"
+
+
+def infer_transformer_config(state_dict):
+    """Infer hidden width, exact encoder depth, and FFN width."""
+    attention = state_dict.get(
+        "encoder.layers.0.self_attn.in_proj_weight",
+        state_dict.get("encoder.layers.0.linear1.weight"),
+    )
+    if attention is None or "encoder.layers.0.linear1.weight" not in state_dict:
+        raise KeyError("checkpoint does not contain Transformer encoder weights")
+    layer_indices = {
+        int(key.split(".")[2])
+        for key in state_dict
+        if key.startswith("encoder.layers.")
+    }
+    if not layer_indices:
+        raise KeyError("checkpoint does not contain any Transformer encoder layers")
+    hidden_dim = attention.shape[1]
+    n_layers = max(layer_indices) + 1
+    ff_dim = state_dict["encoder.layers.0.linear1.weight"].shape[0]
+    return hidden_dim, n_layers, ff_dim
 
 
 def main():
@@ -199,7 +226,12 @@ def main():
     sd_keys = set(state_dict.keys())
 
     # ── Detect version ──
-    version_tag, is_v16, model_version_arg = detect_version(sd_keys)
+    version_tag, is_v16, model_version_arg = detect_version(
+        sd_keys, checkpoint_version=ckpt.get("model_version")
+    )
+    if model_version_arg == "v17.1":
+        state_dict = upgrade_legacy_v17_1_state_dict(state_dict)
+        sd_keys = set(state_dict.keys())
     is_temporal_version = model_version_arg in ("v10", "v11")
 
     # V10+/V16 default: raw last-frame masks; V9 default: temporal average.
@@ -232,14 +264,7 @@ def main():
         state_dict["joint_queries"] = state_dict.pop("query_tokens")
 
     # ── Auto-detect config ──
-    hidden_dim = state_dict.get("encoder.layers.0.self_attn.in_proj_weight",
-        state_dict.get("encoder.layers.0.linear1.weight")).shape[1]
-    n_layers = 4
-    for k in sd_keys:
-        if k.startswith("encoder.layers."):
-            idx = int(k.split(".")[2])
-            n_layers = max(n_layers, idx + 1)
-    ff_dim = state_dict.get("encoder.layers.0.linear1.weight").shape[0]
+    hidden_dim, n_layers, ff_dim = infer_transformer_config(state_dict)
     print(f"  Config: hidden_dim={hidden_dim}, n_layers={n_layers}, ff_dim={ff_dim}")
 
     G = args.img_size // 16
@@ -251,8 +276,9 @@ def main():
         dropout=0.0, pretrained=False,
         version=model_version_arg,
     ).to(device)
-    model.load_state_dict(state_dict, strict=False)
+    loaded, skipped = load_compatible_state_dict(model, state_dict)
     model.eval()
+    print(f"  Checkpoint tensors: {loaded} loaded, {skipped} skipped")
     print(f"  Model loaded. Grid={G}×{G}")
 
     # ── Load data ──

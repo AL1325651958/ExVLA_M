@@ -8,6 +8,34 @@ import math
 import numpy as np
 
 
+def upgrade_legacy_v17_1_state_dict(state_dict):
+    """Map legacy shared V17.1 mask heads onto four independent heads."""
+    upgraded = dict(state_dict)
+    if "mask_linear1.weight" not in upgraded or "mask_linear1.0.weight" in upgraded:
+        return upgraded
+
+    for joint in range(4):
+        source_prefix = "swing_mask_linear" if joint == 3 else "mask_linear"
+        for layer in (1, 2):
+            for parameter in ("weight", "bias"):
+                source = f"{source_prefix}{layer}.{parameter}"
+                target = f"mask_linear{layer}.{joint}.{parameter}"
+                if source in upgraded:
+                    upgraded[target] = upgraded[source]
+    return upgraded
+
+
+def load_compatible_state_dict(module, state_dict):
+    """Load checkpoint tensors whose names and shapes match ``module``."""
+    module_state = module.state_dict()
+    compatible = {
+        key: value for key, value in state_dict.items()
+        if key in module_state and module_state[key].shape == value.shape
+    }
+    module.load_state_dict(compatible, strict=False)
+    return len(compatible), len(state_dict) - len(compatible)
+
+
 class ConvBNSiLU(nn.Module):
     def __init__(self, in_c, out_c, k, s=1, p=0, g=1):
         super().__init__()
@@ -284,10 +312,28 @@ class ExcavatorVLAYolo(nn.Module):
                 hidden_dim, nhead=max(4, n_heads // 2), num_layers=1,
                 ff_dim=hidden_dim * 2, dropout=dropout,
             )
-            self.pose_aux_head = nn.Linear(hidden_dim, 4)
+            # V17.1 uses periodic pose supervision so Swing never sees a
+            # discontinuity between -pi and +pi.  Earlier versions retain
+            # their original four-radian auxiliary interface.
+            pose_aux_dim = 8 if version == "v17.1" else 4
+            self.pose_aux_head = nn.Linear(hidden_dim, pose_aux_dim)
         else:
             self.temporal_mask_mixer = None
             self.pose_aux_head = None
+
+        # Independent training-only prediction of the next Swing increment.
+        # It consumes visual decoder features, never qpos, and therefore does
+        # not change the pure-visual inference contract.
+        if version == "v17.1":
+            self.swing_velocity_head = nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim // 2),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim // 2, 2),
+            )
+        else:
+            self.swing_velocity_head = None
 
         # ── V11 pure-visual motion observation branch ──
         # Adjacent RGB/elevation frame residuals are encoded independently of
@@ -312,7 +358,8 @@ class ExcavatorVLAYolo(nn.Module):
         # This guarantees mask_0 → Boom, mask_1 → Arm, mask_2 → Bucket, mask_3 → Swing.
         self.joint_embed = nn.Parameter(torch.randn(self.num_joints, hidden_dim) * 0.5)
 
-        if version == "v17":
+        self.use_independent_joint_masks = version in ("v17", "v17.1")
+        if self.use_independent_joint_masks:
             # V17: 4 independent mask heads — one per joint
             # Boom(0): semi-soft mask (needs boom + body + partial global)
             # Arm(1):  local mask (arm linkage region)
@@ -383,7 +430,7 @@ class ExcavatorVLAYolo(nn.Module):
                             nn.init.zeros_(module.bias)
         nn.init.normal_(self.excv_embed.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.joint_embed, mean=0.0, std=0.5)
-        if self.version == "v17":
+        if self.use_independent_joint_masks:
             for j in range(4):
                 nn.init.xavier_uniform_(self.mask_linear1[j].weight, gain=1.0)
                 nn.init.zeros_(self.mask_linear1[j].bias)
@@ -441,7 +488,9 @@ class ExcavatorVLAYolo(nn.Module):
 
     def forward(self, rgb, elevation, qpos=None, excavator_id=None, return_aux=False):
         # qpos is deliberately unused: inference remains vision-only.
-        # return_aux=True (V10 training only) additionally returns pose_aux [B,4].
+        # return_aux=True adds training-only auxiliary predictions. V10/V11
+        # return pose_aux [B,4]; V17.1 returns periodic pose_aux [B,8] and
+        # independent Swing velocity sin/cos [B,2].
         B, T = rgb.shape[:2]
         G = self.grid_size
         D = self.hidden_dim
@@ -475,6 +524,13 @@ class ExcavatorVLAYolo(nn.Module):
         rgb_D = rgb_enhanced.reshape(B, T, G, G, D)
         elev_D = elev_enhanced.reshape(B, T, G, G, D)
 
+        # V17.1 masks must observe motion across the input window.  Apply the
+        # shared temporal mixer independently to both modalities before mask
+        # generation; the fused action path then inherits the same features.
+        if self.version == "v17.1" and self.temporal_mask_mixer is not None:
+            rgb_D = self.temporal_mask_mixer(rgb_D)
+            elev_D = self.temporal_mask_mixer(elev_D)
+
         # ── V16/V17: Independent masks from each modality before fusion ──
         # V17: each joint has its own mask_linear1[j]/mask_linear2[j] (ModuleList)
         # V16: Boom/Arm/Bucket share mask_linear1/2; Swing uses swing_mask_linear1/2
@@ -482,7 +538,7 @@ class ExcavatorVLAYolo(nn.Module):
         elev_t = elev_D.reshape(B, T * G * G, D)
         rgb_masks_list, elev_masks_list = [], []
         for j in range(self.num_joints):
-            if self.version == "v17":
+            if self.use_independent_joint_masks:
                 # Independent mask head per joint
                 h_r = F.gelu(self.mask_linear1[j](rgb_t + self.joint_embed[j]))
                 m_r = torch.sigmoid(self.mask_linear2[j](h_r)).squeeze(-1)
@@ -522,7 +578,7 @@ class ExcavatorVLAYolo(nn.Module):
             grid = self.fuse_motion(grid, motion)
 
         # ── V10+ temporal mask mixing (cross-frame at each grid location) ──
-        if self.temporal_mask_mixer is not None:
+        if self.temporal_mask_mixer is not None and self.version != "v17.1":
             grid = self.temporal_mask_mixer(grid)
 
         grid = self.pos_embed(grid)
@@ -546,7 +602,7 @@ class ExcavatorVLAYolo(nn.Module):
             m_j = 1.0 - (1.0 - masks_spatial[:, 0, j]) * (1.0 - masks_spatial[:, 1, j])
             m_j = m_j.reshape(B, T * G * G)                            # [B, N]
             tgt = self.joint_queries[:, j:j+1, :].expand(B, -1, -1)
-            if self.version == "v17":
+            if self.use_independent_joint_masks:
                 lb = self.joint_logit_bias[j].item()
                 lv = self.joint_value_lambda[j].item()
                 use_bias = (lb > 0.0)
@@ -577,6 +633,9 @@ class ExcavatorVLAYolo(nn.Module):
         if return_aux and self.pose_aux_head is not None:
             # Pose auxiliary: predict current qpos from last-frame spatial tokens
             pose_aux = self.pose_aux_head(memory[:, -G * G:].mean(dim=1))
+            if self.swing_velocity_head is not None:
+                swing_velocity_aux = self.swing_velocity_head(decoded[:, 3])
+                return (*outputs, pose_aux, swing_velocity_aux)
             return (*outputs, pose_aux)
         return outputs
 
