@@ -40,6 +40,70 @@ from vla_model.dataset import ExcavatorDataset
 
 # ── Shared utilities ──
 
+_TRAINING_VARIANTS = {
+    "v17.1": {
+        "model_version": "v17.1",
+        "checkpoint_prefix": "yolo_v17_1",
+        "diversity_mode": "legacy_all_pairs",
+        "diversity_margin": 0.3,
+        "mask_diagnostics": False,
+    },
+    "v17.3": {
+        "model_version": "v17.3",
+        "checkpoint_prefix": "yolo_v17_3",
+        "diversity_mode": "within_modality",
+        "diversity_margin": 0.5,
+        "mask_diagnostics": True,
+    },
+}
+
+
+def get_training_variant(version):
+    """Return an isolated copy of one supported training-variant config."""
+    try:
+        return dict(_TRAINING_VARIANTS[str(version).lower()])
+    except KeyError as error:
+        supported = ", ".join(sorted(_TRAINING_VARIANTS))
+        raise ValueError(
+            f"unknown training variant {version!r}; expected one of: {supported}"
+        ) from error
+
+
+def _validate_dual_mask_shape(masks_spatial):
+    if (
+        masks_spatial.ndim != 6
+        or masks_spatial.shape[1] != 2
+        or masks_spatial.shape[2] != 4
+    ):
+        raise ValueError(
+            "masks_spatial must have shape [B, 2, 4, T, G, G]"
+        )
+
+
+def compute_mask_diversity_loss(masks_spatial, mode, margin):
+    """Penalize mask collapse using legacy or V17.3 pair selection."""
+    _validate_dual_mask_shape(masks_spatial)
+    if mode == "legacy_all_pairs":
+        batch = masks_spatial.size(0)
+        flat = masks_spatial.reshape(batch, 8, -1)
+        normalized = flat / flat.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        similarity = torch.bmm(normalized, normalized.transpose(1, 2))
+        eye = torch.eye(
+            8, device=similarity.device, dtype=similarity.dtype
+        ).unsqueeze(0)
+        off_diagonal = similarity * (1.0 - eye)
+        return 0.5 * torch.relu(off_diagonal - margin).pow(2).mean()
+    if mode == "within_modality":
+        flat = masks_spatial.flatten(start_dim=3)
+        normalized = flat / flat.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        similarity = torch.matmul(normalized, normalized.transpose(-1, -2))
+        off_diagonal = ~torch.eye(
+            4, device=similarity.device, dtype=torch.bool
+        )
+        penalties = torch.relu(similarity - margin).pow(2)
+        return 0.5 * penalties[..., off_diagonal].mean()
+    raise ValueError(f"unknown mask diversity mode: {mode!r}")
+
 def _circular_error(pred_rad, gt_rad):
     """Wrap-aware element-wise difference in [-π, π] (torch or numpy)."""
     delta = pred_rad - gt_rad
@@ -227,16 +291,14 @@ def train_epoch(model, dataloader, optimizer, scaler, scheduler, criterion, conf
                                torch.relu(area_swing - 0.70).pow(2)).mean()
             area_loss = 1.0 * area_loss_planar + 0.2 * area_loss_swing
 
-            # 4. Cosine-similarity overlap with margin
-            B_s = masks_spatial.size(0)
-            mf = masks_spatial.reshape(B_s, 8, -1)
-            norms = mf.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-            mf_n = mf / norms
-            cos_sim = torch.bmm(mf_n, mf_n.transpose(1, 2))
-            eye = torch.eye(8, device=cos_sim.device).unsqueeze(0)
-            off_diag = cos_sim * (1 - eye)
-            margin = 0.3
-            diversity_loss = 0.5 * torch.relu(off_diag - margin).pow(2).mean()
+            # 4. Cosine-similarity overlap with variant-specific pair selection
+            diversity_loss = compute_mask_diversity_loss(
+                masks_spatial,
+                mode=getattr(
+                    config, "v17_mask_diversity_mode", "legacy_all_pairs"
+                ),
+                margin=getattr(config, "v17_mask_diversity_margin", 0.3),
+            )
 
             # 5. Temporal smoothness — slice TIME dim (dim=3), NOT joint dim (dim=2)
             temp_diff = (masks_spatial[:, :, :, 1:] - masks_spatial[:, :, :, :-1]).abs().mean()
