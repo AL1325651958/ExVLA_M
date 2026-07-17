@@ -8,8 +8,10 @@ from unittest import mock
 
 import torch
 
+from vla_model.model_yolo import load_compatible_state_dict
 from vla_model.train_yolo_v17_1 import (
     accumulate_mask_diagnostics,
+    build_v17_1_model,
     compute_mask_diagnostics,
     compute_mask_diversity_loss,
     format_mask_diagnostics,
@@ -58,6 +60,14 @@ class V173DiversityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"\[B, 2, 4, T, G, G\]"):
             compute_mask_diversity_loss(
                 torch.zeros(1, 4, 2, 2), mode="within_modality", margin=0.5
+            )
+
+    def test_rectangular_mask_grid_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, r"\[B, 2, 4, T, G, G\]"):
+            compute_mask_diversity_loss(
+                torch.zeros(1, 2, 4, 1, 2, 3),
+                mode="within_modality",
+                margin=0.5,
             )
 
     def test_legacy_half_precision_matches_original_v17_1_math(self):
@@ -218,6 +228,48 @@ class V173ArtifactTests(unittest.TestCase):
         )
 
         self.assertEqual(result, ("V17.3", True, "v17.1"))
+
+    def test_v17_3_state_dict_loads_without_skipped_tensors(self):
+        from vla_model.visualize_yolo import detect_version
+
+        source = build_v17_1_model(
+            seq_len=2,
+            img_size=32,
+            hidden_dim=32,
+            n_heads=4,
+            n_layers=1,
+            ff_dim=64,
+            dropout=0.0,
+            pretrained=False,
+            num_excavators=3,
+        )
+        checkpoint = {
+            "model_version": "v17.3",
+            "model_state_dict": source.state_dict(),
+        }
+        _, _, model_version = detect_version(
+            set(checkpoint["model_state_dict"]),
+            checkpoint_version=checkpoint["model_version"],
+        )
+        target = build_v17_1_model(
+            seq_len=2,
+            img_size=32,
+            hidden_dim=32,
+            n_heads=4,
+            n_layers=1,
+            ff_dim=64,
+            dropout=0.0,
+            pretrained=False,
+            num_excavators=3,
+        )
+
+        loaded, skipped = load_compatible_state_dict(
+            target, checkpoint["model_state_dict"]
+        )
+
+        self.assertEqual(model_version, "v17.1")
+        self.assertEqual(skipped, 0)
+        self.assertEqual(loaded, len(checkpoint["model_state_dict"]))
 
 
 if __name__ == "__main__":

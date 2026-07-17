@@ -74,6 +74,7 @@ def _validate_dual_mask_shape(masks_spatial):
         masks_spatial.ndim != 6
         or masks_spatial.shape[1] != 2
         or masks_spatial.shape[2] != 4
+        or masks_spatial.shape[-2] != masks_spatial.shape[-1]
     ):
         raise ValueError(
             "masks_spatial must have shape [B, 2, 4, T, G, G]"

@@ -205,7 +205,7 @@ def infer_transformer_config(state_dict):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Visualize V9-V16 YOLO-ST-VLA checkpoints")
+        description="Visualize STVTA V9-V17.3 checkpoints")
     parser.add_argument("--checkpoint", type=str, default="output/YOLO_ST-VLA/yolo_checkpoint_best.pt")
     parser.add_argument("--data_path", type=str,
                         default="data/excavator-motion/data/75/xcmg_data_2025-04-11-17-46-49.hdf5")
@@ -217,7 +217,7 @@ def main():
     parser.add_argument("--no_masks", action="store_true", help="Skip mask overlay")
     parser.add_argument("--mask_view", type=str, default=None,
                         choices=["last", "avg"],
-                        help="V10+/V16 default: last (raw); V9 default: avg")
+                        help="Temporal/dual-modality versions default to last; V9 defaults to avg")
     args = parser.parse_args()
 
     device = args.device if torch.cuda.is_available() else "cpu"
@@ -238,7 +238,7 @@ def main():
         sd_keys = set(state_dict.keys())
     is_temporal_version = model_version_arg in ("v10", "v11")
 
-    # V10+/V16 default: raw last-frame masks; V9 default: temporal average.
+    # Temporal/dual-modality versions use raw last-frame masks by default.
     if args.mask_view is None:
         args.mask_view = "last" if (is_temporal_version or is_v16) else "avg"
 
