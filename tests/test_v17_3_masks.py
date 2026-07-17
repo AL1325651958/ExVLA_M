@@ -1,12 +1,17 @@
 """Focused tests for the V17.3 mask-regularization training variant."""
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
 from vla_model.train_yolo_v17_1 import (
+    accumulate_mask_diagnostics,
+    compute_mask_diagnostics,
     compute_mask_diversity_loss,
+    format_mask_diagnostics,
     get_training_variant,
+    validate,
 )
 
 
@@ -50,6 +55,96 @@ class V173DiversityTests(unittest.TestCase):
             compute_mask_diversity_loss(
                 torch.zeros(1, 4, 2, 2), mode="within_modality", margin=0.5
             )
+
+
+class V173DiagnosticTests(unittest.TestCase):
+    def test_reports_area_centroid_and_cross_modal_similarity(self):
+        masks = torch.zeros(1, 2, 4, 1, 2, 2)
+        masks[:, :, 0, :, 0, 0] = 1.0
+        masks[:, :, 2, :, 1, 1] = 1.0
+
+        diagnostics = compute_mask_diagnostics(masks)
+
+        self.assertEqual(tuple(diagnostics["area"].shape), (1, 2, 4))
+        self.assertAlmostEqual(diagnostics["area"][0, 0, 0].item(), 0.25)
+        self.assertAlmostEqual(diagnostics["center_x"][0, 0, 0].item(), 0.0)
+        self.assertAlmostEqual(diagnostics["center_y"][0, 0, 0].item(), 0.0)
+        self.assertAlmostEqual(diagnostics["center_x"][0, 0, 2].item(), 1.0)
+        self.assertAlmostEqual(diagnostics["center_y"][0, 0, 2].item(), 1.0)
+        self.assertAlmostEqual(
+            diagnostics["cross_modal_similarity"][0, 0].item(), 1.0
+        )
+
+    def test_accumulator_is_sample_weighted(self):
+        totals = None
+        first = {
+            "area": torch.ones(2, 2, 4),
+            "center_x": torch.zeros(2, 2, 4),
+            "center_y": torch.full((2, 2, 4), 0.25),
+            "cross_modal_similarity": torch.full((2, 4), 0.5),
+        }
+        totals, count = accumulate_mask_diagnostics(totals, 0, first)
+        second = {key: value[:1] * 3 for key, value in first.items()}
+        totals, count = accumulate_mask_diagnostics(totals, count, second)
+        averaged = {key: value / count for key, value in totals.items()}
+
+        self.assertEqual(count, 3)
+        self.assertAlmostEqual(averaged["area"][0, 0].item(), 5.0 / 3.0)
+
+    def test_formatter_emphasizes_boom_and_bucket(self):
+        diagnostics = {
+            "area": [[0.1, 0.2, 0.3, 0.4], [0.2, 0.3, 0.4, 0.5]],
+            "center_x": [[0.5] * 4, [0.6] * 4],
+            "center_y": [[0.1, 0.2, 0.8, 0.4], [0.2, 0.3, 0.7, 0.5]],
+            "cross_modal_similarity": [0.9, 0.8, 0.7, 0.6],
+        }
+
+        lines = format_mask_diagnostics(diagnostics)
+
+        self.assertEqual(len(lines), 2)
+        self.assertIn("Boom", lines[0])
+        self.assertIn("Bucket", lines[1])
+        self.assertNotIn("Swing", " ".join(lines))
+
+    def test_validation_returns_sample_weighted_diagnostics(self):
+        class DiagnosticModel(torch.nn.Module):
+            out_dims = (2, 2, 2, 2)
+
+            def forward(self, rgb, elevation, qpos, excavator_id):
+                batch = rgb.shape[0]
+                raw = torch.tensor(
+                    [0.0, 1.0] * 4, dtype=rgb.dtype, device=rgb.device
+                ).view(1, 8).expand(batch, -1)
+                masks = torch.zeros(batch, 2, 4, 1, 2, 2, device=rgb.device)
+                masks[:, :, 0, :, 0, 0] = 1.0
+                return raw, masks.mean(dim=3), masks
+
+            @staticmethod
+            def decode_action(raw):
+                pairs = raw.view(-1, 4, 2)
+                return torch.atan2(pairs[..., 0], pairs[..., 1])
+
+        batch = {
+            "rgb": torch.zeros(1, 1, 3, 2, 2),
+            "elevation": torch.zeros(1, 1, 3, 2, 2),
+            "qpos": torch.zeros(1, 1, 4),
+            "excavator_id": torch.zeros(1, dtype=torch.long),
+            "action": torch.zeros(1, 1, 4),
+        }
+        config = SimpleNamespace(
+            device="cpu",
+            v17_swing_loss_weight=2.0,
+            v17_mask_diagnostics=True,
+        )
+
+        metrics = validate(
+            DiagnosticModel(), [batch], torch.nn.MSELoss(), config
+        )
+
+        self.assertIn("mask_diagnostics", metrics)
+        self.assertAlmostEqual(
+            metrics["mask_diagnostics"]["area"][0][0], 0.25
+        )
 
 
 if __name__ == "__main__":

@@ -104,6 +104,78 @@ def compute_mask_diversity_loss(masks_spatial, mode, margin):
         return 0.5 * penalties[..., off_diagonal].mean()
     raise ValueError(f"unknown mask diversity mode: {mode!r}")
 
+
+@torch.no_grad()
+def compute_mask_diagnostics(masks_spatial):
+    """Return per-sample area, centroid, and cross-modal mask agreement."""
+    _validate_dual_mask_shape(masks_spatial)
+    masks = masks_spatial.detach()
+    batch, _, _, _, grid_h, grid_w = masks.shape
+    area = masks.mean(dim=(-3, -2, -1))
+    mass = masks.sum(dim=(-3, -2, -1)).clamp_min(1e-6)
+    x_axis = torch.linspace(
+        0.0, 1.0, grid_w, device=masks.device, dtype=masks.dtype
+    )
+    y_axis = torch.linspace(
+        0.0, 1.0, grid_h, device=masks.device, dtype=masks.dtype
+    )
+    center_x = (
+        masks * x_axis.view(1, 1, 1, 1, 1, grid_w)
+    ).sum(dim=(-3, -2, -1)) / mass
+    center_y = (
+        masks * y_axis.view(1, 1, 1, 1, grid_h, 1)
+    ).sum(dim=(-3, -2, -1)) / mass
+    flat = masks.reshape(batch, 2, 4, -1)
+    cross_modal_similarity = torch.nn.functional.cosine_similarity(
+        flat[:, 0], flat[:, 1], dim=-1, eps=1e-6
+    )
+    return {
+        "area": area,
+        "center_x": center_x,
+        "center_y": center_y,
+        "cross_modal_similarity": cross_modal_similarity,
+    }
+
+
+def accumulate_mask_diagnostics(totals, count, diagnostics):
+    """Accumulate diagnostic sums so uneven validation batches stay weighted."""
+    batch_size = diagnostics["area"].shape[0]
+    batch_totals = {
+        key: value.detach().sum(dim=0).cpu()
+        for key, value in diagnostics.items()
+    }
+    if totals is None:
+        totals = batch_totals
+    else:
+        for key in totals:
+            totals[key] += batch_totals[key]
+    return totals, count + batch_size
+
+
+def format_mask_diagnostics(diagnostics):
+    """Format the two reported shortcut-prone joints for epoch logs."""
+    if not diagnostics:
+        return []
+    lines = []
+    modalities = ("RGB", "Elevation")
+    joints = ((0, "Boom"), (2, "Bucket"))
+    for joint_index, joint_name in joints:
+        modality_parts = []
+        for modality_index, modality_name in enumerate(modalities):
+            area = diagnostics["area"][modality_index][joint_index]
+            center_x = diagnostics["center_x"][modality_index][joint_index]
+            center_y = diagnostics["center_y"][modality_index][joint_index]
+            modality_parts.append(
+                f"{modality_name}: area={area:.3f}, "
+                f"center=({center_x:.3f},{center_y:.3f})"
+            )
+        similarity = diagnostics["cross_modal_similarity"][joint_index]
+        lines.append(
+            f"  Mask {joint_name} | " + " | ".join(modality_parts)
+            + f" | RGB/Elev cos={similarity:.3f}"
+        )
+    return lines
+
 def _circular_error(pred_rad, gt_rad):
     """Wrap-aware element-wise difference in [-π, π] (torch or numpy)."""
     delta = pred_rad - gt_rad
@@ -385,6 +457,8 @@ def validate(model, dataloader, criterion, config):
     n_batches = 0
     swing_labels = []  # collect Swing labels for circular R²
     out_dims = getattr(model, 'out_dims', (2, 2, 2, 2))
+    diagnostic_totals = None
+    diagnostic_count = 0
 
     for batch in tqdm(dataloader, desc="Validating"):
         rgb = batch["rgb"].to(config.device)
@@ -393,7 +467,13 @@ def validate(model, dataloader, criterion, config):
         excavator_id = batch["excavator_id"].to(config.device)
         action_gt = batch["action"].to(config.device)
 
-        raw_out, _, _ = model(rgb, elevation, qpos, excavator_id)
+        raw_out, _, masks_spatial = model(rgb, elevation, qpos, excavator_id)
+        if getattr(config, "v17_mask_diagnostics", False):
+            diagnostic_totals, diagnostic_count = accumulate_mask_diagnostics(
+                diagnostic_totals,
+                diagnostic_count,
+                compute_mask_diagnostics(masks_spatial),
+            )
         action_gt_rad = action_gt.squeeze(1)
         target = _rad_to_output(action_gt_rad, out_dims)
         loss = _weighted_sincos_loss(
@@ -421,13 +501,19 @@ def validate(model, dataloader, criterion, config):
         swing_labels.extend(label_cpu[:, 3].tolist())
 
     r2_per, r2_mean = _compute_r2_circular(ss_res, sum_y, sum_y2, n_total, swing_labels)
-    return {
+    metrics = {
         "loss": total_loss / n_batches,
         "mae": (total_mae / n_batches).tolist(),
         "mae_mean": float(total_mae.mean() / n_batches),
         "r2": r2_per.tolist(),
         "r2_mean": r2_mean,
     }
+    if diagnostic_count:
+        metrics["mask_diagnostics"] = {
+            key: (value / diagnostic_count).tolist()
+            for key, value in diagnostic_totals.items()
+        }
+    return metrics
 
 
 def save_checkpoint(model, optimizer, scaler, scheduler, epoch, metrics, config,
