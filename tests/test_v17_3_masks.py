@@ -1,7 +1,10 @@
 """Focused tests for the V17.3 mask-regularization training variant."""
 
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -11,6 +14,7 @@ from vla_model.train_yolo_v17_1 import (
     compute_mask_diversity_loss,
     format_mask_diagnostics,
     get_training_variant,
+    save_checkpoint,
     validate,
 )
 
@@ -145,6 +149,47 @@ class V173DiagnosticTests(unittest.TestCase):
         self.assertAlmostEqual(
             metrics["mask_diagnostics"]["area"][0][0], 0.25
         )
+
+
+class V173ArtifactTests(unittest.TestCase):
+    def test_checkpoint_uses_v17_3_filename_and_metadata(self):
+        model = torch.nn.Linear(2, 1)
+        optimizer = torch.optim.AdamW(model.parameters())
+        scaler = torch.amp.GradScaler("cpu")
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer, lambda _: 1.0
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            config = SimpleNamespace(
+                output_dir=tmp,
+                v17_checkpoint_prefix="yolo_v17_3",
+                v17_model_version="v17.3",
+            )
+            path = save_checkpoint(
+                model,
+                optimizer,
+                scaler,
+                scheduler,
+                epoch=0,
+                metrics={"loss": 1.0, "r2": [0.0] * 4},
+                config=config,
+                is_best=True,
+            )
+            checkpoint = torch.load(
+                path, map_location="cpu", weights_only=False
+            )
+
+        self.assertEqual(Path(path).name, "yolo_v17_3_checkpoint_best.pt")
+        self.assertEqual(checkpoint["model_version"], "v17.3")
+
+    def test_entry_point_selects_v17_3(self):
+        import vla_model.train_yolo_v17_3 as entry_point
+
+        with mock.patch.object(
+            entry_point, "train_v17_1_main", return_value=17
+        ) as run:
+            self.assertEqual(entry_point.main(), 17)
+        run.assert_called_once_with(training_version="v17.3")
 
 
 if __name__ == "__main__":

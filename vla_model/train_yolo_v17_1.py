@@ -526,7 +526,13 @@ def save_checkpoint(model, optimizer, scaler, scheduler, epoch, metrics, config,
         suffix = "best"
     else:
         suffix = f"epoch_{epoch+1}"
-    path = os.path.join(config.output_dir, f"yolo_v17_1_checkpoint_{suffix}.pt")
+    checkpoint_prefix = getattr(
+        config, "v17_checkpoint_prefix", "yolo_v17_1"
+    )
+    model_version = getattr(config, "v17_model_version", "v17.1")
+    path = os.path.join(
+        config.output_dir, f"{checkpoint_prefix}_checkpoint_{suffix}.pt"
+    )
     checkpoint_model = ema_model if ema_model is not None else model
     payload = {
         "epoch": epoch + 1,
@@ -538,7 +544,7 @@ def save_checkpoint(model, optimizer, scaler, scheduler, epoch, metrics, config,
         "best_loss": best_loss,
         "best_swing_r2": best_swing_r2,
         "config": config,
-        "model_version": "v17.1",
+        "model_version": model_version,
     }
     if ema_model is not None:
         payload["raw_model_state_dict"] = model.state_dict()
@@ -549,8 +555,11 @@ def save_checkpoint(model, optimizer, scaler, scheduler, epoch, metrics, config,
 
 # ── Main ──
 
-def main():
-    parser = argparse.ArgumentParser(description="Train ExcavatorVLA-YOLO V17.1")
+def main(training_version="v17.1"):
+    variant = get_training_variant(training_version)
+    parser = argparse.ArgumentParser(
+        description=f"Train STVTA {variant['model_version'].upper()}"
+    )
     parser.add_argument("--data_dir", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
@@ -576,6 +585,11 @@ def main():
         parser.error("--weights_only requires --resume CHECKPOINT")
 
     config = Config()
+    config.v17_model_version = variant["model_version"]
+    config.v17_checkpoint_prefix = variant["checkpoint_prefix"]
+    config.v17_mask_diversity_mode = variant["diversity_mode"]
+    config.v17_mask_diversity_margin = variant["diversity_margin"]
+    config.v17_mask_diagnostics = variant["mask_diagnostics"]
 
     for key in ("data_dir", "epochs", "batch_size", "lr", "seq_len",
                 "sample_ratio", "img_size", "output_dir"):
@@ -585,7 +599,10 @@ def main():
 
     config.device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {config.device}")
-    print(f"V17.1: V17 independent masks + V10 TemporalMaskMixer + pose_aux + Swing vel_aux")
+    print(f"{config.v17_model_version.upper()}: V17 independent masks + "
+          "V10 TemporalMaskMixer + pose_aux + Swing vel_aux")
+    print(f"       Mask diversity: {config.v17_mask_diversity_mode} "
+          f"(margin={config.v17_mask_diversity_margin:.1f})")
     print(f"       Boom(λ_m=1.5/λ_v=0.8) Arm(λ_m=2.0/λ_v=1.0) Bucket(λ_m=2.5/λ_v=1.0) Swing(λ_m=0/λ_v=0.5)")
     print(f"       Anti-overfit: n_layers=3  dropout=0.25  wd=1e-3  mask_reg_decay(40→0.1x)")
     print(f"       pose_aux_weight={args.pose_aux_weight}  vel_aux_weight={args.vel_aux_weight}  "
@@ -686,6 +703,8 @@ def main():
     # ── Training loop ──
     history = {"train_loss": [], "val_loss": [], "train_mae": [], "val_mae": [],
                "train_r2": [], "val_r2": [], "val_swing_r2": []}
+    if config.v17_mask_diagnostics:
+        history["val_mask_diagnostics"] = []
 
     for epoch in range(start_epoch, config.epochs):
         t0 = time.time()
@@ -705,6 +724,11 @@ def main():
         history["val_mae"].append(val_metrics["mae_mean"])
         history["val_r2"].append(val_metrics["r2_mean"])
         history["val_swing_r2"].append(val_metrics["r2"][3])
+        if config.v17_mask_diagnostics:
+            diagnostics = val_metrics.get("mask_diagnostics", {})
+            history["val_mask_diagnostics"].append(diagnostics)
+            for line in format_mask_diagnostics(diagnostics):
+                print(line)
 
         elapsed = time.time() - t0
         print(f"Epoch {epoch+1:3d}/{config.epochs} | "
@@ -751,7 +775,8 @@ def main():
                     best_swing_r2=best_swing_r2)
     print(f"\nTraining complete.  Best val loss: {best_loss:.6f}  Best Swing R²: {best_swing_r2:.4f}")
 
-    with open(os.path.join(config.output_dir, "yolo_v17_1_history.json"), "w") as f:
+    history_name = f"{config.v17_checkpoint_prefix}_history.json"
+    with open(os.path.join(config.output_dir, history_name), "w") as f:
         json.dump(history, f, indent=2)
 
 
