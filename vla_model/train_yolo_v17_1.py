@@ -119,6 +119,43 @@ def restore_training_state(optimizer, scaler, scheduler, checkpoint):
     return True
 
 
+def prepare_resume(checkpoint, weights_only=False):
+    """Select checkpoint weights and metadata for full or weights-only resume."""
+    ema_state = checkpoint["model_state_dict"]
+    selected_state = (
+        ema_state
+        if weights_only
+        else checkpoint.get("raw_model_state_dict", ema_state)
+    )
+    had_legacy_masks = (
+        "mask_linear1.weight" in selected_state
+        and "mask_linear1.0.weight" not in selected_state
+    )
+    ema_state = _upgrade_legacy_v17_1_state_dict(ema_state)
+    selected_state = _upgrade_legacy_v17_1_state_dict(selected_state)
+
+    if weights_only:
+        start_epoch = 0
+        best_loss = float("inf")
+        best_swing_r2 = -float("inf")
+    else:
+        start_epoch = checkpoint.get("epoch", 0)
+        metrics = checkpoint.get("metrics", {})
+        best_loss = checkpoint.get("best_loss", metrics.get("loss", float("inf")))
+        previous_r2 = metrics.get("r2", [0.0, 0.0, 0.0, -float("inf")])
+        best_swing_r2 = checkpoint.get("best_swing_r2", previous_r2[3])
+
+    return {
+        "model_state_dict": selected_state,
+        "ema_state_dict": ema_state,
+        "start_epoch": start_epoch,
+        "best_loss": best_loss,
+        "best_swing_r2": best_swing_r2,
+        "restore_training_state": not weights_only,
+        "had_legacy_masks": had_legacy_masks,
+    }
+
+
 def build_v17_1_model(seq_len=8, img_size=224, hidden_dim=512, n_heads=8,
                        n_layers=3, ff_dim=2048, dropout=0.25, pretrained=True,
                        num_excavators=4):
@@ -374,6 +411,8 @@ def main():
     parser.add_argument("--sample_ratio", type=float, default=None)
     parser.add_argument("--img_size", type=int, default=None)
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--weights_only", action="store_true",
+                        help="Load checkpoint EMA model weights but reset epoch, optimizer, and scheduler")
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--overfit", action="store_true")
     parser.add_argument("--exclude_306", action="store_true",
@@ -385,6 +424,8 @@ def main():
     parser.add_argument("--swing_loss_weight", type=float, default=2.0,
                         help="Relative weight of Swing in the main sin/cos loss")
     args = parser.parse_args()
+    if args.weights_only and not args.resume:
+        parser.error("--weights_only requires --resume CHECKPOINT")
 
     config = Config()
 
@@ -470,24 +511,21 @@ def main():
     resume_ema_state = None
     if args.resume:
         ckpt = torch.load(args.resume, map_location=config.device, weights_only=False)
-        resume_ema_state = _upgrade_legacy_v17_1_state_dict(ckpt["model_state_dict"])
-        resume_state = ckpt.get("raw_model_state_dict", ckpt["model_state_dict"])
-        had_legacy_masks = (
-            "mask_linear1.weight" in resume_state
-            and "mask_linear1.0.weight" not in resume_state
-        )
-        resume_state = _upgrade_legacy_v17_1_state_dict(resume_state)
-        if had_legacy_masks:
+        prepared = prepare_resume(ckpt, weights_only=args.weights_only)
+        resume_ema_state = prepared["ema_state_dict"]
+        if prepared["had_legacy_masks"]:
             print("  [resume] migrated shared V17.1 masks to four independent heads")
-        loaded, skipped = load_compatible_state_dict(model, resume_state)
+        loaded, skipped = load_compatible_state_dict(model, prepared["model_state_dict"])
         print(f"  [resume] loaded {loaded} keys, skipped {skipped} (size mismatch or missing)")
-        restore_training_state(optimizer, scaler, scheduler, ckpt)
-        start_epoch = ckpt.get("epoch", 0)
-        metrics = ckpt.get("metrics", {})
-        best_loss = ckpt.get("best_loss", metrics.get("loss", float("inf")))
-        previous_r2 = metrics.get("r2", [0.0, 0.0, 0.0, -float("inf")])
-        best_swing_r2 = ckpt.get("best_swing_r2", previous_r2[3])
-        print(f"Resumed from {args.resume} at epoch {start_epoch}")
+        if prepared["restore_training_state"]:
+            restore_training_state(optimizer, scaler, scheduler, ckpt)
+        start_epoch = prepared["start_epoch"]
+        best_loss = prepared["best_loss"]
+        best_swing_r2 = prepared["best_swing_r2"]
+        if args.weights_only:
+            print(f"Weights-only warm start from {args.resume}: epoch=0, fresh optimizer/scheduler")
+        else:
+            print(f"Resumed from {args.resume} at epoch {start_epoch}")
 
     # EMA must start from the actually loaded live weights, not the freshly
     # constructed pre-resume model.

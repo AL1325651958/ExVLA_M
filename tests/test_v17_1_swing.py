@@ -14,6 +14,7 @@ from vla_model.train_yolo_v17_1 import (
     _compute_r2_circular,
     _upgrade_legacy_v17_1_state_dict,
     _weighted_sincos_loss,
+    prepare_resume,
     save_checkpoint,
     restore_training_state,
     train_epoch,
@@ -92,6 +93,46 @@ class V171ModelTests(unittest.TestCase):
 
 
 class V171TrainingUtilityTests(unittest.TestCase):
+    def test_weights_only_resume_uses_ema_and_resets_training_metadata(self):
+        ema_weight = torch.tensor([1.0])
+        raw_weight = torch.tensor([2.0])
+        checkpoint = {
+            "model_state_dict": {"weight": ema_weight},
+            "raw_model_state_dict": {"weight": raw_weight},
+            "epoch": 40,
+            "best_loss": 0.01,
+            "best_swing_r2": 0.98,
+        }
+
+        prepared = prepare_resume(checkpoint, weights_only=True)
+
+        self.assertIs(prepared["model_state_dict"]["weight"], ema_weight)
+        self.assertIs(prepared["ema_state_dict"]["weight"], ema_weight)
+        self.assertEqual(prepared["start_epoch"], 0)
+        self.assertEqual(prepared["best_loss"], float("inf"))
+        self.assertEqual(prepared["best_swing_r2"], -float("inf"))
+        self.assertFalse(prepared["restore_training_state"])
+
+    def test_full_resume_keeps_raw_weights_epoch_and_best_metrics(self):
+        ema_weight = torch.tensor([1.0])
+        raw_weight = torch.tensor([2.0])
+        checkpoint = {
+            "model_state_dict": {"weight": ema_weight},
+            "raw_model_state_dict": {"weight": raw_weight},
+            "epoch": 40,
+            "best_loss": 0.01,
+            "best_swing_r2": 0.98,
+        }
+
+        prepared = prepare_resume(checkpoint, weights_only=False)
+
+        self.assertIs(prepared["model_state_dict"]["weight"], raw_weight)
+        self.assertIs(prepared["ema_state_dict"]["weight"], ema_weight)
+        self.assertEqual(prepared["start_epoch"], 40)
+        self.assertEqual(prepared["best_loss"], 0.01)
+        self.assertEqual(prepared["best_swing_r2"], 0.98)
+        self.assertTrue(prepared["restore_training_state"])
+
     def test_incompatible_optimizer_does_not_restore_stale_scheduler(self):
         source_model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 1))
         source_optimizer = torch.optim.AdamW(source_model.parameters(), lr=1e-4)
