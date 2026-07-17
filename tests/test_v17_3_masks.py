@@ -191,6 +191,16 @@ class V173ArtifactTests(unittest.TestCase):
             self.assertEqual(entry_point.main(), 17)
         run.assert_called_once_with(training_version="v17.3")
 
+    def test_visualizer_maps_v17_3_to_v17_1_topology(self):
+        from vla_model.visualize_yolo import detect_version
+
+        result = detect_version(
+            {"joint_logit_bias", "temporal_mask_mixer.layers.0.weight"},
+            checkpoint_version="v17.3",
+        )
+
+        self.assertEqual(result, ("V17.3", True, "v17.1"))
+
 
 if __name__ == "__main__":
     unittest.main()

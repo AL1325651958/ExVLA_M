@@ -156,7 +156,11 @@ def select_mask_view(masks_spatial, mask_view, is_v16):
 
 def detect_version(state_keys, checkpoint_version=None):
     """Return (version_tag, is_v16, model_version_arg)."""
-    if str(checkpoint_version).lower() == "v17.1":
+    checkpoint_version = str(checkpoint_version).lower()
+    if checkpoint_version == "v17.3":
+        # V17.3 changes only the training regularizer and shares V17.1 tensors.
+        return "V17.3", True, "v17.1"
+    if checkpoint_version == "v17.1":
         return "V17.1", True, "v17.1"
     # V17.1: V17 features + restored V10 TemporalMaskMixer/pose_aux
     has_v17 = any("joint_logit_bias" in k for k in state_keys)
