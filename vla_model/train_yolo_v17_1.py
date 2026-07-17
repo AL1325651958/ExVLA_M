@@ -88,9 +88,8 @@ def compute_mask_diversity_loss(masks_spatial, mode, margin):
         flat = masks_spatial.reshape(batch, 8, -1)
         normalized = flat / flat.norm(dim=-1, keepdim=True).clamp_min(1e-6)
         similarity = torch.bmm(normalized, normalized.transpose(1, 2))
-        eye = torch.eye(
-            8, device=similarity.device, dtype=similarity.dtype
-        ).unsqueeze(0)
+        # Keep the original V17.1 float32 identity promotion under autocast.
+        eye = torch.eye(8, device=similarity.device).unsqueeze(0)
         off_diagonal = similarity * (1.0 - eye)
         return 0.5 * torch.relu(off_diagonal - margin).pow(2).mean()
     if mode == "within_modality":

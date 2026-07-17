@@ -60,6 +60,24 @@ class V173DiversityTests(unittest.TestCase):
                 torch.zeros(1, 4, 2, 2), mode="within_modality", margin=0.5
             )
 
+    def test_legacy_half_precision_matches_original_v17_1_math(self):
+        torch.manual_seed(3)
+        masks = torch.rand(2, 2, 4, 1, 2, 2, dtype=torch.float16)
+        flat = masks.reshape(2, 8, -1)
+        normalized = flat / flat.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        similarity = torch.bmm(normalized, normalized.transpose(1, 2))
+        eye = torch.eye(8, device=similarity.device).unsqueeze(0)
+        expected = 0.5 * torch.relu(
+            similarity * (1.0 - eye) - 0.3
+        ).pow(2).mean()
+
+        actual = compute_mask_diversity_loss(
+            masks, mode="legacy_all_pairs", margin=0.3
+        )
+
+        self.assertEqual(actual.dtype, expected.dtype)
+        self.assertTrue(torch.equal(actual, expected))
+
 
 class V173DiagnosticTests(unittest.TestCase):
     def test_reports_area_centroid_and_cross_modal_similarity(self):
