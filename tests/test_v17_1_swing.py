@@ -15,6 +15,7 @@ from vla_model.train_yolo_v17_1 import (
     _upgrade_legacy_v17_1_state_dict,
     _weighted_sincos_loss,
     save_checkpoint,
+    restore_training_state,
     train_epoch,
     update_ema,
 )
@@ -91,6 +92,28 @@ class V171ModelTests(unittest.TestCase):
 
 
 class V171TrainingUtilityTests(unittest.TestCase):
+    def test_incompatible_optimizer_does_not_restore_stale_scheduler(self):
+        source_model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 1))
+        source_optimizer = torch.optim.AdamW(source_model.parameters(), lr=1e-4)
+        source_scheduler = torch.optim.lr_scheduler.StepLR(source_optimizer, step_size=1)
+        source_optimizer.step()
+        source_scheduler.step()
+        checkpoint = {
+            "optimizer_state_dict": source_optimizer.state_dict(),
+            "scheduler_state_dict": source_scheduler.state_dict(),
+        }
+
+        target_model = nn.Linear(2, 1)
+        target_optimizer = torch.optim.AdamW(target_model.parameters(), lr=3e-4)
+        target_scheduler = torch.optim.lr_scheduler.StepLR(target_optimizer, step_size=5)
+        initial_scheduler_epoch = target_scheduler.last_epoch
+
+        restored = restore_training_state(
+            target_optimizer, None, target_scheduler, checkpoint
+        )
+        self.assertFalse(restored)
+        self.assertEqual(target_scheduler.last_epoch, initial_scheduler_epoch)
+
     def test_complete_training_batch_runs_with_ema(self):
         model = build_small_v17_1()
         ema_model = deepcopy(model).eval()

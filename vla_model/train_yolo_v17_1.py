@@ -95,6 +95,30 @@ def update_ema(ema_model: nn.Module, model: nn.Module, decay: float) -> None:
         ema_buffers[name].copy_(buffer.detach())
 
 
+def restore_training_state(optimizer, scaler, scheduler, checkpoint):
+    """Restore optimizer/scheduler atomically enough to avoid a stale LR."""
+    optimizer_state = checkpoint.get("optimizer_state_dict")
+    if optimizer_state is None:
+        print("  [resume] optimizer state missing; using fresh optimizer and scheduler")
+        return False
+    try:
+        optimizer.load_state_dict(optimizer_state)
+        if scaler is not None and "scaler_state_dict" in checkpoint:
+            scaler.load_state_dict(checkpoint["scaler_state_dict"])
+    except (ValueError, KeyError) as error:
+        print(f"  [resume] optimizer/scaler state incompatible ({error}), "
+              "using fresh optimizer and scheduler")
+        return False
+
+    if "scheduler_state_dict" in checkpoint:
+        try:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            print(f"  [resume] scheduler LR restored to {scheduler.get_last_lr()[0]:.2e}")
+        except (ValueError, KeyError):
+            print("  [resume] scheduler state incompatible, using fresh scheduler")
+    return True
+
+
 def build_v17_1_model(seq_len=8, img_size=224, hidden_dim=512, n_heads=8,
                        n_layers=3, ff_dim=2048, dropout=0.25, pretrained=True,
                        num_excavators=4):
@@ -457,19 +481,7 @@ def main():
             print("  [resume] migrated shared V17.1 masks to four independent heads")
         loaded, skipped = load_compatible_state_dict(model, resume_state)
         print(f"  [resume] loaded {loaded} keys, skipped {skipped} (size mismatch or missing)")
-        try:
-            if "optimizer_state_dict" in ckpt:
-                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            if "scaler_state_dict" in ckpt:
-                scaler.load_state_dict(ckpt["scaler_state_dict"])
-        except (ValueError, KeyError) as e:
-            print(f"  [resume] optimizer/scaler state incompatible ({e}), using fresh optimizer")
-        if "scheduler_state_dict" in ckpt:
-            try:
-                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-                print(f"  [resume] scheduler LR restored to {scheduler.get_last_lr()[0]:.2e}")
-            except (ValueError, KeyError):
-                print(f"  [resume] scheduler state incompatible, using fresh scheduler")
+        restore_training_state(optimizer, scaler, scheduler, ckpt)
         start_epoch = ckpt.get("epoch", 0)
         metrics = ckpt.get("metrics", {})
         best_loss = ckpt.get("best_loss", metrics.get("loss", float("inf")))
