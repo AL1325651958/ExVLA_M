@@ -124,6 +124,10 @@ def detect_yolo_version(state_keys, checkpoint_version=None):
     if str(checkpoint_version).lower() in ("v17.1", "v17", "v16"):
         return str(checkpoint_version).upper(), True, str(checkpoint_version).lower()
 
+    # V17.3 / V17.1 model_version tags → v17.1
+    if str(checkpoint_version).lower() in ("v17.3", "v17.1"):
+        return "V17.1", True, "v17.1"
+
     has_v17 = any("joint_logit_bias" in k for k in state_keys)
     has_temporal = any("temporal_mask_mixer" in k or "pose_aux_head" in k for k in state_keys)
     if has_v17 and has_temporal:
@@ -163,17 +167,64 @@ def infer_yolo_config(state_dict):
     return hidden_dim, n_layers, ff_dim
 
 
+def remap_legacy_keys(state_dict):
+    """Apply old-checkpoint key remapping (V2-V7 → current key names)."""
+    sd = dict(state_dict)
+    sd_keys = set(sd.keys())
+    remapped = {}
+
+    # R1: skip delta_head and old-style action_head (V2-V4, single shared head)
+    for k in list(sd.keys()):
+        if "delta_head" in k:
+            del sd[k]
+        if "action_head." in k and "action_heads" not in k:
+            del sd[k]
+        if "qpos_mod" in k or "qpos_proj" in k:
+            del sd[k]
+
+    # R2: V5 old 6-joint → remap to 4-joint (skip 6. and 3., clone for j in 0..3)
+    is_v5 = any("action_heads" in sk for sk in sd.keys()) and not any("joint_embed" in sk for sk in sd.keys())
+    if is_v5:
+        for k, val in list(sd.items()):
+            if "action_heads." in k:
+                parts = k.split(".")
+                eid = int(parts[1])
+                rest = ".".join(parts[2:])
+                if rest.startswith("6.") or rest.startswith("3."):
+                    del sd[k]
+                    continue
+                for j in range(4):
+                    remapped[f"action_heads.{eid}.{j}.{rest}"] = val.clone()
+
+    # R3: mask_head → mask_heads (V5-V7 shared mask_head)
+    for k, val in list(sd.items()):
+        if "mask_head" in k and "mask_heads" not in k:
+            for j in range(4):
+                remapped[k.replace("mask_head", f"mask_heads.{j}")] = val.clone()
+            del sd[k]
+
+    # R4: query_tokens → joint_queries
+    if "query_tokens" in sd and "joint_queries" not in sd:
+        sd["joint_queries"] = sd.pop("query_tokens")
+
+    sd.update(remapped)
+    return sd
+
+
 def load_yolo_model(ckpt_path, device):
     """Load a YOLO model with correct architecture."""
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     sd = ckpt.get("model_state_dict", ckpt)
+
+    # Apply old-checkpoint key remapping (V2-V7)
+    sd = remap_legacy_keys(sd)
     sd_keys = set(sd.keys())
 
     version_tag, is_v16, version_arg = detect_yolo_version(
         sd_keys, ckpt.get("model_version")
     )
 
-    # Upgrade legacy masks
+    # Upgrade legacy V17 masks
     if version_arg in ("v17", "v17.1"):
         sd = upgrade_legacy_v17_1_state_dict(sd)
 

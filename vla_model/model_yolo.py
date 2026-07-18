@@ -298,13 +298,22 @@ class ExcavatorVLAYolo(nn.Module):
         grid_size = img_size // 16
         total_grid_dim = 3 * grid_dim * 2
         self.grid_size = grid_size
-        self.grid_proj = nn.Linear(2 * hidden_dim, hidden_dim)  # V16: cat of 2×D → D
 
-        # V16: separate per-modality projections + cross-modal attention
-        self.rgb_proj = nn.Linear(grid_dim * 3, hidden_dim)       # 768 → 512
-        self.elev_proj = nn.Linear(grid_dim * 3, hidden_dim)      # 768 → 512
-        self.cross_rgb_from_elev = nn.MultiheadAttention(hidden_dim, 4, dropout=dropout, batch_first=True)
-        self.cross_elev_from_rgb = nn.MultiheadAttention(hidden_dim, 4, dropout=dropout, batch_first=True)
+        self.is_v16_plus = version in ("v16", "v17", "v17.1")
+        if self.is_v16_plus:
+            # V16+: separate per-modality projections + cross-modal attention
+            self.rgb_proj = nn.Linear(grid_dim * 3, hidden_dim)       # 768 → 512
+            self.elev_proj = nn.Linear(grid_dim * 3, hidden_dim)      # 768 → 512
+            self.cross_rgb_from_elev = nn.MultiheadAttention(hidden_dim, 4, dropout=dropout, batch_first=True)
+            self.cross_elev_from_rgb = nn.MultiheadAttention(hidden_dim, 4, dropout=dropout, batch_first=True)
+            self.grid_proj = nn.Linear(2 * hidden_dim, hidden_dim)     # cat of 2×D → D
+        else:
+            # V9-V11: single grid projection from concatenated raw grid features
+            self.rgb_proj = None
+            self.elev_proj = None
+            self.cross_rgb_from_elev = None
+            self.cross_elev_from_rgb = None
+            self.grid_proj = nn.Linear(total_grid_dim, hidden_dim)     # 1536 → 512
 
         # ── V10+ temporal mask mixer (across-frame at each grid location) ──
         if version in ("v10", "v11", "v17.1"):
@@ -509,63 +518,82 @@ class ExcavatorVLAYolo(nn.Module):
         n3_e, n4_e, n5_e = self.elev_neck(p3_e, p4_e, p5_e)
         grid_elev = self.elev_head(n3_e, n4_e, n5_e, G)
 
-        # V16: project each modality separately, then cross-modal attention
+        # ── Projection & cross-modal attention ──
         grid_rgb_flat = grid_rgb.view(B * T, G * G, -1)             # [BT, G², 768]
         grid_elev_flat = grid_elev.view(B * T, G * G, -1)           # [BT, G², 768]
-        rgb_D = self.rgb_proj(grid_rgb_flat).view(B, T, G, G, D)   # [B, T, G, G, 512]
-        elev_D = self.elev_proj(grid_elev_flat).view(B, T, G, G, D)
 
-        # Cross-modal: RGB tokens attend to Elevation tokens and vice versa
-        # Done as token-level exchange at each spatial position
-        rgb_tokens = rgb_D.reshape(B, T * G * G, D)
-        elev_tokens = elev_D.reshape(B, T * G * G, D)
-        rgb_enhanced = self.cross_rgb_from_elev(rgb_tokens, elev_tokens, elev_tokens)[0]
-        elev_enhanced = self.cross_elev_from_rgb(elev_tokens, rgb_tokens, rgb_tokens)[0]
-        rgb_D = rgb_enhanced.reshape(B, T, G, G, D)
-        elev_D = elev_enhanced.reshape(B, T, G, G, D)
+        if self.is_v16_plus:
+            # V16+: project each modality separately, then cross-modal attention
+            rgb_D = self.rgb_proj(grid_rgb_flat).view(B, T, G, G, D)   # [B, T, G, G, 512]
+            elev_D = self.elev_proj(grid_elev_flat).view(B, T, G, G, D)
 
-        # V17.1 masks must observe motion across the input window.  Apply the
-        # shared temporal mixer independently to both modalities before mask
-        # generation; the fused action path then inherits the same features.
-        if self.version == "v17.1" and self.temporal_mask_mixer is not None:
-            rgb_D = self.temporal_mask_mixer(rgb_D)
-            elev_D = self.temporal_mask_mixer(elev_D)
+            # Cross-modal: RGB tokens attend to Elevation tokens and vice versa
+            rgb_tokens = rgb_D.reshape(B, T * G * G, D)
+            elev_tokens = elev_D.reshape(B, T * G * G, D)
+            rgb_enhanced = self.cross_rgb_from_elev(rgb_tokens, elev_tokens, elev_tokens)[0]
+            elev_enhanced = self.cross_elev_from_rgb(elev_tokens, rgb_tokens, rgb_tokens)[0]
+            rgb_D = rgb_enhanced.reshape(B, T, G, G, D)
+            elev_D = elev_enhanced.reshape(B, T, G, G, D)
 
-        # ── V16/V17: Independent masks from each modality before fusion ──
-        # V17: each joint has its own mask_linear1[j]/mask_linear2[j] (ModuleList)
-        # V16: Boom/Arm/Bucket share mask_linear1/2; Swing uses swing_mask_linear1/2
-        rgb_t = rgb_D.reshape(B, T * G * G, D)
-        elev_t = elev_D.reshape(B, T * G * G, D)
-        rgb_masks_list, elev_masks_list = [], []
-        for j in range(self.num_joints):
-            if self.use_independent_joint_masks:
-                # Independent mask head per joint
-                h_r = F.gelu(self.mask_linear1[j](rgb_t + self.joint_embed[j]))
-                m_r = torch.sigmoid(self.mask_linear2[j](h_r)).squeeze(-1)
-                h_e = F.gelu(self.mask_linear1[j](elev_t + self.joint_embed[j]))
-                m_e = torch.sigmoid(self.mask_linear2[j](h_e)).squeeze(-1)
-            elif j == 3:
-                # V16 Swing: independent head
-                h_r = F.gelu(self.swing_mask_linear1(rgb_t + self.joint_embed[j]))
-                m_r = torch.sigmoid(self.swing_mask_linear2(h_r)).squeeze(-1)
-                h_e = F.gelu(self.swing_mask_linear1(elev_t + self.joint_embed[j]))
-                m_e = torch.sigmoid(self.swing_mask_linear2(h_e)).squeeze(-1)
-            else:
-                # V16 Boom/Arm/Bucket: shared head
-                h_r = F.gelu(self.mask_linear1(rgb_t + self.joint_embed[j]))
-                m_r = torch.sigmoid(self.mask_linear2(h_r)).squeeze(-1)
-                h_e = F.gelu(self.mask_linear1(elev_t + self.joint_embed[j]))
-                m_e = torch.sigmoid(self.mask_linear2(h_e)).squeeze(-1)
-            rgb_masks_list.append(m_r.view(B, T, G, G))
-            elev_masks_list.append(m_e.view(B, T, G, G))
-        rgb_masks = torch.stack(rgb_masks_list, dim=1)               # [B, 4, T, G, G]
-        elev_masks = torch.stack(elev_masks_list, dim=1)             # [B, 4, T, G, G]
+            # V17.1: temporal mixer on each modality before mask generation
+            if self.version == "v17.1" and self.temporal_mask_mixer is not None:
+                rgb_D = self.temporal_mask_mixer(rgb_D)
+                elev_D = self.temporal_mask_mixer(elev_D)
 
-        masks_spatial = torch.stack([rgb_masks, elev_masks], dim=1)  # [B, 2, 4, T, G, G]
+            # ── V16+: Independent masks from each modality before fusion ──
+            rgb_t = rgb_D.reshape(B, T * G * G, D)
+            elev_t = elev_D.reshape(B, T * G * G, D)
+            rgb_masks_list, elev_masks_list = [], []
+            for j in range(self.num_joints):
+                if self.use_independent_joint_masks:
+                    h_r = F.gelu(self.mask_linear1[j](rgb_t + self.joint_embed[j]))
+                    m_r = torch.sigmoid(self.mask_linear2[j](h_r)).squeeze(-1)
+                    h_e = F.gelu(self.mask_linear1[j](elev_t + self.joint_embed[j]))
+                    m_e = torch.sigmoid(self.mask_linear2[j](h_e)).squeeze(-1)
+                elif j == 3:
+                    h_r = F.gelu(self.swing_mask_linear1(rgb_t + self.joint_embed[j]))
+                    m_r = torch.sigmoid(self.swing_mask_linear2(h_r)).squeeze(-1)
+                    h_e = F.gelu(self.swing_mask_linear1(elev_t + self.joint_embed[j]))
+                    m_e = torch.sigmoid(self.swing_mask_linear2(h_e)).squeeze(-1)
+                else:
+                    h_r = F.gelu(self.mask_linear1(rgb_t + self.joint_embed[j]))
+                    m_r = torch.sigmoid(self.mask_linear2(h_r)).squeeze(-1)
+                    h_e = F.gelu(self.mask_linear1(elev_t + self.joint_embed[j]))
+                    m_e = torch.sigmoid(self.mask_linear2(h_e)).squeeze(-1)
+                rgb_masks_list.append(m_r.view(B, T, G, G))
+                elev_masks_list.append(m_e.view(B, T, G, G))
+            rgb_masks = torch.stack(rgb_masks_list, dim=1)               # [B, 4, T, G, G]
+            elev_masks = torch.stack(elev_masks_list, dim=1)             # [B, 4, T, G, G]
+            masks_spatial = torch.stack([rgb_masks, elev_masks], dim=1)  # [B, 2, 4, T, G, G]
 
-        # Fuse: RGB + Elev channels concatenated, then projected back to D
-        grid = torch.cat([rgb_D, elev_D], dim=-1)
-        grid = self.grid_proj(grid).view(B, T, G, G, D)
+            # Fuse: RGB + Elev features concatenated, then projected back to D
+            grid = torch.cat([rgb_D, elev_D], dim=-1)
+            grid = self.grid_proj(grid).view(B, T, G, G, D)
+
+        else:
+            # V9-V11: concatenate raw grid features → single projection (no cross-attn)
+            grid = torch.cat([grid_rgb_flat, grid_elev_flat], dim=-1)   # [BT, G², 1536]
+            grid = self.grid_proj(grid).view(B, T, G, G, D)             # [B, T, G, G, 512]
+
+            # V10/V11: temporal mixer applied post-fusion (line ~610), not here
+
+            # Single-modality masks from fused grid tokens (V9-V11: 4 masks per joint)
+            flat_tokens = grid.reshape(B, T * G * G, D)
+            mask_list = []
+            for j in range(self.num_joints):
+                # V9-V11 use shared mask_linear1/2 (single Linear, not ModuleList)
+                if isinstance(self.mask_linear1, nn.ModuleList):
+                    h = F.gelu(self.mask_linear1[j](flat_tokens + self.joint_embed[j]))
+                    m = torch.sigmoid(self.mask_linear2[j](h)).squeeze(-1)
+                else:
+                    h = F.gelu(self.mask_linear1(flat_tokens + self.joint_embed[j]))
+                    m = torch.sigmoid(self.mask_linear2(h)).squeeze(-1)
+                mask_list.append(m.view(B, T, G, G))
+            single_masks = torch.stack(mask_list, dim=1)                # [B, 4, T, G, G]
+            # Duplicate as [RGB, Elev] for uniform interface — old models had no modality split
+            masks_spatial = torch.stack([single_masks, single_masks], dim=1)  # [B, 2, 4, T, G, G]
+
+            # V17.1 compat: rgb_D/elev_D not used in pre-V16 paths
 
         # ── V11 residual motion fusion (pure visual; before temporal mixer) ──
         if self.motion_adapter is not None:
