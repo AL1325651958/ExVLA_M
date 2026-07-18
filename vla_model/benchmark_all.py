@@ -339,7 +339,8 @@ def run_inference_yolo(model, rgb_pp, elev_pp, excv_id, device, sample_ratio=1.0
     excv_t = torch.tensor([excv_id], dtype=torch.long).to(device)
 
     predictions = np.full((N, 4), np.nan, dtype=np.float32)
-    predictions[:T - 1] = np.zeros((T - 1, 4))  # dummy fill
+    # NOTE: do NOT pre-fill T-1 zeros — they contaminate metrics when sample_ratio ≪ 1.
+    # Unfilled entries stay NaN and are excluded from MAE/R².
 
     step = max(1, int(1.0 / sample_ratio)) if sample_ratio < 1.0 else 1
     for start in range(0, N - T, step):
@@ -360,7 +361,6 @@ def run_inference_stvta(model, rgb_pp, elev_pp, excv_id, device, sample_ratio=1.
     excv_t = torch.tensor([excv_id], dtype=torch.long).to(device)
 
     predictions = np.full((N, 4), np.nan, dtype=np.float32)
-    predictions[:T - 1] = np.zeros((T - 1, 4))
 
     step = max(1, int(1.0 / sample_ratio)) if sample_ratio < 1.0 else 1
     for start in range(0, N - T, step):
