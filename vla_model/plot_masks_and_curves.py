@@ -40,7 +40,8 @@ PRED_COLOR = '#e74c3c'
 def preprocess_image(img_bgr, size=224):
     img = cv2.resize(img_bgr, (size, size))
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    return (img - IMAGENET_MEAN) / IMAGENET_STD
+    img = (img - IMAGENET_MEAN) / IMAGENET_STD
+    return img.transpose(2, 0, 1)
 
 
 def detect_version(state_keys, checkpoint_version=None):
