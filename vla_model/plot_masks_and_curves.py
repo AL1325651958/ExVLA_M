@@ -106,6 +106,12 @@ def _compute_per_joint_r2(predictions, targets):
     return r2
 
 
+def _hex_to_bgr(hex_color):
+    """'#e74c3c' → (B, G, R) = (0x3c, 0x4c, 0xe7)."""
+    h = hex_color.lstrip('#')
+    return (int(h[4:6], 16), int(h[2:4], 16), int(h[0:2], 16))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkpoint', required=True)
@@ -260,8 +266,7 @@ def main():
         for j in range(4):
             ax_m = fig.add_subplot(gs_masks[j + 2])
             mask_14 = all_masks[fidx, 0, j]
-            overlayed = render_mask_overlay(rgb_orig, mask_14,
-                                           [int(c) for c in JOINT_COLORS[j].lstrip('#')])
+            overlayed = render_mask_overlay(rgb_orig, mask_14, _hex_to_bgr(JOINT_COLORS[j]))
             overlayed_rgb = cv2.cvtColor(overlayed, cv2.COLOR_BGR2RGB)
             ax_m.imshow(overlayed_rgb, aspect='equal')
             ax_m.set_xticks([]); ax_m.set_yticks([])
