@@ -1,7 +1,11 @@
-"""SCI-style mask + prediction-curve composite figure from visualization frames.
+"""SCI-style mask + prediction-curve composite figure.
 
-Reads a checkpoint, runs inference on one episode, renders masks and GT-vs-Pred curves.
-Outputs a single publication-ready 2×1 layout: masks (top) + 4-DOF curves (bottom).
+Reads a checkpoint, runs inference on one episode, renders mask overlays and
+per-joint GT-vs-Pred curves.  Outputs a publication-ready figure.
+
+Layout (top → bottom):
+  1. 4-row prediction curves with per-joint R² annotations
+  2. N mask-overlay rows — each row: [RGB] [Elev] [Boom mask] [Arm mask] [Bucket mask] [Swing mask]
 """
 
 import sys, argparse, h5py, numpy as np, torch, cv2
@@ -18,12 +22,12 @@ from vla_model.dataset import IMAGENET_MEAN, IMAGENET_STD
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
+from matplotlib.gridspec import GridSpecFromSubplotSpec
 
 # ── SCI style ──
 plt.rcParams.update({
     'font.family': 'sans-serif', 'font.sans-serif': ['DejaVu Sans', 'Arial'],
-    'font.size': 8, 'axes.labelsize': 9, 'axes.titlesize': 10,
+    'font.size': 8, 'axes.labelsize': 9, 'axes.titlesize': 9,
     'legend.fontsize': 7, 'xtick.labelsize': 7, 'ytick.labelsize': 7,
     'axes.linewidth': 0.6, 'xtick.major.width': 0.5, 'ytick.major.width': 0.5,
     'xtick.major.size': 3, 'ytick.major.size': 3,
@@ -35,6 +39,11 @@ JOINT_NAMES = ['Boom', 'Arm', 'Bucket', 'Swing']
 JOINT_COLORS = ['#e74c3c', '#2ecc71', '#3498db', '#f39c12']
 GT_COLOR = '#333333'
 PRED_COLOR = '#e74c3c'
+
+
+def _circular_error(pred_rad, gt_rad):
+    delta = pred_rad - gt_rad
+    return np.arctan2(np.sin(delta), np.cos(delta))
 
 
 def preprocess_image(img_bgr, size=224):
@@ -79,39 +88,22 @@ def render_mask_overlay(bgr_img, mask_14x14, color, alpha=0.45):
     return np.clip(overlay, 0, 255).astype(np.uint8)
 
 
-def render_prediction_curves(timeline, targets, predictions, n_frames=300):
-    """Render 4-DOF GT vs Prediction curves in SCI style."""
-    N = len(timeline)
-    fig, axes = plt.subplots(4, 1, figsize=(10, 6), sharex=True)
-
-    for j in range(4):
-        ax = axes[j]
-        ax.set_facecolor('white')
-        ax.plot(timeline, targets[:, j], color=GT_COLOR, linewidth=0.8, alpha=0.9, label='Ground Truth')
-        ax.plot(timeline, predictions[:, j], color=JOINT_COLORS[j], linewidth=0.8, alpha=0.8, label='Prediction')
-
-        # shade error
-        valid = ~np.isnan(predictions[:, j])
-        if valid.any():
-            ax.fill_between(timeline[valid], targets[valid, j], predictions[valid, j],
-                           alpha=0.12, color=JOINT_COLORS[j])
-
-        ax.set_ylabel(JOINT_NAMES[j], fontsize=9, fontweight='bold', color='#333')
-        ax.grid(True, alpha=0.15, color='#999')
-        ax.tick_params(labelsize=7)
-
-        # Compute MAE
-        err = np.abs(predictions[valid, j] - targets[valid, j]).mean()
-        ax.text(0.99, 0.05, f'MAE={err:.4f} rad', transform=ax.transAxes, ha='right',
-               fontsize=7, color='#555', style='italic')
-
-        if j == 0:
-            ax.legend(loc='upper right', fontsize=7, frameon=False)
-
-    axes[-1].set_xlabel('Frame', fontsize=9, fontweight='bold')
-    axes[-1].set_xlim(timeline[0], timeline[-1])
-    fig.tight_layout(pad=0.5, h_pad=0.2)
-    return fig
+def _compute_per_joint_r2(predictions, targets):
+    """Compute per-joint R². Swing uses circular error."""
+    valid = ~np.isnan(predictions[:, 0])
+    pred = predictions[valid]; gt = targets[valid]; n = len(pred)
+    r2 = np.zeros(4)
+    for j in range(3):
+        ss_res = ((pred[:, j] - gt[:, j]) ** 2).sum()
+        ss_tot = max(((gt[:, j] - gt[:, j].mean()) ** 2).sum(), 1e-10)
+        r2[j] = 1 - ss_res / ss_tot
+    swing_err = _circular_error(pred[:, 3], gt[:, 3])
+    ss_res_s = (swing_err ** 2).sum()
+    s = gt[:, 3]; mean_a = np.arctan2(np.sin(s).mean(), np.cos(s).mean())
+    centered = _circular_error(s, mean_a)
+    ss_tot_s = max((centered ** 2).sum(), 1e-10)
+    r2[3] = 1 - ss_res_s / ss_tot_s
+    return r2
 
 
 def main():
@@ -122,7 +114,7 @@ def main():
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--frames_to_plot', type=int, default=300,
                        help='How many frames to show on curves (0=all)')
-    parser.add_argument('--mask_frames', type=str, default='0,3,6',
+    parser.add_argument('--mask_frames', type=str, default='50,100,150',
                        help='Comma-separated frame indices to render masks for')
     args = parser.parse_args()
 
@@ -145,7 +137,7 @@ def main():
     ).to(device)
     load_compatible_state_dict(model, sd)
     model.eval()
-    print(f'  {version_tag} | n_layers={n_layers} | hidden_dim={hidden_dim}')
+    print(f'  n_layers={n_layers}  hidden_dim={hidden_dim}')
 
     # ── Load episode ──
     print(f'Loading: {args.data_path}')
@@ -164,6 +156,7 @@ def main():
     elif '/490/' in pl or '\\490\\' in pl: excv_id = 2
     else: excv_id = 3
     excv_t = torch.tensor([excv_id], dtype=torch.long).to(device)
+    excv_label = {0: '75', 1: '306', 2: '490'}.get(excv_id, '?')
 
     # ── Preprocess ──
     print('Preprocessing...')
@@ -192,88 +185,100 @@ def main():
             m = masks_spatial[:, :, -1, :, :][0].cpu().numpy()
             all_masks[start + T - 1, 0] = m; all_masks[start + T - 1, 1] = m
 
+    # ── Per-joint R² ──
+    per_joint_r2 = _compute_per_joint_r2(predictions, targets)
+    valid = ~np.isnan(predictions[:, 0])
+    per_joint_mae = np.zeros(4)
+    for j in range(3):
+        per_joint_mae[j] = np.abs(predictions[valid, j] - targets[valid, j]).mean()
+    per_joint_mae[3] = np.abs(_circular_error(predictions[valid, 3], targets[valid, 3])).mean()
+
     # ── Build figure ──
     print('Building figure...')
     mask_frame_indices = [int(s) for s in args.mask_frames.split(',') if s.strip()]
     mask_frame_indices = [i for i in mask_frame_indices if T - 1 <= i < N]
+    n_mask_rows = len(mask_frame_indices)
 
-    n_mask_frames = len(mask_frame_indices)
-    n_rows = 1 + n_mask_frames  # curves + mask rows
-    fig = plt.figure(figsize=(14, 3.5 * n_rows))
+    # SCI double-column width, per-joint layout
+    fig_w = 8.5
+    curve_h = 3.2                    # 4-row curve panel
+    mask_row_h = 1.2                 # each mask row — compact but legible
+    title_h_space = 0.4
+    fig_h = title_h_space + curve_h + n_mask_rows * mask_row_h + 0.3
 
-    # ── Row 1: Prediction curves ──
+    fig = plt.figure(figsize=(fig_w, fig_h))
+    gs = fig.add_gridspec(1 + n_mask_rows, 1, hspace=0.28,
+                          height_ratios=[curve_h] + [mask_row_h] * n_mask_rows)
+
+    # ── Row 1: Prediction curves with per-joint R² ──
     n_curve_frames = min(args.frames_to_plot, N) if args.frames_to_plot > 0 else N
     timeline = np.arange(n_curve_frames, dtype=np.float32)
     sf = max(0, T - 1)
     ef = min(N, sf + n_curve_frames)
 
-    gs = fig.add_gridspec(n_rows, 1, hspace=0.35)
-
-    # Curves subplot
-    from matplotlib.gridspec import GridSpecFromSubplotSpec
-    gs_curves = GridSpecFromSubplotSpec(4, 1, subplot_spec=gs[0], hspace=0.15)
+    gs_curves = GridSpecFromSubplotSpec(4, 1, subplot_spec=gs[0], hspace=0.18)
     curve_axes = [fig.add_subplot(gs_curves[j]) for j in range(4)]
 
     pred_slice = predictions[sf:ef]
     tgt_slice = targets[sf:ef]
     for j, ax in enumerate(curve_axes):
         ax.set_facecolor('white')
-        ax.plot(timeline, tgt_slice[:, j], color=GT_COLOR, linewidth=0.6, alpha=0.85, label='GT')
-        ax.plot(timeline, pred_slice[:, j], color=JOINT_COLORS[j], linewidth=0.7, alpha=0.8, label='Pred')
-        valid = ~np.isnan(pred_slice[:, j])
-        if valid.any():
-            ax.fill_between(timeline[valid], tgt_slice[valid, j], pred_slice[valid, j],
+        ax.plot(timeline, tgt_slice[:, j], color=GT_COLOR, linewidth=0.5, alpha=0.85, label='GT')
+        ax.plot(timeline, pred_slice[:, j], color=JOINT_COLORS[j], linewidth=0.65, alpha=0.82, label='Pred')
+        valid_j = ~np.isnan(pred_slice[:, j])
+        if valid_j.any():
+            ax.fill_between(timeline[valid_j], tgt_slice[valid_j, j], pred_slice[valid_j, j],
                            alpha=0.10, color=JOINT_COLORS[j])
-        err = np.abs(pred_slice[valid, j] - tgt_slice[valid, j]).mean()
-        ax.text(0.99, 0.95, f'{JOINT_NAMES[j]}  MAE={err:.4f}', transform=ax.transAxes,
-               ha='right', va='top', fontsize=7, fontweight='bold', color='#333')
+        # R² annotation (per-joint, full-episode)
+        ax.text(0.99, 0.94, f'{JOINT_NAMES[j]}  R²={per_joint_r2[j]:.4f}',
+                transform=ax.transAxes, ha='right', va='top',
+                fontsize=7, fontweight='bold', color='#333')
         ax.grid(True, alpha=0.12, color='#999')
         ax.tick_params(labelsize=6)
         if j == 0:
-            ax.legend(loc='upper left', fontsize=6, frameon=False, bbox_to_anchor=(0, 1.3))
+            ax.legend(loc='upper left', fontsize=6, frameon=False, bbox_to_anchor=(0, 1.28))
         if j < 3: ax.set_xticklabels([])
     curve_axes[-1].set_xlabel('Frame', fontsize=9, fontweight='bold')
     curve_axes[-1].set_xlim(0, len(timeline) - 1)
 
     # ── Rows 2+: Mask overlay ──
-    row_idx = 1
-    for fidx in mask_frame_indices:
-        # Show original RGB + Elev + 4 joint mask pairs
-        gs_masks = GridSpecFromSubplotSpec(1, 6, subplot_spec=gs[row_idx], wspace=0.03)
+    for ri, fidx in enumerate(mask_frame_indices):
+        gs_masks = GridSpecFromSubplotSpec(1, 6, subplot_spec=gs[ri + 1], wspace=0.04)
 
-        # Original images
+        # Original images (square aspect to match SCI 1:1 panels)
         rgb_orig = cv2.cvtColor(mains[fidx], cv2.COLOR_BGR2RGB)
         elev_orig = cv2.cvtColor(elevations[fidx], cv2.COLOR_BGR2RGB)
-        ax_rgb = fig.add_subplot(gs_masks[0]); ax_rgb.imshow(rgb_orig); ax_rgb.set_xticks([]); ax_rgb.set_yticks([])
-        ax_rgb.set_title('RGB', fontsize=7, fontweight='bold')
-        ax_elv = fig.add_subplot(gs_masks[1]); ax_elv.imshow(elev_orig); ax_elv.set_xticks([]); ax_elv.set_yticks([])
-        ax_elv.set_title('Elevation', fontsize=7, fontweight='bold')
 
-        # 4 joint mask overlays (RGB overlay with mask)
+        ax_rgb = fig.add_subplot(gs_masks[0]); ax_rgb.imshow(rgb_orig, aspect='equal')
+        ax_rgb.set_xticks([]); ax_rgb.set_yticks([])
+        ax_rgb.set_title('RGB', fontsize=7, fontweight='bold', loc='left', pad=2)
+
+        ax_elv = fig.add_subplot(gs_masks[1]); ax_elv.imshow(elev_orig, aspect='equal')
+        ax_elv.set_xticks([]); ax_elv.set_yticks([])
+        ax_elv.set_title('Elevation', fontsize=7, fontweight='bold', loc='left', pad=2)
+
         for j in range(4):
             ax_m = fig.add_subplot(gs_masks[j + 2])
-            mask_14 = all_masks[fidx, 0, j] if is_v16 else all_masks[fidx, 0, j]
+            mask_14 = all_masks[fidx, 0, j]
             overlayed = render_mask_overlay(rgb_orig, mask_14,
                                            [int(c) for c in JOINT_COLORS[j].lstrip('#')])
-            # Convert BGR→RGB
-            overlayed_rgb = cv2.cvtColor(overlayed, cv2.COLOR_BGR2RGB) if overlayed.shape[-1] == 3 else overlayed
-            ax_m.imshow(overlayed_rgb)
+            overlayed_rgb = cv2.cvtColor(overlayed, cv2.COLOR_BGR2RGB)
+            ax_m.imshow(overlayed_rgb, aspect='equal')
             ax_m.set_xticks([]); ax_m.set_yticks([])
             ax_m.set_title(JOINT_NAMES[j], fontsize=7, fontweight='bold',
-                          color=JOINT_COLORS[j])
+                          color=JOINT_COLORS[j], loc='left', pad=2)
 
-        row_idx += 1
-
-    # Title
+    # Title — no version, excavator label only, per-joint comparison
     ep_name = Path(args.data_path).stem
-    excv_label = {0: '75', 1: '306', 2: '490'}.get(excv_id, '?')
-    fig.suptitle(f'{version_tag} — Excavator {excv_label} — {ep_name}',
-                fontsize=11, fontweight='bold', y=1.02)
+    fig.suptitle(f'逐关节预测对比  —  Excavator {excv_label}',
+                 fontsize=11, fontweight='bold', y=0.995)
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.out, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
     plt.close(fig)
     print(f'Saved: {args.out}')
+    print(f'  Per-joint R²: {[f"{r:.4f}" for r in per_joint_r2]}')
+    print(f'  Per-joint MAE: {[f"{m:.4f}" for m in per_joint_mae]}')
 
 
 if __name__ == '__main__':
