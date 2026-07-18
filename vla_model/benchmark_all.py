@@ -387,8 +387,8 @@ def main():
                         help="Output directories to skip")
     parser.add_argument("--episodes_per_excv", type=int, default=0,
                         help="Max episodes per excavator (0=all)")
-    parser.add_argument("--sample_ratio", type=float, default=0.1,
-                        help="Fraction of windows to evaluate per episode (default 0.1)")
+    parser.add_argument("--sample_ratio", type=float, default=0.01,
+                        help="Fraction of windows to evaluate per episode (default 0.01)")
     parser.add_argument("--exclude_306", action="store_true",
                         help="Skip excavator 306 (nighttime data)")
     args = parser.parse_args()
