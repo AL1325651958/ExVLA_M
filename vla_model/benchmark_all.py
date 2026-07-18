@@ -338,6 +338,8 @@ def main():
                         help="Max episodes per excavator (0=all)")
     parser.add_argument("--sample_ratio", type=float, default=0.1,
                         help="Fraction of windows to evaluate per episode (default 0.1)")
+    parser.add_argument("--exclude_306", action="store_true",
+                        help="Skip excavator 306 (nighttime data)")
     args = parser.parse_args()
 
     device = args.device if torch.cuda.is_available() else "cpu"
@@ -345,6 +347,8 @@ def main():
 
     # ── Find episodes ──
     episodes = find_episodes(args.data_dir)
+    if args.exclude_306:
+        episodes.pop(1, None)  # remove excavator 306
     for eid in sorted(episodes.keys()):
         print(f"  Excavator {EXCV_NAMES[eid]}: {len(episodes[eid])} episodes")
         if args.episodes_per_excv > 0:
