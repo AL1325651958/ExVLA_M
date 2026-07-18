@@ -40,7 +40,7 @@ def _hex_to_bgr(h):
     return (int(h[4:6], 16), int(h[2:4], 16), int(h[0:2], 16))
 
 
-def render_mask_overlay(bgr_img, mask_14x14, color_bgr, alpha=0.45):
+def render_mask_overlay(bgr_img, mask_14x14, color_bgr, alpha=0.70):
     h, w = bgr_img.shape[:2]
     mask = cv2.resize(mask_14x14, (w, h), interpolation=cv2.INTER_LINEAR)
     mask = np.clip(mask, 0, 1)
@@ -104,7 +104,7 @@ def main():
 
     # ── Build figure ──
     fig_w = 8.5
-    curve_h = 3.2
+    curve_h = 4.0                    # taller to accommodate inter-joint spacing
     mask_row_h = 1.2
     title_h = 0.3
     fig_h = title_h + curve_h + n_mask_rows * mask_row_h + 0.2
@@ -118,7 +118,7 @@ def main():
     timeline = np.arange(n_curve, dtype=np.float32)
     sf = T - 1; ef = min(N, sf + n_curve)
 
-    gs_curves = GridSpecFromSubplotSpec(4, 1, subplot_spec=gs[0], hspace=0.18)
+    gs_curves = GridSpecFromSubplotSpec(4, 1, subplot_spec=gs[0], hspace=0.35)
     curve_axes = [fig.add_subplot(gs_curves[j]) for j in range(4)]
 
     for j, ax in enumerate(curve_axes):
@@ -135,8 +135,9 @@ def main():
         ax.grid(True, alpha=0.12, color='#999')
         ax.tick_params(labelsize=6)
         if j == 0:
-            ax.legend(loc='upper left', fontsize=6, frameon=False, bbox_to_anchor=(0, 1.28))
-        if j < 3: ax.set_xticklabels([])
+            ax.legend(loc='upper left', fontsize=6, frameon=False, bbox_to_anchor=(0, 1.35))
+        if j < 3:
+            ax.set_xticklabels([])
     curve_axes[-1].set_xlabel('Frame', fontsize=9, fontweight='bold')
     curve_axes[-1].set_xlim(0, len(timeline) - 1)
 
@@ -167,7 +168,7 @@ def main():
                           color=JOINT_COLORS[j], loc='left', pad=2)
 
     # Close HDF5 (opened for elevation)
-    fig.suptitle(f"逐关节预测对比  —  Excavator {meta['excavator']}",
+    fig.suptitle(f"Per-joint Prediction  —  Excavator {meta['excavator']}",
                  fontsize=11, fontweight='bold', y=0.995)
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
