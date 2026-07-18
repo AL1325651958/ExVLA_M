@@ -255,9 +255,6 @@ def load_episode(h5_path):
 def find_episodes(data_dir):
     """Find all .h5/.hdf5 episode files grouped by excavator type."""
     episodes = defaultdict(list)
-    for fp in sorted(glob.glob(os.path.join(data_dir, "**", "*.h5"), recursive=True)):
-        fp += glob.glob(os.path.join(data_dir, "**", "*.hdf5"), recursive=True)
-        break
 
     for fp in sorted(glob.glob(os.path.join(data_dir, "**", "*.h5"), recursive=True)):
         excv_id = _parse_excv_from_path(fp)
@@ -284,7 +281,7 @@ def _parse_excv_from_path(fp):
 # ── Inference ──
 
 @torch.no_grad()
-def run_inference_yolo(model, rgb_pp, elev_pp, excv_id, device):
+def run_inference_yolo(model, rgb_pp, elev_pp, excv_id, device, sample_ratio=1.0):
     """Run YOLO inference over an episode."""
     N = len(rgb_pp)
     T = 8
@@ -293,7 +290,8 @@ def run_inference_yolo(model, rgb_pp, elev_pp, excv_id, device):
     predictions = np.full((N, 4), np.nan, dtype=np.float32)
     predictions[:T - 1] = np.zeros((T - 1, 4))  # dummy fill
 
-    for start in range(0, N - T):
+    step = max(1, int(1.0 / sample_ratio)) if sample_ratio < 1.0 else 1
+    for start in range(0, N - T, step):
         end = start + T
         rgb_seq = torch.from_numpy(rgb_pp[start:end]).unsqueeze(0).to(device)
         elev_seq = torch.from_numpy(elev_pp[start:end]).unsqueeze(0).to(device)
@@ -304,7 +302,7 @@ def run_inference_yolo(model, rgb_pp, elev_pp, excv_id, device):
 
 
 @torch.no_grad()
-def run_inference_stvta(model, rgb_pp, elev_pp, excv_id, device):
+def run_inference_stvta(model, rgb_pp, elev_pp, excv_id, device, sample_ratio=1.0):
     """Run STVTA inference over an episode."""
     N = len(rgb_pp)
     T = 8
@@ -313,7 +311,8 @@ def run_inference_stvta(model, rgb_pp, elev_pp, excv_id, device):
     predictions = np.full((N, 4), np.nan, dtype=np.float32)
     predictions[:T - 1] = np.zeros((T - 1, 4))
 
-    for start in range(0, N - T):
+    step = max(1, int(1.0 / sample_ratio)) if sample_ratio < 1.0 else 1
+    for start in range(0, N - T, step):
         end = start + T
         rgb_seq = torch.from_numpy(rgb_pp[start:end]).unsqueeze(0).to(device)
         elev_seq = torch.from_numpy(elev_pp[start:end]).unsqueeze(0).to(device)
@@ -337,10 +336,12 @@ def main():
                         help="Output directories to skip")
     parser.add_argument("--episodes_per_excv", type=int, default=0,
                         help="Max episodes per excavator (0=all)")
+    parser.add_argument("--sample_ratio", type=float, default=0.1,
+                        help="Fraction of windows to evaluate per episode (default 0.1)")
     args = parser.parse_args()
 
     device = args.device if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}")
+    print(f"Device: {device}  |  sample_ratio={args.sample_ratio}")
 
     # ── Find episodes ──
     episodes = find_episodes(args.data_dir)
@@ -418,7 +419,7 @@ def main():
                 rgb_pp, elev_pp, targets, N = episode_data[key]
 
                 try:
-                    preds = run_fn(model, rgb_pp, elev_pp, eid, device)
+                    preds = run_fn(model, rgb_pp, elev_pp, eid, device, sample_ratio=args.sample_ratio)
                     all_preds.append(preds)
                     all_targets.append(targets)
                 except Exception as e:
