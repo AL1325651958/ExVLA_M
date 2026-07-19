@@ -4,7 +4,7 @@ Outputs per output_dir:
   predictions.csv  — frame, target_boom, target_arm, target_bucket, target_swing,
                        pred_boom,   pred_arm,   pred_bucket,   pred_swing
   all_masks.npy    — [N, 2, 4, 14, 14] (modality × joint × spatial)
-  meta.json        — checkpoint path, version, excavator, episode path, per-joint MAE/R²
+  meta.json        — checkpoint path, version, excavator, episode path, per-joint MAE/R2
 """
 
 import sys, argparse, json, h5py, numpy as np, torch, csv, cv2
@@ -187,7 +187,7 @@ def main():
     with open(meta_path, 'w') as f:
         json.dump(meta, f, indent=2)
     print(f'Saved: {meta_path}')
-    print(f'  MAE: {[f"{m:.4f}" for m in mae]}  R²: {[f"{r:.4f}" for r in r2]}')
+    print(f'  MAE: {[f"{m:.4f}" for m in mae]}  R2: {[f"{r:.4f}" for r in r2]}')
 
 
 if __name__ == '__main__':

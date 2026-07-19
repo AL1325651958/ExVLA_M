@@ -33,9 +33,8 @@ for excv in ["75", "490"]:
 
         # Parse MAE/R² from stdout
         for line in result.stdout.split("\n"):
-            if "MAE:" in line and "R²:" in line:
-                # MAE: ['0.0249', ...]  R²: ['0.9783', ...]
-                parts = line.strip().split("R²:")
+            if "MAE:" in line and ("R2:" in line or "R²:" in line):
+                parts = line.strip().replace("R²:", "R2:").split("R2:")
                 mae_str = parts[0].replace("MAE:", "").strip()
                 r2_str = parts[1].strip()
                 mae = ast.literal_eval(mae_str)
