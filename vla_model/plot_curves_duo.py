@@ -74,7 +74,6 @@ def draw_curves(axes, timeline, targets, predictions, sf, ef, r2_values):
         if j < 3: ax.set_xticklabels([])
     axes[-1].set_xlabel('Frame', fontsize=12, fontweight='bold')
     axes[-1].set_xlim(0, len(timeline) - 1)
-    axes[0].set_title(title_label, fontsize=13, fontweight='bold', loc='left', pad=8)
 
 
 def main():
@@ -121,8 +120,8 @@ def main():
     draw_curves(axes_75,  timeline_75,  t75,  p75,  sf75,  ef75,  r2_75)
     draw_curves(axes_490, timeline_490, t490, p490, sf490, ef490, r2_490)
 
-    fig.suptitle("Per-joint Prediction  —  V17.3",
-                 fontsize=14, fontweight='bold', y=1.005)
+    fig.suptitle("Per-joint Prediction",
+                 fontsize=15, fontweight='bold', y=1.005)
     fig.subplots_adjust(left=0.06, right=0.98, top=0.94, bottom=0.06)
     fig.tight_layout(pad=0.5, h_pad=0.3, rect=(0, 0, 1, 0.93))
 
