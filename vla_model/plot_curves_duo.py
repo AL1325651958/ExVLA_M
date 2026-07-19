@@ -50,13 +50,13 @@ def load_data(predictions_csv, meta_json):
     return targets, predictions, meta
 
 
-def draw_curves(axes, timeline, targets, predictions, sf, ef, title_label, r2_values):
+def draw_curves(axes, timeline, targets, predictions, sf, ef, r2_values):
     for j, ax in enumerate(axes):
         ax.set_facecolor('white')
         ax.plot(timeline, targets[sf:ef, j],
-                color=GT_COLOR, linewidth=0.7, alpha=0.9, label='GT')
+                color=GT_COLOR, linewidth=0.7, alpha=0.9, label='Ground Truth')
         ax.plot(timeline, predictions[sf:ef, j],
-                color=JOINT_COLORS[j], linewidth=0.9, alpha=0.85, label='Pred')
+                color=JOINT_COLORS[j], linewidth=0.9, alpha=0.85, label='Prediction')
         vj = ~np.isnan(predictions[sf:ef, j])
         if vj.any():
             ax.fill_between(timeline[vj],
@@ -69,8 +69,8 @@ def draw_curves(axes, timeline, targets, predictions, sf, ef, title_label, r2_va
         ax.grid(True, alpha=0.12, color='#999')
         ax.tick_params(labelsize=8)
         if j == 0:
-            ax.legend(loc='upper left', fontsize=9, frameon=False,
-                      bbox_to_anchor=(0, 1.25))
+            ax.legend(loc='center right', fontsize=8, frameon=False,
+                      bbox_to_anchor=(0.98, 0.55))
         if j < 3: ax.set_xticklabels([])
     axes[-1].set_xlabel('Frame', fontsize=12, fontweight='bold')
     axes[-1].set_xlim(0, len(timeline) - 1)
@@ -106,19 +106,25 @@ def main():
     fig = plt.figure(figsize=(14, 7))
     gs = GridSpec(1, 2, figure=fig, wspace=0.08)
 
-    gs_l = GridSpecFromSubplotSpec(4, 1, subplot_spec=gs[0], hspace=0.22)
-    gs_r = GridSpecFromSubplotSpec(4, 1, subplot_spec=gs[1], hspace=0.22)
+    gs_l = GridSpecFromSubplotSpec(4, 1, subplot_spec=gs[0], hspace=0.32)
+    gs_r = GridSpecFromSubplotSpec(4, 1, subplot_spec=gs[1], hspace=0.32)
 
     axes_75 = [fig.add_subplot(gs_l[j]) for j in range(4)]
     axes_490 = [fig.add_subplot(gs_r[j]) for j in range(4)]
 
-    draw_curves(axes_75,  timeline_75,  t75,  p75,  sf75,  ef75,
-                f"Excavator 75 (22 t)  |  R2 mean={np.mean(r2_75):.4f}", r2_75)
-    draw_curves(axes_490, timeline_490, t490, p490, sf490, ef490,
-                f"Excavator 490 (50 t)  |  R2 mean={np.mean(r2_490):.4f}", r2_490)
+    # Column labels above first joint (merged into suptitle block)
+    axes_75[0].text(0.02, 1.18, f"Excavator 75 (22 t)  |  R2 mean = {np.mean(r2_75):.4f}",
+                    transform=axes_75[0].transAxes, fontsize=11, fontweight='bold', color='#444')
+    axes_490[0].text(0.02, 1.18, f"Excavator 490 (50 t)  |  R2 mean = {np.mean(r2_490):.4f}",
+                     transform=axes_490[0].transAxes, fontsize=11, fontweight='bold', color='#444')
 
-    fig.suptitle("Per-joint Prediction — V17.3", fontsize=15, fontweight='bold', y=1.01)
-    fig.tight_layout(pad=0.8, h_pad=0.3)
+    draw_curves(axes_75,  timeline_75,  t75,  p75,  sf75,  ef75,  r2_75)
+    draw_curves(axes_490, timeline_490, t490, p490, sf490, ef490, r2_490)
+
+    fig.suptitle("Per-joint Prediction  —  V17.3",
+                 fontsize=14, fontweight='bold', y=1.005)
+    fig.subplots_adjust(left=0.06, right=0.98, top=0.94, bottom=0.06)
+    fig.tight_layout(pad=0.5, h_pad=0.3, rect=(0, 0, 1, 0.93))
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.out, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
