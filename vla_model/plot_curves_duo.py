@@ -18,10 +18,10 @@ from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
 
 plt.rcParams.update({
     'font.family': 'sans-serif', 'font.sans-serif': ['DejaVu Sans', 'Arial'],
-    'font.size': 10, 'axes.labelsize': 11, 'axes.titlesize': 12,
-    'legend.fontsize': 9, 'xtick.labelsize': 8, 'ytick.labelsize': 8,
-    'axes.linewidth': 0.8, 'xtick.major.width': 0.6, 'ytick.major.width': 0.6,
-    'xtick.major.size': 4, 'ytick.major.size': 4,
+    'font.size': 12, 'axes.labelsize': 13, 'axes.titlesize': 14,
+    'legend.fontsize': 11, 'xtick.labelsize': 10, 'ytick.labelsize': 10,
+    'axes.linewidth': 1.0, 'xtick.major.width': 0.8, 'ytick.major.width': 0.8,
+    'xtick.major.size': 5, 'ytick.major.size': 5,
     'figure.dpi': 300, 'savefig.dpi': 300, 'savefig.bbox': 'tight',
     'axes.spines.right': False, 'axes.spines.top': False,
 })
@@ -54,25 +54,25 @@ def draw_curves(axes, timeline, targets, predictions, sf, ef, r2_values):
     for j, ax in enumerate(axes):
         ax.set_facecolor('white')
         ax.plot(timeline, targets[sf:ef, j],
-                color=GT_COLOR, linewidth=0.7, alpha=0.9, label='Ground Truth')
+                color=GT_COLOR, linewidth=1.0, alpha=0.9, label='Ground Truth')
         ax.plot(timeline, predictions[sf:ef, j],
-                color=JOINT_COLORS[j], linewidth=0.9, alpha=0.85, label='Prediction')
+                color=JOINT_COLORS[j], linewidth=1.2, alpha=0.85, label='Prediction')
         vj = ~np.isnan(predictions[sf:ef, j])
         if vj.any():
             ax.fill_between(timeline[vj],
                             targets[sf:ef, j][vj],
                             predictions[sf:ef, j][vj],
                             alpha=0.08, color=JOINT_COLORS[j])
-        ax.text(0.99, 0.92, f"{JOINT_NAMES[j]}  R2={r2_values[j]:.4f}",
+        ax.text(0.99, 0.90, f"{JOINT_NAMES[j]}  R2={r2_values[j]:.4f}",
                 transform=ax.transAxes, ha='right', va='top',
-                fontsize=10, fontweight='bold', color='#333')
+                fontsize=13, fontweight='bold', color='#333')
         ax.grid(True, alpha=0.12, color='#999')
-        ax.tick_params(labelsize=8)
+        ax.tick_params(labelsize=10)
         if j == 0:
-            ax.legend(loc='center right', fontsize=8, frameon=False,
+            ax.legend(loc='center right', fontsize=10, frameon=False,
                       bbox_to_anchor=(0.98, 0.55))
         if j < 3: ax.set_xticklabels([])
-    axes[-1].set_xlabel('Frame', fontsize=12, fontweight='bold')
+    axes[-1].set_xlabel('Frame', fontsize=14, fontweight='bold')
     axes[-1].set_xlim(0, len(timeline) - 1)
 
 
@@ -113,15 +113,15 @@ def main():
 
     # Column labels above first joint (merged into suptitle block)
     axes_75[0].text(0.02, 1.18, f"Excavator 75 (22 t)  |  R2 mean = {np.mean(r2_75):.4f}",
-                    transform=axes_75[0].transAxes, fontsize=11, fontweight='bold', color='#444')
+                    transform=axes_75[0].transAxes, fontsize=13, fontweight='bold', color='#444')
     axes_490[0].text(0.02, 1.18, f"Excavator 490 (50 t)  |  R2 mean = {np.mean(r2_490):.4f}",
-                     transform=axes_490[0].transAxes, fontsize=11, fontweight='bold', color='#444')
+                     transform=axes_490[0].transAxes, fontsize=13, fontweight='bold', color='#444')
 
     draw_curves(axes_75,  timeline_75,  t75,  p75,  sf75,  ef75,  r2_75)
     draw_curves(axes_490, timeline_490, t490, p490, sf490, ef490, r2_490)
 
     fig.suptitle("Per-joint Prediction",
-                 fontsize=15, fontweight='bold', y=1.04)
+                 fontsize=18, fontweight='bold', y=1.04)
     fig.subplots_adjust(left=0.06, right=0.98, top=0.90, bottom=0.06)
     fig.tight_layout(pad=0.5, h_pad=0.3, rect=(0, 0, 1, 0.88))
 
