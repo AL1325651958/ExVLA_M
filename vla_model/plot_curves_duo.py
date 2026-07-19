@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from matplotlib.gridspec import GridSpec
+from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
 
 plt.rcParams.update({
     'font.family': 'sans-serif', 'font.sans-serif': ['DejaVu Sans', 'Arial'],
@@ -106,8 +106,8 @@ def main():
     fig = plt.figure(figsize=(14, 7))
     gs = GridSpec(1, 2, figure=fig, wspace=0.08)
 
-    gs_l = GridSpec(4, 1, subplot_spec=gs[0], hspace=0.22)
-    gs_r = GridSpec(4, 1, subplot_spec=gs[1], hspace=0.22)
+    gs_l = GridSpecFromSubplotSpec(4, 1, subplot_spec=gs[0], hspace=0.22)
+    gs_r = GridSpecFromSubplotSpec(4, 1, subplot_spec=gs[1], hspace=0.22)
 
     axes_75 = [fig.add_subplot(gs_l[j]) for j in range(4)]
     axes_490 = [fig.add_subplot(gs_r[j]) for j in range(4)]
