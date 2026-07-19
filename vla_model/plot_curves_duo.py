@@ -121,9 +121,9 @@ def main():
     draw_curves(axes_490, timeline_490, t490, p490, sf490, ef490, r2_490)
 
     fig.suptitle("Per-joint Prediction",
-                 fontsize=15, fontweight='bold', y=1.005)
-    fig.subplots_adjust(left=0.06, right=0.98, top=0.94, bottom=0.06)
-    fig.tight_layout(pad=0.5, h_pad=0.3, rect=(0, 0, 1, 0.93))
+                 fontsize=15, fontweight='bold', y=1.04)
+    fig.subplots_adjust(left=0.06, right=0.98, top=0.90, bottom=0.06)
+    fig.tight_layout(pad=0.5, h_pad=0.3, rect=(0, 0, 1, 0.88))
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.out, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
