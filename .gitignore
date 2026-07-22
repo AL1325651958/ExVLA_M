@@ -33,3 +33,13 @@ Thumbs.db
 *.zip
 .claude/settings.json
 .worktrees/
+
+# Local non-code content
+paper/
+figure/
+export/
+docs/
+.superpowers/
+CHANGELOG.md
+ablation.md
+benchmark_results.csv
